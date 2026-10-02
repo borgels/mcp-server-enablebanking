@@ -65,10 +65,22 @@ gateway and, optionally, `ENABLEBANKING_CONSENT_ADMINS`):
 
 The consent `state` is HMAC-signed and carries company, user, and a 30-minute expiry; it
 is single-use. A redirect cannot be completed on another company's endpoint, by another
-user, twice, or late. The redirect only needs to land on a URL registered with the
-application (`ENABLEBANKING_REDIRECT_URL`); nothing has to listen there —
-the admin copies the address from the browser into `enablebanking_complete_consent`. No
-callback route, so no extra public surface.
+user, twice, or late. Two ways to finish a consent:
+
+- **Confirmation page** (`ENABLEBANKING_CONSENT_CALLBACK=true`): the server answers
+  `GET` on the path of `ENABLEBANKING_REDIRECT_URL`, completes the consent there and shows
+  which accounts were bound (IBANs masked), with a button back to the chat
+  (`ENABLEBANKING_RETURN_URL`). That path is the only one that must be reachable without
+  the gateway; it does nothing without a valid, unused state, and the bank's code is
+  worthless without the application's private key. The page is static HTML with
+  `no-store`, `no-referrer` and a CSP that allows no script.
+- **Paste** (callback off): the redirect only needs to land on a URL registered with the
+  application; nothing has to listen there. The admin copies the address from the browser
+  into `enablebanking_complete_consent` — no extra public surface at all.
+
+Either way, the consent belongs to the company, not to the person who gave it: once one
+authorised person has approved it with MitID, everyone the gateway lets onto the endpoint
+reads the accounts without MitID of their own, until the consent expires.
 
 ## Bank limits
 

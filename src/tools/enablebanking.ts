@@ -160,7 +160,8 @@ export function registerTools(server: McpServer, bank: Bank, options: ToolOption
       title: 'Start a bank consent (admin)',
       description:
         "Create or renew this company's consent at one bank. Returns a MitID link for someone authorised for the company at the bank. " +
-        'Nothing is linked until enablebanking_complete_consent is called with the address the browser lands on. Renewing replaces ' +
+        "Nothing is linked until the consent is completed: by the server's own confirmation page when it has one (the result's " +
+        '"next" says so), otherwise by enablebanking_complete_consent with the address the browser lands on. Renewing replaces ' +
         "(and revokes) the company's previous consent at the same bank.",
       inputSchema: {
         bank: z.string().trim().min(1).describe('Exact bank name from enablebanking_list_banks, e.g. "Danske Bank".'),
@@ -179,7 +180,8 @@ export function registerTools(server: McpServer, bank: Bank, options: ToolOption
     {
       title: 'Complete a bank consent (admin)',
       description:
-        'Finish a consent started with enablebanking_start_consent: pass the whole address the browser landed on after MitID. ' +
+        'Finish a consent started with enablebanking_start_consent: pass the whole address the browser landed on after MitID ' +
+        '(not needed when the server completes consents on its own confirmation page). ' +
         "Binds ONLY the accounts registered to this company in the account registry; other companies' accounts are discarded, " +
         'and unregistered accounts are listed so they can be added to the registry (then run enablebanking_refresh_consent).',
       inputSchema: {
