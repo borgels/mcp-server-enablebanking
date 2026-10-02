@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.0
+
+- Confirmation page for consents (`ENABLEBANKING_CONSENT_CALLBACK`): the bank's redirect
+  completes the consent on the server and shows the accounts bound, so nothing has to be
+  copied back into the chat. Attributed to the user named in the signed state; audited as
+  `consent_callback`. `ENABLEBANKING_RETURN_URL` sets the page's back button.
+- A forged or foreign consent state is reported as a consent error instead of a server error.
+
 ## 0.1.0
 
 First version.

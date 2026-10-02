@@ -3,7 +3,7 @@ import { EnableBankingHttpError } from '../errors.js';
 import type { AccountResource, EnableBankingClient } from './client.js';
 import { balanceView, isoDate, summarize, transactionView, type TransactionView } from './format.js';
 import { maskIban, normalizeIban, type AccountRegistry, type Company, type RegisteredAccount } from './registry.js';
-import type { BoundAccount, ExcludedAccount, SessionStore, StoredSession } from './store.js';
+import type { BoundAccount, ConsentState, ExcludedAccount, SessionStore, StoredSession } from './store.js';
 
 const STATE_TTL_MS = 30 * 60_000;
 const DAY_MS = 86_400_000;
@@ -14,6 +14,8 @@ export interface BankOptions {
   registry: AccountRegistry;
   store: SessionStore;
   redirectUrl?: string;
+  /** The redirect lands on this server, which completes the consent itself. */
+  consentCallback?: boolean;
   cacheSeconds?: number;
   now?: () => number;
 }
@@ -272,18 +274,37 @@ export class Bank {
       validDays,
       url: auth.url,
       expiresAt: new Date(expiresAt).toISOString(),
-      next:
-        `Open the URL and approve with MitID as someone authorised for ${company.name} (CVR ${company.cvr}). ` +
-        `You land on ${this.options.redirectUrl}; copy the WHOLE address from the browser and pass it to ` +
-        'enablebanking_complete_consent within 30 minutes. Only accounts registered to ' +
-        `${company.name} in the account registry become readable; everything else in the consent is discarded.`,
+      next: this.options.consentCallback
+        ? `Open the URL and approve with MitID as someone authorised for ${company.name} (CVR ${company.cvr}) within 30 minutes. ` +
+          'The bank then returns to a confirmation page that completes the consent and lists the accounts bound; nothing ' +
+          'needs to be copied. Afterwards enablebanking_list_accounts shows the result. Only accounts registered to ' +
+          `${company.name} in the account registry become readable; everything else in the consent is discarded.`
+        : `Open the URL and approve with MitID as someone authorised for ${company.name} (CVR ${company.cvr}). ` +
+          `You land on ${this.options.redirectUrl}; copy the WHOLE address from the browser and pass it to ` +
+          'enablebanking_complete_consent within 30 minutes. Only accounts registered to ' +
+          `${company.name} in the account registry become readable; everything else in the consent is discarded.`,
     };
   }
 
+  /** Complete from the address the admin pasted; the admin must be the one who started it. */
   async completeConsent(input: { user: string; redirectUrl: string }): Promise<BindingReport> {
+    return (await this.finishConsent(input.redirectUrl, input.user.toLowerCase())).report;
+  }
+
+  /**
+   * Complete from the bank's redirect arriving at this server. There is no
+   * signed-in user on that request: the HMAC-signed, single-use, 30-minute
+   * state names who started the consent and for which company, and the code
+   * is worthless without this application's private key.
+   */
+  async completeConsentCallback(redirectUrl: string): Promise<{ report: BindingReport; user: string }> {
+    return this.finishConsent(redirectUrl, null);
+  }
+
+  private async finishConsent(redirectUrl: string, expectedUser: string | null): Promise<{ report: BindingReport; user: string }> {
     let url: URL;
     try {
-      url = new URL(input.redirectUrl.trim());
+      url = new URL(redirectUrl.trim());
     } catch {
       throw new ConsentError('pass the full address you landed on after MitID (it contains ?code=…&state=…)');
     }
@@ -295,11 +316,16 @@ export class Bank {
     const rawState = url.searchParams.get('state');
     if (!code || !rawState) throw new ConsentError('the address has no code/state; copy it again from the browser');
 
-    const state = this.store.verifyState(rawState);
+    let state: ConsentState;
+    try {
+      state = this.store.verifyState(rawState);
+    } catch (error) {
+      throw new ConsentError(error instanceof Error ? error.message : 'the consent state is invalid');
+    }
     if (state.company !== this.company) {
       throw new ConsentError(`this consent was started for company ${state.company}, not ${this.company}; complete it on that company's endpoint`);
     }
-    if (state.user !== input.user.toLowerCase()) {
+    if (expectedUser !== null && state.user !== expectedUser) {
       throw new ConsentError('this consent was started by another user; the person who started it must complete it');
     }
     if (state.expiresAt <= this.now()) throw new ConsentError('the consent link is older than 30 minutes; start again');
@@ -311,7 +337,7 @@ export class Bank {
       // Nothing here belongs to this company: do not keep a consent that can
       // only read other companies' (or nobody's) accounts.
       await this.client.deleteSession(created.session_id).catch(() => undefined);
-      return this.report(state.aspsp.name, '(revoked)', binding);
+      return { report: this.report(state.aspsp.name, '(revoked)', binding), user: state.user };
     }
     const session: StoredSession = {
       key: sessionKey(state.aspsp, state.psuType),
@@ -320,7 +346,7 @@ export class Bank {
       psuType: state.psuType,
       validUntil: created.access?.valid_until || state.validUntil,
       createdAt: new Date(this.now()).toISOString(),
-      createdBy: input.user.toLowerCase(),
+      createdBy: state.user,
       accounts: binding.bound,
       excluded: binding.excluded,
     };
@@ -329,7 +355,7 @@ export class Bank {
       await this.client.deleteSession(replaced.sessionId).catch(() => undefined);
     }
     this.cache.clear();
-    return this.report(state.aspsp.name, session.validUntil, binding);
+    return { report: this.report(state.aspsp.name, session.validUntil, binding), user: state.user };
   }
 
   /**

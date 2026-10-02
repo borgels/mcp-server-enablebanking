@@ -6,7 +6,7 @@ import { AccountRegistry } from './enablebanking/registry.js';
 import { parseKey, SessionStore } from './enablebanking/store.js';
 import { registerTools } from './tools/enablebanking.js';
 
-export const VERSION = '0.1.0';
+export const VERSION = '0.2.0';
 
 /** One Bank per process: it holds the read cache, and the config never changes at runtime. */
 export function createBank(config: EnableBankingConfig = loadConfig(), client?: EnableBankingClient): Bank {
@@ -23,6 +23,7 @@ export function createBank(config: EnableBankingConfig = loadConfig(), client?: 
     registry: AccountRegistry.fromFile(config.accountsPath),
     store: new SessionStore(config.company, config.dataDir, parseKey(config.encryptionKey)),
     redirectUrl: config.redirectUrl,
+    consentCallback: config.consentEnabled && config.consentCallback,
     cacheSeconds: config.cacheSeconds,
   });
 }

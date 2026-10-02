@@ -1,6 +1,6 @@
 {
   "name": "mcp-server-enablebanking",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Read-only MCP server for bank accounts via Enable Banking (PSD2 AIS), hard-scoped to one company per instance.",
   "type": "module",
   "main": "./dist/transports/stdio.js",

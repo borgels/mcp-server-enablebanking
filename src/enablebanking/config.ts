@@ -15,6 +15,14 @@ export interface EnableBankingConfig {
   /** 32-byte key (hex or base64) for the session store and the consent state. */
   encryptionKey?: string;
   redirectUrl?: string;
+  /**
+   * Serve the bank's redirect at the path of redirectUrl and complete the
+   * consent right there, instead of the admin pasting the address into
+   * enablebanking_complete_consent.
+   */
+  consentCallback: boolean;
+  /** Where the confirmation page's button leads (e.g. the chat client). */
+  returnUrl?: string;
   consentEnabled: boolean;
   /** Optional UPN allowlist for consent tools, on top of the gateway duty group. */
   consentAdmins: string[];
@@ -42,6 +50,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): EnableBankingC
     dataDir: env.ENABLEBANKING_DATA_DIR ?? '/data',
     encryptionKey: env.ENABLEBANKING_ENCRYPTION_KEY?.trim() || undefined,
     redirectUrl: env.ENABLEBANKING_REDIRECT_URL?.trim() || undefined,
+    consentCallback: env.ENABLEBANKING_CONSENT_CALLBACK === 'true',
+    returnUrl: httpsOrUndefined(env.ENABLEBANKING_RETURN_URL, 'ENABLEBANKING_RETURN_URL'),
     consentEnabled: env.ENABLEBANKING_ENABLE_CONSENT === 'true',
     consentAdmins: (env.ENABLEBANKING_CONSENT_ADMINS ?? '')
       .split(',')
@@ -53,6 +63,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): EnableBankingC
     timeoutMs: clampInt(env.ENABLEBANKING_TIMEOUT_MS, 30_000, 1_000, 120_000),
     auditLog: env.ENABLEBANKING_AUDIT_LOG?.trim() || undefined,
   };
+}
+
+function httpsOrUndefined(value: string | undefined, name: string): string | undefined {
+  const trimmed = value?.trim();
+  if (!trimmed) return undefined;
+  if (!trimmed.startsWith('https://')) throw new Error(`${name} must be https`);
+  return trimmed;
 }
 
 function clampInt(value: string | undefined, fallback: number, min: number, max: number): number {

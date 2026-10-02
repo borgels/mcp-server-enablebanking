@@ -11,17 +11,26 @@ import {
   readJsonBody,
   sendJson,
 } from './http-helpers.js';
+import { consentCallbackPath, handleConsentCallback } from './consent-page.js';
 
 const config = getHttpConfig();
 const bankConfig = loadConfig();
 // Built once, at startup: a bad registry, key or store fails the container
 // immediately instead of on the first user's call.
 const bank = createBank(bankConfig);
+const callbackPath = consentCallbackPath(bankConfig);
 
 const httpServer = createNodeServer(async (req, res) => {
   try {
     if (req.url === '/healthz' && req.method === 'GET') {
       sendJson(res, 200, { ok: true, company: bank.company, consent: bankConfig.consentEnabled }, req);
+      return;
+    }
+
+    // The bank's redirect (through the user's browser): no gateway, no token —
+    // the signed, single-use state is what authorises it.
+    if (callbackPath && req.method === 'GET' && req.url && new URL(req.url, 'http://local').pathname === callbackPath) {
+      await handleConsentCallback(bank, bankConfig, req.url, res);
       return;
     }
 
@@ -83,5 +92,5 @@ function firstHeaderValue(value: string | string[] | undefined): string | undefi
 }
 
 httpServer.listen(config.port, config.host, () => {
-  console.error(`Enable Banking MCP (${bank.company}) listening on http://${config.host}:${config.port}/mcp`);
+  console.error(`Enable Banking MCP (${bank.company}) listening on http://${config.host}:${config.port}/mcp${callbackPath ? ` (consent callback on ${callbackPath})` : ''}`);
 });
