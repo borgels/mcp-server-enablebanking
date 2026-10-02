@@ -1,0 +1,64 @@
+{
+  "name": "mcp-server-enablebanking",
+  "version": "0.1.0",
+  "description": "Read-only MCP server for bank accounts via Enable Banking (PSD2 AIS), hard-scoped to one company per instance.",
+  "type": "module",
+  "main": "./dist/transports/stdio.js",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+    ".env.example"
+  ],
+  "bin": {
+    "mcp-server-enablebanking": "./dist/transports/stdio.js"
+  },
+  "scripts": {
+    "build": "tsup src/server.ts src/transports/stdio.ts src/transports/http.ts --format esm --clean --sourcemap",
+    "dev": "tsx src/transports/stdio.ts",
+    "dev:http": "tsx src/transports/http.ts",
+    "check:accounts": "tsx src/enablebanking/check-registry.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "prepack": "npm run typecheck && npm test && npm run build"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/borgels/mcp-server-enablebanking.git"
+  },
+  "keywords": [
+    "mcp",
+    "enable-banking",
+    "psd2",
+    "ais",
+    "bank",
+    "transactions"
+  ],
+  "author": "",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=20.11"
+  },
+  "bugs": {
+    "url": "https://github.com/borgels/mcp-server-enablebanking/issues"
+  },
+  "homepage": "https://github.com/borgels/mcp-server-enablebanking#readme",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.3",
+    "tsup": "^8.5.1",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.6"
+  },
+  "overrides": {
+    "ip-address": ">=10.3.1",
+    "hono": ">=4.12.34",
+    "fast-uri": ">=3.1.5",
+    "@hono/node-server": ">=1.19.15"
+  }
+}

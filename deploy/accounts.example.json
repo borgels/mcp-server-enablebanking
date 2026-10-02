@@ -1,0 +1,13 @@
+{
+  "$comment": "Which bank account belongs to which company. The ONLY authority for that: a bank consent can contain accounts of several companies, and only an IBAN listed under the instance's company is ever read. An IBAN under two companies fails startup. Validate with `npm run check:accounts -- accounts.json`. Companies, CVRs and IBANs below are fictional (valid checksums, not real accounts).",
+  "companies": {
+    "aaa": {
+      "name": "Alfa Drift ApS",
+      "cvr": "12345678",
+      "accounts": [
+        { "iban": "DK5254700001234567", "id": "drift", "name": "Driftskonto", "bank": "Danske Bank", "currency": "DKK", "ledgerAccount": 5820 }
+      ]
+    },
+    "bbb": { "name": "Beta Handel ApS", "cvr": "87654321", "accounts": [] }
+  }
+}
