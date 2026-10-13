@@ -97,7 +97,11 @@ application in its control panel — one more gate, outside this server.
 ## Identity and audit
 
 Behind an authenticating MCP gateway (`ENABLEBANKING_TRUST_FORWARDED_USER=true`) every
-request must carry the verified user in `X-MCP-User`; requests without it are refused. Each tool
+request must carry the verified user in `X-MCP-User`; requests without it are refused. The HTTP
+server refuses to start with that flag set unless `MCP_HTTP_TOKEN` is also set (the bearer is
+compared in constant time), so only the gateway can supply the header. Without the flag, HTTP
+callers all act as the static `ENABLEBANKING_DEFAULT_USER`, so the consent tools and the consent
+callback are disabled over HTTP even when `ENABLEBANKING_ENABLE_CONSENT=true`; stdio is unaffected. Each tool
 call is written to `ENABLEBANKING_AUDIT_LOG` with company, user, tool and account id;
 arguments are hashed, and balances, transactions and the consent code are never logged.
 Keep your gateway's own audit as well.
