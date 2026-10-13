@@ -12,9 +12,10 @@ import {
   sendJson,
 } from './http-helpers.js';
 import { consentCallbackPath, handleConsentCallback } from './consent-page.js';
+import { httpBankConfig } from './http-policy.js';
 
 const config = getHttpConfig();
-const bankConfig = loadConfig();
+const bankConfig = resolveHttpBankConfig();
 // Built once, at startup: a bad registry, key or store fails the container
 // immediately instead of on the first user's call.
 const bank = createBank(bankConfig);
@@ -84,6 +85,17 @@ const httpServer = createNodeServer(async (req, res) => {
     }
   }
 });
+
+function resolveHttpBankConfig() {
+  try {
+    const { config: effective, warnings } = httpBankConfig(loadConfig(), config);
+    for (const warning of warnings) console.error(`WARNING: ${warning}`);
+    return effective;
+  } catch (error) {
+    console.error(`FATAL: ${(error as Error).message}`);
+    process.exit(1);
+  }
+}
 
 function firstHeaderValue(value: string | string[] | undefined): string | undefined {
   const raw = Array.isArray(value) ? value[0] : value;

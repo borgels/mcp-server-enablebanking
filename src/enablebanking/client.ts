@@ -1,6 +1,7 @@
 import { createPrivateKey, createSign, type KeyObject } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { EnableBankingHttpError } from '../errors.js';
+import { encodePathParam } from '../path-params.js';
 
 // Enable Banking, account information (AIS) only. The application is not
 // registered for payment initiation and this client has no method that could
@@ -186,20 +187,20 @@ export class EnableBankingClient {
   }
 
   getSession(sessionId: string): Promise<SessionStatus> {
-    return this.request('GET', `/sessions/${encodeURIComponent(sessionId)}`);
+    return this.request('GET', `/sessions/${encodePathParam(sessionId, 'sessionId')}`);
   }
 
   /** Close the session and revoke the consent at the bank. */
   async deleteSession(sessionId: string): Promise<void> {
-    await this.request('DELETE', `/sessions/${encodeURIComponent(sessionId)}`);
+    await this.request('DELETE', `/sessions/${encodePathParam(sessionId, 'sessionId')}`);
   }
 
   getAccountDetails(uid: string): Promise<AccountResource> {
-    return this.request('GET', `/accounts/${encodeURIComponent(uid)}/details`);
+    return this.request('GET', `/accounts/${encodePathParam(uid, 'uid')}/details`);
   }
 
   async getBalances(uid: string): Promise<BalanceResource[]> {
-    const body = await this.request<{ balances?: BalanceResource[] }>('GET', `/accounts/${encodeURIComponent(uid)}/balances`);
+    const body = await this.request<{ balances?: BalanceResource[] }>('GET', `/accounts/${encodePathParam(uid, 'uid')}/balances`);
     return body.balances ?? [];
   }
 
@@ -217,7 +218,7 @@ export class EnableBankingClient {
       if (continuation) params.set('continuation_key', continuation);
       const body = await this.request<{ transactions?: TransactionResource[]; continuation_key?: string | null }>(
         'GET',
-        `/accounts/${encodeURIComponent(uid)}/transactions?${params}`,
+        `/accounts/${encodePathParam(uid, 'uid')}/transactions?${params}`,
       );
       transactions.push(...(body.transactions ?? []));
       continuation = body.continuation_key ?? undefined;
