@@ -46,7 +46,7 @@
   "homepage": "https://github.com/borgels/mcp-server-enablebanking#readme",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
-    "zod": "^4.4.3"
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "@types/node": "^25.9.3",
