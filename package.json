@@ -1,6 +1,6 @@
 {
   "name": "mcp-server-enablebanking",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Read-only MCP server for bank accounts via Enable Banking (PSD2 AIS), hard-scoped to one company per instance.",
   "type": "module",
   "main": "./dist/transports/stdio.js",
@@ -45,20 +45,22 @@
   },
   "homepage": "https://github.com/borgels/mcp-server-enablebanking#readme",
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0",
-    "zod": "^4.4.3"
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "zod": "^4.6.7"
   },
   "devDependencies": {
-    "@types/node": "^25.9.3",
+    "@types/node": "^25.9.9",
     "tsup": "^8.5.1",
-    "tsx": "^4.21.0",
+    "tsx": "^4.23.15",
     "typescript": "^6.0.3",
-    "vitest": "^4.1.6"
+    "vitest": "^4.1.12"
   },
   "overrides": {
-    "ip-address": ">=10.3.1",
-    "hono": ">=4.12.34",
-    "fast-uri": ">=3.1.5",
-    "@hono/node-server": ">=1.19.15"
+    "ip-address": "^10.3.1",
+    "hono": "^4.13.19",
+    "@hono/node-server": "^2.1.8",
+    "fast-uri": "^3.1.9",
+    "qs": "^6.17.1",
+    "body-parser": "^2.4.0"
   }
 }

@@ -58,9 +58,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): EnableBankingC
       .map(value => value.trim().toLowerCase())
       .filter(Boolean),
     trustForwardedUser: env.ENABLEBANKING_TRUST_FORWARDED_USER === 'true',
-    cacheSeconds: clampInt(env.ENABLEBANKING_CACHE_SECONDS, 300, 0, 86_400),
+    cacheSeconds: clampInt('ENABLEBANKING_CACHE_SECONDS', env.ENABLEBANKING_CACHE_SECONDS, 300, 0, 86_400),
     apiBaseUrl,
-    timeoutMs: clampInt(env.ENABLEBANKING_TIMEOUT_MS, 30_000, 1_000, 120_000),
+    timeoutMs: clampInt('ENABLEBANKING_TIMEOUT_MS', env.ENABLEBANKING_TIMEOUT_MS, 30_000, 1_000, 120_000),
     auditLog: env.ENABLEBANKING_AUDIT_LOG?.trim() || undefined,
   };
 }
@@ -72,8 +72,16 @@ function httpsOrUndefined(value: string | undefined, name: string): string | und
   return trimmed;
 }
 
-function clampInt(value: string | undefined, fallback: number, min: number, max: number): number {
-  const parsed = Number(value);
-  if (!value || !Number.isFinite(parsed)) return fallback;
-  return Math.min(max, Math.max(min, Math.trunc(parsed)));
+/**
+ * Unset or blank gives the fallback; a value that is not a plain integer
+ * stops startup (instead of silently using the fallback); an integer outside
+ * [min, max] is clamped to the range.
+ */
+function clampInt(name: string, value: string | undefined, fallback: number, min: number, max: number): number {
+  const trimmed = value?.trim();
+  if (!trimmed) return fallback;
+  if (!/^[+-]?\d+$/.test(trimmed) || !Number.isSafeInteger(Number(trimmed))) {
+    throw new Error(`${name} must be an integer (${min}-${max}); got ${JSON.stringify(trimmed.slice(0, 40))}.`);
+  }
+  return Math.min(max, Math.max(min, Number(trimmed)));
 }

@@ -8,6 +8,8 @@ the Enable Banking application is not registered for payment initiation. And it 
 **hard-scoped to one company per instance**: which account belongs to which company is
 decided by a reviewed registry, never by the bank consent or by a tool argument.
 
+This is an independent, unofficial project. It is not developed, endorsed or supported by Enable Banking.
+
 ## Who owns an account
 
 A bank consent is a poor authority for that. One MitID business login often reaches
@@ -117,6 +119,44 @@ operations repository — it names real accounts and does not belong next to the
 
 The container runs as uid 1000; the data directory and key file must be readable by it
 (key: mode 600).
+
+### HTTP transport
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `MCP_HTTP_HOST` (or `HOST`) | `127.0.0.1` | Bind address. |
+| `PORT` | `3000` | Listen port (1-65535). |
+| `MCP_HTTP_TOKEN` | unset | Bearer token required on `/mcp`; at least 32 printable ASCII characters. Required when binding to a non-loopback address or with `MCP_ALLOW_ANY_ORIGIN=true`. Generate one with `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`. |
+| `MCP_HTTP_ALLOW_UNAUTHENTICATED` | `false` | Start without a token on a non-loopback bind anyway (only when access is restricted by other means). |
+| `MCP_ALLOWED_ORIGINS` | localhost origins | Comma-separated exact `Origin` values allowed. Requests without `Origin` (server-to-server) are allowed. |
+| `MCP_ALLOW_ANY_ORIGIN` | `false` | Allow any `Origin` (requires a token). |
+| `MCP_ALLOWED_HOSTS` | see meaning | Comma-separated host names accepted in the `Host` header. By default a loopback bind only accepts localhost names and its bind address; other binds do not check `Host`. |
+| `MCP_MAX_BODY_BYTES` | `10485760` | Maximum request body size. |
+| `MCP_AUTH_FAILURE_LIMIT` | `20` | Failed authentication attempts per client address and window before further failures get HTTP 429; `0` disables. Requests with a valid token are never throttled. |
+| `MCP_AUTH_FAILURE_WINDOW_MS` | `60000` | Window for the limit above. |
+
+Invalid numeric or boolean values stop the server at startup with a message
+naming the variable. `GET /healthz` answers `{"status":"ok"}` without
+authentication, for container health checks; here it reports
+`{"ok":true,"company":...,"consent":...}`. The consent callback path (when enabled) is
+also served without the bearer token: the signed, single-use state authorises it.
+`ENABLEBANKING_CACHE_SECONDS` and `ENABLEBANKING_TIMEOUT_MS` must be integers; values
+outside their range are clamped as before.
+
+## Security model
+
+- All callers share one Enable Banking application identity and the consents
+  stored for this instance's company. With `ENABLEBANKING_TRUST_FORWARDED_USER=true`
+  the forwarded `X-MCP-User` names the caller for the audit log and the consent
+  tools; the server does not authenticate users itself.
+- `MCP_HTTP_TOKEN` is a single shared secret that authenticates callers of
+  the HTTP endpoint; it does not identify individual users. Per-user
+  authentication and authorization belong in an identity-aware gateway or
+  proxy in front of this server.
+- Access to a tool is access to every registered account of the instance's
+  company; there is no per-user account filter inside the server.
+- The HTTP server does not terminate TLS. Run it on loopback or a private
+  network, behind a TLS-terminating proxy when traffic leaves the host.
 
 ## Run
 
