@@ -150,8 +150,7 @@ export class EnableBankingClient {
       );
     }
     if (!response.ok) {
-      const errorBody = await readErrorBody(response);
-      const payload = typeof errorBody === 'object' && errorBody !== null ? errorBody : undefined;
+      const payload = errorPayload(await readErrorBody(response));
       throw new EnableBankingHttpError({ status: response.status, method, path, payload });
     }
     const text = await response.text();
@@ -239,4 +238,21 @@ export class EnableBankingClient {
     }
     return { transactions, truncated: true };
   }
+}
+
+/**
+ * The error object from a (size-capped) error body. JSON is used whatever the
+ * content type, so a code such as EXPIRED_SESSION is kept even when the body is
+ * served as text/plain.
+ */
+function errorPayload(body: unknown): object | undefined {
+  if (typeof body === 'string') {
+    try {
+      const parsed: unknown = JSON.parse(body);
+      return typeof parsed === 'object' && parsed !== null ? parsed : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+  return typeof body === 'object' && body !== null ? body : undefined;
 }

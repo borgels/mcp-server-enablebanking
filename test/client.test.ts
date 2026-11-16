@@ -65,3 +65,26 @@ describe('numeric configuration', () => {
     expect(loadConfig({ ENABLEBANKING_COMPANY: 'aaa', ENABLEBANKING_CACHE_SECONDS: '0' }).cacheSeconds).toBe(0);
   });
 });
+
+describe('error codes from non-JSON content types', () => {
+  it('keeps the code of a JSON error body served as text/plain', async () => {
+    const fetchImpl = vi.fn<typeof fetch>(async () =>
+      new Response(JSON.stringify({ error: 'EXPIRED_SESSION', message: 'Session expired' }), {
+        status: 422,
+        headers: { 'Content-Type': 'text/plain' },
+      }),
+    );
+    const error = (await client(fetchImpl).getApplication().catch((e: unknown) => e)) as EnableBankingHttpError;
+    expect(error).toBeInstanceOf(EnableBankingHttpError);
+    expect(error.code).toBe('EXPIRED_SESSION');
+    expect(error.consentLost).toBe(true);
+    expect(error.message).toContain('Session expired');
+  });
+
+  it('ignores a non-JSON text body', async () => {
+    const fetchImpl = vi.fn<typeof fetch>(async () => new Response('Bad gateway', { status: 502 }));
+    const error = (await client(fetchImpl).getApplication().catch((e: unknown) => e)) as EnableBankingHttpError;
+    expect(error.status).toBe(502);
+    expect(error.code).toBeUndefined();
+  });
+});

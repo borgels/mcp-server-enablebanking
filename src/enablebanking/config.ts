@@ -24,7 +24,7 @@ export interface EnableBankingConfig {
   /** Where the confirmation page's button leads (e.g. the chat client). */
   returnUrl?: string;
   consentEnabled: boolean;
-  /** Optional UPN allowlist for consent tools, on top of the gateway duty group. */
+  /** Optional user allowlist for consent tools, on top of the gateway's access group. */
   consentAdmins: string[];
   trustForwardedUser: boolean;
   cacheSeconds: number;

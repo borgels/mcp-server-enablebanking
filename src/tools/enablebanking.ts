@@ -12,10 +12,10 @@ import {
 } from '../enablebanking/capabilities.js';
 
 export interface ToolOptions {
-  /** Gateway-verified UPN of the caller. */
+  /** Gateway-verified user name of the caller. */
   actingAs: string;
   consentEnabled: boolean;
-  /** Empty = the gateway duty group alone decides. */
+  /** Empty = the gateway's access group alone decides. */
   consentAdmins: string[];
   auditLog?: string;
 }

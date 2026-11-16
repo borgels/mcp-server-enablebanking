@@ -54,7 +54,7 @@ registered to another company are reported masked only.
 Accounts are named by their registry id (`drift`) or IBAN. Amounts are decimal strings
 (never floats); negative means money left the account; totals are summed in minor units.
 
-**Consent** (only with `ENABLEBANKING_ENABLE_CONSENT=true`; gated by a duty group at the
+**Consent** (only with `ENABLEBANKING_ENABLE_CONSENT=true`; gated by a group at the
 gateway and, optionally, `ENABLEBANKING_CONSENT_ADMINS`):
 
 | Tool | |
@@ -114,7 +114,7 @@ Run one container per company, each with its own `ENABLEBANKING_COMPANY`, data
 directory and encryption key, all mounting the same read-only registry and private
 key (see [`.env.example`](.env.example)). Put the HTTP transport behind a gateway that
 authenticates users, forwards `X-MCP-User`, and holds the upstream `MCP_HTTP_TOKEN`.
-Gate the consent tools separately there (a duty group), and keep the registry in your
+Gate the consent tools separately there (a group), and keep the registry in your
 operations repository — it names real accounts and does not belong next to the code.
 
 The container runs as uid 1000; the data directory and key file must be readable by it
@@ -136,12 +136,14 @@ The container runs as uid 1000; the data directory and key file must be readable
 | `MCP_AUTH_FAILURE_WINDOW_MS` | `60000` | Window for the limit above. |
 
 Invalid numeric or boolean values stop the server at startup with a message
-naming the variable. `GET /healthz` answers `{"status":"ok"}` without
-authentication, for container health checks; here it reports
-`{"ok":true,"company":...,"consent":...}`. The consent callback path (when enabled) is
+naming the variable. `GET /healthz` answers `{"ok":true,"company":...,"consent":...}`
+without authentication, for container health checks. The consent callback path (when enabled) is
 also served without the bearer token: the signed, single-use state authorises it.
 `ENABLEBANKING_CACHE_SECONDS` and `ENABLEBANKING_TIMEOUT_MS` must be integers; values
-outside their range are clamped as before.
+outside their range are clamped as before. The `ENABLEBANKING_*` flags
+(`ENABLEBANKING_TRUST_FORWARDED_USER`, `ENABLEBANKING_ENABLE_CONSENT`,
+`ENABLEBANKING_CONSENT_CALLBACK`) are only on with exactly `true`; any other value
+(including `TRUE` or `1`) leaves them off, unlike the `MCP_*` flags above.
 
 ## Security model
 

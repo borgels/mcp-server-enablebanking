@@ -41,7 +41,9 @@ HTTP transport hardening, upstream client hardening and dependency updates.
 
 Upgrade notes: deployments that bind to `0.0.0.0` must set `MCP_HTTP_TOKEN`
 (32+ characters) or the server exits at startup. Check that numeric variables
-hold plain integers.
+hold plain integers. A server bound to a loopback address behind a reverse
+proxy that forwards the public `Host` header now answers 403 on `/mcp` until
+that host name is listed in `MCP_ALLOWED_HOSTS`.
 
 ## 0.2.0
 
