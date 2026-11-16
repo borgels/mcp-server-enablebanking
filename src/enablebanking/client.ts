@@ -1,6 +1,7 @@
 import { createPrivateKey, createSign, type KeyObject } from 'node:crypto';
 import { readFileSync } from 'node:fs';
-import { EnableBankingHttpError } from '../errors.js';
+import { EnableBankingHttpError, redactPath } from '../errors.js';
+import { discardBody, isRedirect, readErrorBody } from '../upstream-http.js';
 import { encodePathParam } from '../path-params.js';
 
 // Enable Banking, account information (AIS) only. The application is not
@@ -136,17 +137,28 @@ export class EnableBankingClient {
         ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
       },
       body: body === undefined ? undefined : JSON.stringify(body),
+      // Never follow redirects: the signed JWT and the body (e.g. an authorization
+      // code) would be re-sent to the new location.
+      redirect: 'manual',
       signal: AbortSignal.timeout(this.timeoutMs),
     });
+    if (isRedirect(response.status)) {
+      await discardBody(response);
+      throw new Error(
+        `Enable Banking ${method} ${redactPath(path)} answered with a redirect (HTTP ${response.status}); ` +
+          'redirects are not followed. Check ENABLEBANKING_API_BASE_URL.',
+      );
+    }
+    if (!response.ok) {
+      const payload = errorPayload(await readErrorBody(response));
+      throw new EnableBankingHttpError({ status: response.status, method, path, payload });
+    }
     const text = await response.text();
     let payload: unknown;
     try {
       payload = text ? JSON.parse(text) : undefined;
     } catch {
       payload = undefined;
-    }
-    if (!response.ok) {
-      throw new EnableBankingHttpError({ status: response.status, method, path, payload });
     }
     return payload as T;
   }
@@ -226,4 +238,21 @@ export class EnableBankingClient {
     }
     return { transactions, truncated: true };
   }
+}
+
+/**
+ * The error object from a (size-capped) error body. JSON is used whatever the
+ * content type, so a code such as EXPIRED_SESSION is kept even when the body is
+ * served as text/plain.
+ */
+function errorPayload(body: unknown): object | undefined {
+  if (typeof body === 'string') {
+    try {
+      const parsed: unknown = JSON.parse(body);
+      return typeof parsed === 'object' && parsed !== null ? parsed : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+  return typeof body === 'object' && body !== null ? body : undefined;
 }

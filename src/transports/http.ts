@@ -1,100 +1,80 @@
-import { createServer as createNodeServer } from 'node:http';
-import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import type { IncomingMessage } from 'node:http';
+import { ConfigError } from '../config-env.js';
 import { loadConfig } from '../enablebanking/config.js';
 import { createBank, createServer as createMcpServer } from '../server.js';
-import {
-  assertAllowedOrigin,
-  assertAuthorized,
-  corsHeaders,
-  getHttpConfig,
-  HttpRequestError,
-  readJsonBody,
-  sendJson,
-} from './http-helpers.js';
 import { consentCallbackPath, handleConsentCallback } from './consent-page.js';
+import { configWarnings, getHttpConfig, type HttpConfig, HttpRequestError } from './http-helpers.js';
 import { httpBankConfig } from './http-policy.js';
+import { startHttpServer } from './http-server.js';
 
-const config = getHttpConfig();
-const bankConfig = resolveHttpBankConfig();
-// Built once, at startup: a bad registry, key or store fails the container
-// immediately instead of on the first user's call.
-const bank = createBank(bankConfig);
-const callbackPath = consentCallbackPath(bankConfig);
+const NOT_STARTED = 'Enable Banking MCP HTTP server not started';
 
-const httpServer = createNodeServer(async (req, res) => {
+async function main(): Promise<void> {
+  let config: HttpConfig;
   try {
-    if (req.url === '/healthz' && req.method === 'GET') {
-      sendJson(res, 200, { ok: true, company: bank.company, consent: bankConfig.consentEnabled }, req);
-      return;
-    }
-
-    // The bank's redirect (through the user's browser): no gateway, no token —
-    // the signed, single-use state is what authorises it.
-    if (callbackPath && req.method === 'GET' && req.url && new URL(req.url, 'http://local').pathname === callbackPath) {
-      await handleConsentCallback(bank, bankConfig, req.url, res);
-      return;
-    }
-
-    if (req.url !== '/mcp') {
-      sendJson(res, 404, { error: 'Not found' }, req);
-      return;
-    }
-
-    assertAllowedOrigin(req);
-
-    if (req.method === 'OPTIONS') {
-      res.writeHead(204, corsHeaders(req));
-      res.end();
-      return;
-    }
-
-    if (req.method !== 'POST') {
-      sendJson(res, 405, { error: 'Method not allowed' }, req, { Allow: 'POST' });
-      return;
-    }
-
-    assertAuthorized(req, config);
-    const body = await readJsonBody(req, config.maxBodyBytes);
-
-    // The gateway forwards the Entra-verified user as X-MCP-User (never the
-    // client's own header). Bank data without a named reader is not served.
-    const forwarded = bankConfig.trustForwardedUser ? firstHeaderValue(req.headers['x-mcp-user']) : undefined;
-    if (bankConfig.trustForwardedUser && !forwarded) {
-      throw new HttpRequestError(401, 'Missing X-MCP-User from the gateway');
-    }
-    const actingAs = forwarded ?? process.env.ENABLEBANKING_DEFAULT_USER ?? 'local';
-
-    const mcpServer = createMcpServer({ bank, config: bankConfig, actingAs });
-    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
-
-    await mcpServer.connect(transport);
-    await transport.handleRequest(req, res, body);
-
-    res.on('close', () => {
-      void transport.close();
-      void mcpServer.close();
-    });
+    config = getHttpConfig();
   } catch (error) {
-    console.error(error);
-    if (!res.headersSent) {
-      if (error instanceof HttpRequestError) {
-        sendJson(res, error.status, { error: error.message }, req);
-        return;
-      }
-      sendJson(res, 500, { jsonrpc: '2.0', error: { code: -32603, message: 'Internal server error' }, id: null }, req);
+    if (error instanceof ConfigError) {
+      console.error(`${NOT_STARTED}: ${error.message}`);
+      process.exit(1);
     }
+    throw error;
   }
-});
 
-function resolveHttpBankConfig() {
+  let bankConfig: ReturnType<typeof httpBankConfig>['config'];
+  let bank: ReturnType<typeof createBank>;
   try {
     const { config: effective, warnings } = httpBankConfig(loadConfig(), config);
     for (const warning of warnings) console.error(`WARNING: ${warning}`);
-    return effective;
+    bankConfig = effective;
+    // Built once, at startup: a bad registry, key or store fails the container
+    // immediately instead of on the first user's call.
+    bank = createBank(bankConfig);
   } catch (error) {
-    console.error(`FATAL: ${(error as Error).message}`);
+    console.error(`${NOT_STARTED}: ${error instanceof Error ? error.message : String(error)}`);
     process.exit(1);
   }
+
+  for (const warning of configWarnings(config)) {
+    console.error(warning);
+  }
+
+  const callbackPath = consentCallbackPath(bankConfig);
+  const defaultUser = process.env.ENABLEBANKING_DEFAULT_USER ?? 'local';
+
+  const running = await startHttpServer(config, {
+    healthPayload: () => ({ ok: true, company: bank.company, consent: bankConfig.consentEnabled }),
+    // The bank's redirect (through the user's browser): no proxy identity, no
+    // token. The signed, single-use state is what authorises it.
+    extraRoute: async (req, res, path) => {
+      if (!callbackPath || req.method !== 'GET' || path !== callbackPath) {
+        return false;
+      }
+      await handleConsentCallback(bank, bankConfig, req.url ?? path, res);
+      return true;
+    },
+    createMcpServer: (req: IncomingMessage) => {
+      // With ENABLEBANKING_TRUST_FORWARDED_USER=true an authenticating proxy
+      // in front forwards the verified user as X-MCP-User (never the client's
+      // own header). Bank data without a named reader is not served.
+      const forwarded = bankConfig.trustForwardedUser ? firstHeaderValue(req.headers['x-mcp-user']) : undefined;
+      if (bankConfig.trustForwardedUser && !forwarded) {
+        throw new HttpRequestError(401, 'Missing X-MCP-User from the gateway');
+      }
+      return createMcpServer({ bank, config: bankConfig, actingAs: forwarded ?? defaultUser });
+    },
+  });
+  console.error(
+    `Enable Banking MCP (${bank.company}) listening on http://${config.host}:${running.port}/mcp` +
+      (callbackPath ? ` (consent callback on ${callbackPath})` : ''),
+  );
+
+  const shutdown = (signal: string) => {
+    console.error(`Received ${signal}, shutting down`);
+    void running.close().then(() => process.exit(0));
+  };
+  process.once('SIGTERM', () => shutdown('SIGTERM'));
+  process.once('SIGINT', () => shutdown('SIGINT'));
 }
 
 function firstHeaderValue(value: string | string[] | undefined): string | undefined {
@@ -103,6 +83,7 @@ function firstHeaderValue(value: string | string[] | undefined): string | undefi
   return trimmed ? trimmed : undefined;
 }
 
-httpServer.listen(config.port, config.host, () => {
-  console.error(`Enable Banking MCP (${bank.company}) listening on http://${config.host}:${config.port}/mcp${callbackPath ? ` (consent callback on ${callbackPath})` : ''}`);
+main().catch(error => {
+  console.error(error);
+  process.exit(1);
 });

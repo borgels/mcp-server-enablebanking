@@ -1,3 +1,5 @@
+import { truncate } from './upstream-http.js';
+
 /** Non-2xx answer from the Enable Banking API. */
 export class EnableBankingHttpError extends Error {
   readonly status: number;
@@ -6,10 +8,12 @@ export class EnableBankingHttpError extends Error {
 
   constructor(init: { status: number; method: string; path: string; payload?: unknown }) {
     const payload = (typeof init.payload === 'object' && init.payload !== null ? init.payload : {}) as Record<string, unknown>;
-    const code = typeof payload.error === 'string' ? payload.error : typeof payload.code === 'string' ? payload.code : undefined;
+    const rawCode = typeof payload.error === 'string' ? payload.error : typeof payload.code === 'string' ? payload.code : undefined;
+    const code = rawCode === undefined ? undefined : truncate(redactSecrets(rawCode), 64);
+    // Redact before truncating, so a secret is never cut in half and left partly visible.
     const message = [payload.message, payload.detail]
       .filter((part): part is string => typeof part === 'string' && part.length > 0)
-      .map(part => redactSecrets(part))
+      .map(part => truncate(redactSecrets(part)))
       .join(' — ');
     super(
       `Enable Banking ${init.method} ${redactPath(init.path)} failed with HTTP ${init.status}` +
