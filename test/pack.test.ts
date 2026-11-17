@@ -28,5 +28,6 @@ describe('npm pack', () => {
     };
     expect(pkg.exports['./gateway']).toEqual({ types: './dist/gateway.d.ts', default: './dist/gateway.js' });
     expect(pkg.exports['.']).toBe('./dist/transports/stdio.js');
+    expect(pkg.exports['./package.json']).toBe('./package.json');
   });
 });

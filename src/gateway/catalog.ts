@@ -165,7 +165,7 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
       type: 'object',
       properties: {
         account: accountProperty,
-        from: dateProperty('First booking date, YYYY-MM-DD. Default: 30 days before `to`.'),
+        from: dateProperty('First booking date, YYYY-MM-DD. Default: 29 days before `to`, so the period is 30 days including both.'),
         to: dateProperty('Last booking date, YYYY-MM-DD. Default: today.'),
         status: { type: 'string', enum: ['booked', 'pending', 'all'], description: 'Default: booked.' },
         pageToken: { type: 'string', maxLength: 4096, description: 'nextPageToken from the previous page.' },
@@ -195,15 +195,18 @@ function operation(name: UpstreamName): GatewayUpstreamOperation {
   return { access: target.method === 'GET' ? 'read' : 'write', method: target.method, path: target.path };
 }
 
-/** Stable, unprefixed tool definitions (a fresh copy for each import). */
-export const enableBankingGatewayTools: GatewayToolDefinition[] = TOOL_SPECS.map(spec => ({
+/**
+ * Stable, unprefixed tool definitions. Deeply frozen, so no part of a host can
+ * change the list another part reads; a gateway's `tools` returns a mutable copy.
+ */
+export const enableBankingGatewayTools: readonly GatewayToolDefinition[] = deepFreeze(TOOL_SPECS.map(spec => ({
   name: spec.name,
   title: spec.title,
   description: spec.description,
   riskLevel: spec.riskLevel,
   enabledByDefault: spec.enabledByDefault,
   inputSchema: structuredClone(spec.inputSchema),
-}));
+})));
 
 /**
  * The tool catalog: every tool with its definition, the requests it may make,

@@ -13,8 +13,10 @@ serve many companies. The standalone stdio/HTTP server is unchanged.
   session at Enable Banking must still be authorised and contain it. Missing
   or empty credentials are refused with no fallback.
 - Tools `list_accounts`, `get_balances` (balances only) and
-  `list_transactions` (at most 366 days per call, paged with a token bound to
-  account and period). Read-only: no payment surface.
+  `list_transactions` (at most 366 days per period, default the last 30 days
+  including today; at most 1,000 rows per call, paged with a token signed by
+  the gateway instance and bound to account, period and status). Read-only: no
+  payment surface.
 - `enableBankingToolCatalog` (frozen; `upstream`, `broad`, `defaultRead`,
   `summary`, `exposure`, `transactionDetails`), `enableBankingServiceCatalog`
   and `resolveEnableBankingReadTarget`.
@@ -23,9 +25,14 @@ serve many companies. The standalone stdio/HTTP server is unchanged.
   `completeSession`, `sessionStatus`, `endSession`.
 - A redactor per gateway and per call; fixed upstream targets, time limits,
   bounded response bodies, no redirects.
-- `package.json` gains an `exports` map (`.` and `./gateway`) and the build
-  emits type declarations. Deep imports into `dist/` are no longer resolvable
-  through the package name.
+- `package.json` gains an `exports` map (`.`, `./gateway` and
+  `./package.json`) and the build emits type declarations.
+
+Upgrade notes: with the `exports` map, deep imports such as
+`mcp-server-enablebanking/dist/server.js` no longer resolve through the
+package name; import `mcp-server-enablebanking` (the stdio entry),
+`mcp-server-enablebanking/gateway` or `mcp-server-enablebanking/package.json`.
+The `bin` command and the container image are unchanged.
 
 ## 0.3.0 (2026-11-16)
 

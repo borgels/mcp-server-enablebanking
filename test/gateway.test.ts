@@ -127,7 +127,14 @@ describe('gateway: credentials per call', () => {
       expect(call.url.origin).toBe(ORIGIN);
       const [header, payload, signature] = call.authorization!.replace('Bearer ', '').split('.');
       expect(createVerify('RSA-SHA256').update(`${header}.${payload}`).verify(KEY.publicKey, Buffer.from(signature!, 'base64url'))).toBe(true);
-      expect(JSON.parse(Buffer.from(header!, 'base64url').toString()).kid).toBe('app-0000-test');
+      expect(JSON.parse(Buffer.from(header!, 'base64url').toString())).toEqual({ typ: 'JWT', alg: 'RS256', kid: 'app-0000-test' });
+      const claims = JSON.parse(Buffer.from(payload!, 'base64url').toString()) as { iss: string; aud: string; iat: number; exp: number };
+      expect(claims.iss).toBe('enablebanking.com');
+      expect(claims.aud).toBe('api.enablebanking.com');
+      // Enable Banking rejects a token living longer than 24 hours.
+      expect(claims.exp - claims.iat).toBeGreaterThan(0);
+      expect(claims.exp - claims.iat).toBeLessThanOrEqual(86_400);
+      expect(Math.abs(claims.iat - Date.now() / 1000)).toBeLessThan(60);
     }
   });
 
@@ -290,16 +297,85 @@ describe('gateway: reads', () => {
     const first = await gw.callTool('list_transactions', period, ctxA);
     expect(calls.filter(call => call.url.pathname.endsWith('/transactions'))).toHaveLength(5);
     const token = (first.structuredContent as { nextPageToken: string }).nextPageToken;
-    expect(token).toMatch(/^[A-Za-z0-9_-]+$/);
+    expect(token).toMatch(/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{43}$/);
 
     // The token works only with the same account and period.
     expect(text(await gw.callTool('list_transactions', { ...period, to: '2026-11-09', pageToken: token }, ctxA))).toMatch(/does not belong/);
     expect(text(await gw.callTool('list_transactions', { ...period, account: ACCOUNT_A2, pageToken: token }, ctxA))).toMatch(/does not belong/);
+    expect(text(await gw.callTool('list_transactions', { ...period, from: '2026-11-02', pageToken: token }, ctxA))).toMatch(/does not belong/);
+    expect(text(await gw.callTool('list_transactions', { ...period, status: 'all', pageToken: token }, ctxA))).toMatch(/does not belong/);
+    expect(text(await gw.callTool('list_transactions', { ...period, status: 'pending', pageToken: token }, ctxA))).toMatch(/does not belong/);
+    // The same token with the explicit default status is accepted.
+    expect((await gw.callTool('list_transactions', { ...period, status: 'booked', pageToken: token }, ctxA)).isError).toBeUndefined();
 
     calls.length = 0;
     await gw.callTool('list_transactions', { ...period, pageToken: token }, ctxA);
     const continued = calls.find(call => call.url.pathname.endsWith('/transactions'))!;
     expect(continued.url.searchParams.get('continuation_key')).toBe('key-5');
+  });
+
+  it('refuses a hand-made, altered or foreign page token before any transaction request', async () => {
+    const { calls, fetchImpl } = stubApi({
+      handle: call =>
+        call.url.pathname.endsWith('/transactions') ? json({ transactions: [], continuation_key: 'next-key' }) : undefined,
+    });
+    const gw = gateway(fetchImpl);
+    const period = { account: ACCOUNT_A1, from: '2026-11-01', to: '2026-11-10' };
+    const issued = (await gw.callTool('list_transactions', period, ctxA)).structuredContent as { nextPageToken: string };
+    const [payload, mac] = issued.nextPageToken.split('.') as [string, string];
+    const claims = { k: 'chosen-key', o: 0, a: ACCOUNT_A1, f: '2026-11-01', t: '2026-11-10', s: 'booked' };
+    const forged = Buffer.from(JSON.stringify(claims)).toString('base64url');
+    const flipped = `${mac.slice(0, -1)}${mac.endsWith('A') ? 'B' : 'A'}`;
+    const foreign = ((await gateway(fetchImpl).callTool('list_transactions', period, ctxA)).structuredContent as { nextPageToken: string })
+      .nextPageToken;
+    calls.length = 0;
+    for (const token of [`${forged}.${mac}`, `${forged}.${'A'.repeat(43)}`, `${payload}.${flipped}`, foreign, forged, `${payload}.${mac}.x`]) {
+      const result = await gw.callTool('list_transactions', { ...period, pageToken: token }, ctxA);
+      expect(result.isError, token).toBe(true);
+      expect(text(result)).toMatch(/pageToken (was not issued here|does not belong)/);
+    }
+    expect(calls.some(call => call.url.pathname.endsWith('/transactions'))).toBe(false);
+  });
+
+  it('returns at most 1,000 rows, cutting the last page and continuing inside it', async () => {
+    const pageRows = (page: number) =>
+      Array.from({ length: 400 }, (_, i) => ({
+        entry_reference: `p${page}-${i}`,
+        transaction_amount: { currency: 'DKK', amount: '1.00' },
+        credit_debit_indicator: 'CRDT',
+        status: 'BOOK',
+        booking_date: '2026-11-05',
+      }));
+    const { calls, fetchImpl } = stubApi({
+      handle: call => {
+        if (!call.url.pathname.endsWith('/transactions')) return undefined;
+        const key = call.url.searchParams.get('continuation_key');
+        const page = key ? Number(key.slice(5)) : 1;
+        return json({ transactions: pageRows(page), continuation_key: page < 4 ? `page-${page + 1}` : null });
+      },
+    });
+    const gw = gateway(fetchImpl);
+    const period = { account: ACCOUNT_A1, from: '2026-11-01', to: '2026-11-10' };
+    const first = (await gw.callTool('list_transactions', period, ctxA)).structuredContent as {
+      transactions: Array<{ reference: string }>;
+      nextPageToken: string;
+    };
+    expect(first.transactions).toHaveLength(1000);
+    const firstRefs = new Set(first.transactions.map(row => row.reference));
+    expect(firstRefs.has('p3-199')).toBe(true);
+    expect(firstRefs.has('p3-200')).toBe(false);
+
+    calls.length = 0;
+    const second = (await gw.callTool('list_transactions', { ...period, pageToken: first.nextPageToken }, ctxA)).structuredContent as {
+      transactions: Array<{ reference: string }>;
+      nextPageToken?: string;
+    };
+    const keys = calls.filter(call => call.url.pathname.endsWith('/transactions')).map(call => call.url.searchParams.get('continuation_key'));
+    expect(keys).toEqual(['page-3', 'page-4']);
+    expect(second.transactions).toHaveLength(600);
+    expect(second.nextPageToken).toBeUndefined();
+    const all = [...first.transactions, ...second.transactions].map(row => row.reference);
+    expect(new Set(all).size).toBe(1600);
   });
 
   it('bounds the period and the dates', () => {
@@ -310,7 +386,7 @@ describe('gateway: reads', () => {
     expect(resolve({ to: '2027-01-01' })).toMatchObject({ ok: false, reason: expect.stringMatching(/future/) });
     expect(resolve({})).toEqual({
       ok: true,
-      target: { tool: 'list_transactions', exposure: 'transactions', account: ACCOUNT_A1, from: '2026-10-18', to: '2026-11-17', status: 'booked' },
+      target: { tool: 'list_transactions', exposure: 'transactions', account: ACCOUNT_A1, from: '2026-10-19', to: '2026-11-17', status: 'booked' },
     });
     expect(resolveEnableBankingReadTarget('get_balances', { account: ACCOUNT_A1, extra: 1 })).toMatchObject({ ok: false, reason: expect.stringMatching(/Unknown input/) });
     expect(resolveEnableBankingReadTarget('initiate_payment', {})).toMatchObject({ ok: false, reason: expect.stringMatching(/Unsupported/) });
@@ -399,6 +475,17 @@ describe('gateway: catalog and surface', () => {
     }
     const sources = ['../src/gateway.ts', '../src/gateway/client.ts', '../src/gateway/catalog.ts'].map(file => readFileSync(new URL(file, import.meta.url), 'utf8'));
     for (const source of sources) expect(source).not.toMatch(/\/payments/);
+  });
+
+  it('gives every caller its own tool list', () => {
+    expect(Object.isFrozen(gatewayModule.enableBankingGatewayTools)).toBe(true);
+    expect(Object.isFrozen(gatewayModule.enableBankingGatewayTools[0]!.inputSchema)).toBe(true);
+    const gw = gateway(stubApi().fetchImpl);
+    const mine = gw.tools;
+    mine[0]!.description = 'changed';
+    mine.pop();
+    expect(gw.tools).toHaveLength(3);
+    expect(gw.tools[0]!.description).not.toBe('changed');
   });
 
   it('is deeply frozen and marks what each tool exposes', () => {

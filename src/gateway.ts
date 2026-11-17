@@ -1,5 +1,5 @@
-import { createPrivateKey, type KeyObject } from 'node:crypto';
-import type { AccountResource, SessionStatus } from './enablebanking/client.js';
+import { createHmac, createPrivateKey, randomBytes, timingSafeEqual, type KeyObject } from 'node:crypto';
+import type { AccountResource, SessionStatus, TransactionResource } from './enablebanking/client.js';
 import { balanceView, isoDate, summarize, transactionView, type TransactionView } from './enablebanking/format.js';
 import { maskIban, normalizeIban } from './enablebanking/registry.js';
 import {
@@ -15,6 +15,7 @@ import {
   SPEC_BY_NAME,
   enableBankingGatewayTools,
   type EnableBankingExposure,
+  type GatewayToolDefinition,
   type GatewayJsonObject,
   type GatewayJsonValue,
 } from './gateway/catalog.js';
@@ -216,29 +217,60 @@ function isValidDate(value: string): boolean {
   return !Number.isNaN(parsed.getTime()) && isoDate(parsed) === value;
 }
 
+/**
+ * A page token: where the next page starts (the Enable Banking continuation
+ * key of the page to fetch, empty for the first page, and how many rows of
+ * that page were already returned), bound to account, period and status.
+ * Signed with HMAC-SHA256 under a random key of the gateway instance, so a
+ * token is only accepted by the instance that issued it and cannot be made
+ * by hand.
+ */
 interface PageToken {
   k: string;
+  o: number;
   a: string;
   f: string;
   t: string;
   s: string;
 }
 
-function encodePageToken(token: PageToken): string {
-  return Buffer.from(JSON.stringify(token)).toString('base64url');
+const MAX_CONTINUATION_KEY_LENGTH = 2048;
+/** Rows of one bank page a token may skip (banks with very large pages). */
+const MAX_PAGE_OFFSET = 100_000;
+
+/** The token's content, unverified (for resolving what a call reads). */
+function pagePayload(value: string): PageToken | undefined {
+  const [payload, mac, ...rest] = value.split('.');
+  if (!payload || !mac || rest.length > 0 || !/^[A-Za-z0-9_-]{1,4096}$/.test(payload) || !/^[A-Za-z0-9_-]{43}$/.test(mac)) {
+    return undefined;
+  }
+  try {
+    const parsed = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')) as Partial<PageToken>;
+    const strings = (['k', 'a', 'f', 't', 's'] as const).every(key => typeof parsed[key] === 'string');
+    const offset = parsed.o;
+    if (!strings || typeof offset !== 'number' || !Number.isSafeInteger(offset) || offset < 0 || offset > MAX_PAGE_OFFSET) {
+      return undefined;
+    }
+    if (parsed.k!.length > MAX_CONTINUATION_KEY_LENGTH || (!parsed.k && offset === 0)) return undefined;
+    return parsed as PageToken;
+  } catch {
+    return undefined;
+  }
 }
 
-function decodePageToken(value: string): PageToken | undefined {
-  if (!/^[A-Za-z0-9_-]{1,4096}$/.test(value)) return undefined;
-  try {
-    const parsed = JSON.parse(Buffer.from(value, 'base64url').toString('utf8')) as Partial<PageToken>;
-    if (['k', 'a', 'f', 't', 's'].every(key => typeof parsed[key as keyof PageToken] === 'string') && parsed.k) {
-      return parsed as PageToken;
-    }
-  } catch {
-    // fall through
-  }
-  return undefined;
+function signPageToken(key: Buffer, token: PageToken): string {
+  const payload = Buffer.from(JSON.stringify(token)).toString('base64url');
+  return `${payload}.${createHmac('sha256', key).update(payload).digest('base64url')}`;
+}
+
+/** The token's content when it carries this instance's signature (constant-time comparison). */
+function verifyPageToken(key: Buffer, value: string): PageToken | undefined {
+  const token = pagePayload(value);
+  if (!token) return undefined;
+  const [payload, mac] = value.split('.') as [string, string];
+  const expected = createHmac('sha256', key).update(payload).digest();
+  const given = Buffer.from(mac, 'base64url');
+  return given.length === expected.length && timingSafeEqual(given, expected) ? token : undefined;
 }
 
 /**
@@ -276,7 +308,8 @@ export function resolveEnableBankingReadTarget(
   const today = isoDate(new Date(now));
   const to = (input.to as string | null | undefined) ?? today;
   if (!isValidDate(to)) return refuse('to must be a date, YYYY-MM-DD.');
-  const from = (input.from as string | null | undefined) ?? isoDate(new Date(Date.parse(to) - DEFAULT_RANGE_DAYS * DAY_MS));
+  // The default period is DEFAULT_RANGE_DAYS days including `to`.
+  const from = (input.from as string | null | undefined) ?? isoDate(new Date(Date.parse(to) - (DEFAULT_RANGE_DAYS - 1) * DAY_MS));
   if (!isValidDate(from)) return refuse('from must be a date, YYYY-MM-DD.');
   if (from > to) return refuse(`from (${from}) is after to (${to}).`);
   if (to > isoDate(new Date(now + DAY_MS))) return refuse('to cannot be in the future.');
@@ -285,7 +318,8 @@ export function resolveEnableBankingReadTarget(
   }
   const pageToken = input.pageToken as string | null | undefined;
   if (pageToken) {
-    const token = decodePageToken(pageToken);
+    // The signature is checked by callTool, which holds the instance key.
+    const token = pagePayload(pageToken);
     if (!token || token.a !== account || token.f !== from || token.t !== to || token.s !== status) {
       return refuse('pageToken does not belong to this account and period; start again without it.');
     }
@@ -341,6 +375,8 @@ export function createEnableBankingGateway(options: EnableBankingGatewayOptions)
     );
   }
   const redactor = new GatewayRedactor();
+  // Signs page tokens; never leaves the instance.
+  const pageKey = randomBytes(32);
   let key: KeyObject;
   if (typeof options.privateKey === 'string') {
     if (!options.privateKey.trim()) throw new Error('createEnableBankingGateway: privateKey is required.');
@@ -385,7 +421,10 @@ export function createEnableBankingGateway(options: EnableBankingGatewayOptions)
   }
 
   return {
-    tools: enableBankingGatewayTools,
+    /** A fresh copy on each read, so one part of the host cannot change another's list. */
+    get tools(): GatewayToolDefinition[] {
+      return structuredClone(enableBankingGatewayTools) as GatewayToolDefinition[];
+    },
 
     async callTool(toolName: string, input: GatewayJsonObject = {}, context?: GatewayCallContext): Promise<GatewayToolResult> {
       const callRedactor = redactor.fork();
@@ -412,8 +451,14 @@ export function createEnableBankingGateway(options: EnableBankingGatewayOptions)
             return await listAccounts(client, credentials.accountIds, consent);
           case 'get_balances':
             return await getBalances(client, target.account!);
-          default:
-            return await listTransactions(client, target, input.pageToken as string | undefined);
+          default: {
+            let start: PageToken | undefined;
+            if (target.continued) {
+              start = verifyPageToken(pageKey, input.pageToken as string);
+              if (!start) return errorResult('pageToken was not issued here for this account and period; start again without it.');
+            }
+            return await listTransactions(client, pageKey, target, start);
+          }
         }
       } catch (error) {
         return errorResult(callRedactor.message(error));
@@ -690,35 +735,56 @@ async function getBalances(client: GatewayClient, account: string): Promise<Gate
 
 async function listTransactions(
   client: GatewayClient,
+  pageKey: Buffer,
   target: { account?: string; from?: string; to?: string; status?: 'booked' | 'pending' | 'all' },
-  pageToken: string | undefined,
+  start: PageToken | undefined,
 ): Promise<GatewayToolResult> {
   const account = target.account!;
   const from = target.from!;
   const to = target.to!;
   const status = target.status ?? 'booked';
-  let continuationKey = pageToken ? decodePageToken(pageToken)?.k : undefined;
-  const raw = [];
+  const raw: TransactionResource[] = [];
+  // The page to fetch next (undefined: the first page) and how many of its rows to skip.
+  let continuation: string | undefined = start?.k || undefined;
+  let skip = start?.o ?? 0;
+  let next: { k: string; o: number } | undefined;
   for (let page = 0; page < MAX_PAGES_PER_CALL; page++) {
+    const fetchedWith = continuation;
     const result = await client.getTransactionsPage(account, {
       dateFrom: from,
       dateTo: to,
       ...(status === 'booked' ? { status: 'BOOK' as const } : status === 'pending' ? { status: 'PDNG' as const } : {}),
-      ...(continuationKey ? { continuationKey } : {}),
+      ...(fetchedWith ? { continuationKey: fetchedWith } : {}),
     });
-    raw.push(...result.transactions);
-    continuationKey = result.continuationKey;
-    if (!continuationKey || raw.length >= MAX_ROWS_PER_CALL) break;
+    const rows = result.transactions.slice(skip);
+    const room = MAX_ROWS_PER_CALL - raw.length;
+    if (rows.length > room) {
+      // Cut the page: the next call fetches the same page again and skips what was returned.
+      raw.push(...rows.slice(0, room));
+      next = { k: fetchedWith ?? '', o: skip + room };
+      break;
+    }
+    raw.push(...rows);
+    skip = 0;
+    continuation = result.continuationKey;
+    if (!continuation) break;
+    if (raw.length >= MAX_ROWS_PER_CALL || page === MAX_PAGES_PER_CALL - 1) {
+      next = { k: continuation, o: 0 };
+      break;
+    }
+  }
+  let incomplete = false;
+  if (next && (next.k.length > MAX_CONTINUATION_KEY_LENGTH || next.o > MAX_PAGE_OFFSET)) {
+    // The bank's page key is too long (or a single page too large) to hand on.
+    next = undefined;
+    incomplete = true;
   }
   let rows: TransactionView[] = raw.map(transactionView);
   // Some banks ignore transaction_status; filter here too.
   if (status === 'booked') rows = rows.filter(row => row.status === 'BOOK');
   if (status === 'pending') rows = rows.filter(row => row.status !== 'BOOK');
   rows.sort((a, b) => (b.bookingDate ?? b.valueDate ?? '').localeCompare(a.bookingDate ?? a.valueDate ?? ''));
-  const nextPageToken =
-    continuationKey && continuationKey.length <= 2048
-      ? encodePageToken({ k: continuationKey, a: account, f: from, t: to, s: status })
-      : undefined;
+  const nextPageToken = next ? signPageToken(pageKey, { ...next, a: account, f: from, t: to, s: status }) : undefined;
   const structured = {
     account,
     from,
@@ -728,8 +794,8 @@ async function listTransactions(
     totals: summarize(rows),
     transactions: rows,
     ...(nextPageToken ? { nextPageToken } : {}),
-    // The bank said there is more, but its page key is too long to hand on: ask for a shorter period.
-    ...(continuationKey && !nextPageToken ? { incomplete: true } : {}),
+    // The bank said there is more, but where to continue cannot be handed on: ask for a shorter period.
+    ...(incomplete ? { incomplete: true } : {}),
   };
   const more = nextPageToken ? ' More lines follow: pass nextPageToken as pageToken.' : '';
   return jsonResult(`${rows.length} transaction(s) from ${from} to ${to}.${more}`, structured);

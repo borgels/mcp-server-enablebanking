@@ -9,7 +9,8 @@
     "./gateway": {
       "types": "./dist/gateway.d.ts",
       "default": "./dist/gateway.js"
-    }
+    },
+    "./package.json": "./package.json"
   },
   "files": [
     "dist",

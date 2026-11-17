@@ -219,7 +219,7 @@ const result = await gateway.callTool('get_balances', { account: accountId }, {
 |---|---|---|---|
 | `list_accounts` | The connected accounts: id, name, masked IBAN, currency, product; when the consent expires | `accounts` | no |
 | `get_balances` | Balances of one account (booked, available), decimal strings | `balances` | no |
-| `list_transactions` | Bank lines of one account in at most 366 days (default the last 30, booked only), with counterparty, text, reference and totals; paged with `nextPageToken`/`pageToken` | `transactions` | yes |
+| `list_transactions` | Bank lines of one account in at most 366 days (default the last 30 including today, booked only), with counterparty, text, reference and totals; at most 1,000 rows per call, paged with `nextPageToken`/`pageToken` (signed by the gateway instance, bound to account, period and status) | `transactions` | yes |
 
 `enableBankingToolCatalog` (deeply frozen) gives each tool's definition plus
 `upstream` (every request it may make), `broad` (always `false`),
