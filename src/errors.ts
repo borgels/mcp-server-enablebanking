@@ -102,27 +102,42 @@ export class EnableBankingHttpError extends Error {
   }
 }
 
-/** Values nested deeper than this are replaced by nestedFailuresAsStatus. */
-const MAX_DEPTH = 64;
+/** Keys whose value is a failure context: anything inside that carries an error or a message is a failure. */
+const FAILURE_CONTEXTS = new Set(['failures', 'failure', 'errors', 'error', 'metadata', 'warnings', 'amount']);
+/** Fields that make an object in a failure context a failure. */
+const FAILURE_FIELDS = ['error', 'errors', 'message', 'detail', 'description'];
 
 /**
- * Copy of a successful answer with every failure reported inside it (an
- * object with an `error` field) reduced to its HTTP status and our own text:
- * message, code, detail and the like are dropped. Depth-limited.
+ * Copy of a successful body with every failure reported inside it reduced to
+ * its HTTP status and our own text. A failure is an object with a numeric
+ * `status` of 400 or more, an object with an `error` field, or an
+ * object in a failure context (`failures[]`, `errors[]`, `metadata`, `amount`
+ * and the like) with any of `error`, `errors`, `message`, `detail` or
+ * `description`. Its message, code, detail and every other field are
+ * dropped. Depth-limited.
  */
-export function nestedFailuresAsStatus(value: unknown, depth = 0): unknown {
-  if (depth > MAX_DEPTH) return '[nested too deep]';
-  if (typeof value !== 'object' || value === null) return value;
-  if (Array.isArray(value)) return value.map(entry => nestedFailuresAsStatus(entry, depth + 1));
+export function nestedFailuresAsStatus(value: unknown, depth = 0, context = false): unknown {
+  if (depth > 64) {
+    return '[nested too deep]';
+  }
+  if (typeof value !== 'object' || value === null) {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map(entry => nestedFailuresAsStatus(entry, depth + 1, context));
+  }
   const record = value as Record<string, unknown>;
-  if (Object.hasOwn(record, 'error') && record.error !== null && record.error !== undefined) {
-    const status = record.status;
-    const valid = typeof status === 'number' && Number.isInteger(status) && status >= 100 && status <= 599;
-    return valid
+  const status = record.status;
+  const failedStatus = typeof status === 'number' && Number.isInteger(status) && status >= 400 && status <= 599;
+  const present = (field: string) => Object.hasOwn(record, field) && record[field] !== null && record[field] !== undefined;
+  if (failedStatus || present('error') || (context && FAILURE_FIELDS.some(present))) {
+    return failedStatus
       ? { status, error: `Enable Banking reported a failure with HTTP ${status}.` }
       : { error: 'Enable Banking reported a failure.' };
   }
-  return Object.fromEntries(Object.entries(record).map(([key, entry]) => [key, nestedFailuresAsStatus(entry, depth + 1)]));
+  return Object.fromEntries(
+    Object.entries(record).map(([key, entry]) => [key, nestedFailuresAsStatus(entry, depth + 1, FAILURE_CONTEXTS.has(key))]),
+  );
 }
 
 /** Account uids and session ids are bearer-like in combination with the key: keep them out of messages. */
