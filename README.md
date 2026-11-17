@@ -317,7 +317,11 @@ and returns the account and period a call will read, for the host's log.
 
 Plain functions on the gateway instance, for the host's own connect page.
 They are not tools, so an AI client cannot reach them. They throw
-`EnableBankingGatewayError` with a redacted message and no `cause`.
+`EnableBankingGatewayError` with a redacted message and no `cause`. An
+error that would still hold a piece of a registered value after sealing
+(checked raw and encoded), and any call where Enable Banking returned a
+session id that is not printable ASCII, ends in the ultimate fallback
+instead: a plain `Error` with an empty message and the stack `Error`.
 
 - `listBanks({ country = 'DK', psuType = 'business' })`: banks offering
   account information, with `maximumConsentDays`.
