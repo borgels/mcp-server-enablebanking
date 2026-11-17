@@ -17,7 +17,7 @@
 
 /**
  * What a redacted value is replaced by. Its brackets are not ASCII, so it cannot be a piece of the key's base64
- * content or of a session id; a key whose content shares a FRAGMENT_LENGTH piece with it is refused (overlapsMarker).
+ * content or of a session id; a key whose content shares a FRAGMENT_LENGTH piece with any text of ours is refused (src/key-admission.ts).
  */
 export const REDACTION_MARKER = '‹redacted›';
 
@@ -129,9 +129,10 @@ export class GatewayRedactor {
   message(error: unknown): string {
     const raw = error instanceof Error ? error.message : typeof error === 'string' ? error : 'Unknown error';
     const redacted = this.redact(raw);
-    return redacted.length > MAX_ERROR_MESSAGE_LENGTH
-      ? `${redacted.slice(0, MAX_ERROR_MESSAGE_LENGTH)}... [truncated]`
-      : redacted;
+    const assembled =
+      redacted.length > MAX_ERROR_MESSAGE_LENGTH ? `${redacted.slice(0, MAX_ERROR_MESSAGE_LENGTH)}... [truncated]` : redacted;
+    // The final pass, over the whole message as it leaves.
+    return this.redactValues(assembled);
   }
 
   /** Every run of text covered by a piece of the key becomes one ‹redacted›. */
