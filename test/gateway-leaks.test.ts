@@ -531,6 +531,49 @@ describe('round 11', () => {
   });
 });
 
+describe('round 14', () => {
+  it('ends in the ultimate fallback when masking could make a piece of a returned session id', async () => {
+    const RETURNED = 'Enable\u2026BankiZq7pX2';
+    const answers = [
+      () => json({ session_id: RETURNED, accounts: [] }),
+      () => json({ session_id: RETURNED, accounts: [], error: 'vendor diagnostic' }),
+      () => json({ session_id: RETURNED, error: 'vendor diagnostic' }, 500),
+    ];
+    for (const answer of answers) {
+      const gateway = gatewayWith(url => (url.pathname === '/sessions' ? answer() : json({}, 404)));
+      let caught: Error | undefined;
+      try {
+        await gateway.completeSession({ code: 'code-0123456789' });
+      } catch (error) {
+        caught = error as Error;
+      }
+      expect(caught).toBeInstanceOf(Error);
+      const ultimate = caught!.name === 'Error' && caught!.message === '' && caught!.stack === 'Error';
+      expect(ultimate || caught!.stack === `${caught!.name}: ${caught!.message}`).toBe(true);
+      expect(ultimate).toBe(true);
+      expect(JSON.stringify(caught)).toBe('{}');
+      const fields = [caught!.name, caught!.message, String(caught!.stack), JSON.stringify(caught)];
+      for (let i = 0; i + 6 <= RETURNED.length; i += 1) {
+        for (const field of fields) expect(field).not.toContain(RETURNED.slice(i, i + 6));
+      }
+    }
+  });
+
+  it('leaves every error either sealed in final form or as the ultimate fallback', async () => {
+    const RETURNED = 'EnableBankingGatewayError_Zq7pX2';
+    const gateway = gatewayWith(url => (url.pathname === '/sessions' ? json({ session_id: RETURNED, status: 500 }) : json({}, 404)));
+    let caught: Error | undefined;
+    try {
+      await gateway.completeSession({ code: 'code-0123456789' });
+    } catch (error) {
+      caught = error as Error;
+    }
+    expect(caught).toBeInstanceOf(Error);
+    const ultimate = caught!.name === 'Error' && caught!.message === '' && caught!.stack === 'Error';
+    expect(ultimate || caught!.stack === `${caught!.name}: ${caught!.message}`).toBe(true);
+  });
+});
+
 describe('round 13', () => {
   it('registers a returned session id from the raw answer, before the normalisation can drop it', async () => {
     const RETURNED = 'EnableBankingGatewayError_Zq7pX2';
@@ -571,7 +614,9 @@ describe('round 12', () => {
       for (let i = 0; i + 6 <= RETURNED.length; i += 1) {
         for (const field of fields) expect(field, RETURNED).not.toContain(RETURNED.slice(i, i + 6));
       }
-      expect(String(caught!.stack)).toBe(`${caught!.name}: ${caught!.message}`);
+      // Sealed in final form, or (a returned id that is not printable ASCII) the ultimate fallback.
+      const ultimate = caught!.name === 'Error' && caught!.message === '' && caught!.stack === 'Error';
+      expect(ultimate || caught!.stack === `${caught!.name}: ${caught!.message}`, RETURNED).toBe(true);
     }
   });
 });
