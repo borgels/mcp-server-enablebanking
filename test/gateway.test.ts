@@ -725,9 +725,9 @@ describe('round 6', () => {
         rows: [{ status: 200, message: 'kept' }],
       }),
     ).toEqual({
-      failures: [{ status: 403, error: 'Enable Banking reported a failure with HTTP 403.' }],
+      failures: [{ status: 403, message: 'Enable Banking reported a failure with HTTP 403.' }],
       metadata: { status: 401, error: 'Enable Banking reported a failure with HTTP 401.' },
-      errors: [{ error: 'Enable Banking reported a failure.' }],
+      errors: [{ message: 'Enable Banking reported a failure.' }],
       amount: { error: 'Enable Banking reported a failure.' },
       rows: [{ status: 200, message: 'kept' }],
     });
