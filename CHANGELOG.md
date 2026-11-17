@@ -2,6 +2,9 @@
 
 ## 0.4.1 (2026-11-17)
 
+- Consent helpers check the state, code or session id they are given as
+  printable ASCII inside their error boundary, before anything encodes it,
+  and refuse anything else with a fixed error in final form.
 - Errors leave in final form: every error a gateway throws is a fresh
   error with no `cause`, a `stack` of just `name: message` (no frames,
   paths or function names), and name, message and stack masked against the
