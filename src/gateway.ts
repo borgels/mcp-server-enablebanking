@@ -521,18 +521,23 @@ function buildEnableBankingGateway(options: EnableBankingGatewayOptions) {
     // Every secret of the call: the inputs and anything registered while the call runs (a returned session id).
     // All of them are in the final seal and in the sink check of any error that leaves.
     const secrets: string[] = [];
+    // A value of the call: always in the final mask; added to redaction and the sink check (which encode it) only
+    // when it is printable ASCII, so nothing is encoded that could make the encoding throw.
     const register = (secret: string) => {
-      if (!PRINTABLE_SECRET.test(secret)) throw new Error(INPUT_REFUSED);
       secrets.push(secret);
-      callRedactor.add(secret);
-      callRedactor.watch(secret);
+      if (PRINTABLE_SECRET.test(secret)) {
+        callRedactor.add(secret);
+        callRedactor.watch(secret);
+      }
     };
     let answer: unknown;
     try {
       // Inside the error boundary: each value is checked as printable ASCII before anything encodes it (a lone
       // surrogate would make the encoding throw), then registered.
       for (const input of inputs) {
-        if (input !== undefined) register(input);
+        if (input === undefined) continue;
+        register(input);
+        if (!PRINTABLE_SECRET.test(input)) throw new Error(INPUT_REFUSED);
       }
       // The answer is the host's data (the session id included); only the instance's key is removed from it.
       // The outer pass is the final one, over the assembled answer.
@@ -693,11 +698,12 @@ function buildEnableBankingGateway(options: EnableBankingGatewayOptions) {
         if (typeof code !== 'string' || !CODE_PATTERN.test(code)) throw new Error('completeSession: code is missing or malformed.');
         const session = await client.createSession(code);
         const sessionId = session?.session_id;
+        // The returned session id is a secret of this call from here on, before its format is checked: in the final
+        // seal and, when printable, in the sink check.
+        if (typeof sessionId === 'string') register(sessionId);
         if (typeof sessionId !== 'string' || !ID_PATTERN.test(sessionId)) {
           throw new Error('completeSession: Enable Banking did not return a usable session.');
         }
-        // The returned session id is a secret of this call from here on: in the final seal and sink check.
-        register(sessionId);
         if (!sessionAdmitted(sessionId)) {
           // The sink check on the finished refusal, against the key and the session id.
           const check = redactor.fork();
