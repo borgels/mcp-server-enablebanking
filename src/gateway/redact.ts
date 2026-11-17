@@ -3,10 +3,24 @@
  * holding its key material; each call forks it and adds the call's session id
  * (and, for the consent helpers, the authorization code). Nothing is added to
  * process-wide state, so one company's values never reach another call.
+ *
+ * Redaction is the second line: the gateway's own errors carry no text from
+ * Enable Banking or a bank (see errors.ts). What it removes:
+ * - every value added: exactly, URL-encoded and JSON-escaped;
+ * - for the key material, also every piece of it of FRAGMENT_LENGTH
+ *   characters, so a part of the key is not left after a cut or an echo.
+ *   Session ids and authorization codes are matched whole: a session id is a
+ *   UUID like the account ids the results must keep.
+ * Errors also pass through the patterns below. Results are redacted as
+ * values (redactDeep), before they are serialised.
  */
 
 /** Values shorter than this are not redacted by value (too likely to hit normal text). */
-const MIN_SECRET_LENGTH = 8;
+export const MIN_SECRET_LENGTH = 8;
+/** Pieces of the key material this long or longer are redacted wherever they appear. */
+export const FRAGMENT_LENGTH = 6;
+/** Values nested deeper than this are replaced by redactDeep, never passed on. */
+export const MAX_REDACT_DEPTH = 64;
 /** Upper bound on values held by one redactor; the oldest are dropped first. */
 export const MAX_REDACTED_VALUES = 64;
 /** Longest error message the gateway returns. */
@@ -24,19 +38,30 @@ const PATTERNS: Array<[RegExp, string]> = [
 
 export class GatewayRedactor {
   private readonly values = new Set<string>();
+  private readonly fragments = new Set<string>();
 
-  /** Adds a value (and its URL-encoded form). Short or empty values are ignored. */
+  /** Adds a value (and its URL-encoded and JSON-escaped forms), matched whole. Short or empty values are ignored. */
   add(value: string | undefined): void {
     if (typeof value !== 'string' || value.length < MIN_SECRET_LENGTH) return;
-    this.remember(value);
-    const encoded = encodeURIComponent(value);
-    if (encoded !== value) this.remember(encoded);
+    for (const form of forms(value)) this.remember(form);
+  }
+
+  /**
+   * Adds key material: the value as with add, and its content without
+   * PEM armour and whitespace, with every piece of FRAGMENT_LENGTH characters.
+   */
+  addKey(value: string): void {
+    this.add(value);
+    const content = value.replace(/-----(BEGIN|END) [A-Z ]*-----/g, '').replace(/\s+/g, '');
+    this.add(content);
+    for (let i = 0; i + FRAGMENT_LENGTH <= content.length; i += 1) this.fragments.add(content.slice(i, i + FRAGMENT_LENGTH));
   }
 
   /** A new redactor with the same values; adding to the fork does not change this one. */
   fork(): GatewayRedactor {
     const copy = new GatewayRedactor();
     for (const value of this.values) copy.remember(value);
+    for (const fragment of this.fragments) copy.fragments.add(fragment);
     return copy;
   }
 
@@ -44,14 +69,36 @@ export class GatewayRedactor {
     return this.values.size;
   }
 
-  redact(text: string): string {
+  /** The values and the pieces of the key removed; no patterns. For results, which keep their account ids. */
+  redactValues(text: string): string {
     let result = text;
     // Longest first, so a value containing another is removed whole.
     for (const value of [...this.values].sort((a, b) => b.length - a.length)) {
       result = result.split(value).join('[REDACTED]');
     }
+    return this.fragments.size === 0 ? result : this.redactFragments(result);
+  }
+
+  /** The values, the pieces of the key and the credential patterns removed. For errors. */
+  redact(text: string): string {
+    let result = this.redactValues(text);
     for (const [pattern, replacement] of PATTERNS) result = result.replace(pattern, replacement);
     return result;
+  }
+
+  /**
+   * Copy of a JSON-like value with every string, object keys included, passed
+   * through redactValues. Anything nested deeper than MAX_REDACT_DEPTH is
+   * replaced, never passed on.
+   */
+  redactDeep(value: unknown, depth = 0): unknown {
+    if (depth > MAX_REDACT_DEPTH) return '[nested too deep]';
+    if (typeof value === 'string') return this.redactValues(value);
+    if (typeof value !== 'object' || value === null) return value;
+    if (Array.isArray(value)) return value.map(entry => this.redactDeep(entry, depth + 1));
+    return Object.fromEntries(
+      Object.entries(value).map(([key, entry]) => [this.redactValues(key), this.redactDeep(entry, depth + 1)]),
+    );
   }
 
   /** The message of an error (or any thrown value), redacted and then shortened. */
@@ -61,6 +108,25 @@ export class GatewayRedactor {
     return redacted.length > MAX_ERROR_MESSAGE_LENGTH
       ? `${redacted.slice(0, MAX_ERROR_MESSAGE_LENGTH)}... [truncated]`
       : redacted;
+  }
+
+  /** Every run of text covered by a piece of the key becomes one [REDACTED]. */
+  private redactFragments(text: string): string {
+    const covered = new Uint8Array(text.length);
+    let any = false;
+    for (let i = 0; i + FRAGMENT_LENGTH <= text.length; i += 1) {
+      if (this.fragments.has(text.slice(i, i + FRAGMENT_LENGTH))) {
+        covered.fill(1, i, i + FRAGMENT_LENGTH);
+        any = true;
+      }
+    }
+    if (!any) return text;
+    let out = '';
+    for (let i = 0; i < text.length; i += 1) {
+      if (!covered[i]) out += text[i];
+      else if (i === 0 || !covered[i - 1]) out += '[REDACTED]';
+    }
+    return out;
   }
 
   private remember(value: string): void {
@@ -73,4 +139,9 @@ export class GatewayRedactor {
       this.values.delete(oldest);
     }
   }
+}
+
+/** The value as it may appear: raw, URL-encoded and escaped inside a JSON string. */
+function forms(value: string): string[] {
+  return [...new Set([value, encodeURIComponent(value), JSON.stringify(value).slice(1, -1)])];
 }
