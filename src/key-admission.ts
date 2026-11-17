@@ -96,6 +96,10 @@ export function visibleTexts(value: unknown): string[] {
   if (json !== undefined) texts.push(json);
   const visit = (entry: unknown, depth: number): void => {
     if (depth > MAX_VISIBLE_DEPTH) throw new Error('too deep');
+    if (entry instanceof Error) {
+      // Not enumerable, so not in the JSON text: read on their own.
+      texts.push(String(entry.name), String(entry.message), String(entry.stack ?? ''));
+    }
     if (typeof entry === 'string') {
       texts.push(entry);
     } else if (typeof entry === 'number' || typeof entry === 'bigint' || typeof entry === 'boolean') {
@@ -128,4 +132,29 @@ export function leaksSecret(value: unknown, matcher: LeakMatcher): boolean {
     return true;
   }
   return texts.some(text => matcher.matches(text));
+}
+
+/**
+ * An error in final form, as it leaves a gateway: no `cause`, a `stack` set
+ * to `${name}: ${message}` (no frames, paths or function names), and its
+ * name, message and stack masked against every given secret, so none of them
+ * holds a piece of one. Build a fresh error, then pass it through here.
+ */
+export function sealedError<E extends Error>(error: E, ...secrets: Array<string | undefined>): E {
+  delete (error as { cause?: unknown }).cause;
+  let name = String(error.name);
+  let message = String(error.message);
+  for (const secret of secrets) {
+    if (typeof secret !== 'string' || secret === '') continue;
+    name = maskedText(name, secret);
+    message = maskedText(message, secret);
+  }
+  let stack = `${name}: ${message}`;
+  for (const secret of secrets) {
+    if (typeof secret === 'string' && secret !== '') stack = maskedText(stack, secret);
+  }
+  for (const [key, value] of [['name', name], ['message', message], ['stack', stack]] as const) {
+    Object.defineProperty(error, key, { value, writable: true, configurable: true, enumerable: false });
+  }
+  return error;
 }
