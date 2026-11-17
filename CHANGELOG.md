@@ -2,6 +2,11 @@
 
 ## 0.4.1 (2026-11-17)
 
+- A key object that cannot be exported, or exports no content, is refused:
+  a gateway never runs without a secret to check against. Every error that
+  leaves (helper errors and fallbacks, the session refusal) passes the sink
+  check as a finished object, name, message, stack, status and code
+  included, and is replaced by the sealed fixed fallback when it leaks.
 - Consent helpers check the state, code or session id they are given as
   printable ASCII inside their error boundary, before anything encodes it,
   and refuse anything else with a fixed error in final form.
