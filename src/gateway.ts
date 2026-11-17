@@ -1,4 +1,4 @@
-import { createHmac, createPrivateKey, randomBytes, timingSafeEqual, type KeyObject } from 'node:crypto';
+import { createPrivateKey, randomBytes, type KeyObject } from 'node:crypto';
 import type { AccountResource, SessionStatus, TransactionResource } from './enablebanking/client.js';
 import { balanceView, isoDate, summarize, transactionView, type TransactionView } from './enablebanking/format.js';
 import { maskIban, normalizeIban } from './enablebanking/registry.js';
@@ -20,7 +20,8 @@ import {
   type GatewayJsonValue,
 } from './gateway/catalog.js';
 import { EnableBankingHttpError, ERROR_CODES } from './errors.js';
-import { GatewayRedactor, overlapsMarker, REDACTION_MARKER } from './gateway/redact.js';
+import { GatewayRedactor } from './gateway/redact.js';
+import { admitsKey, keyRefusedText } from './key-admission.js';
 
 /**
  * Embeddable entry point: a host that serves many companies from one process
@@ -214,6 +215,7 @@ const SESSION_STATUSES: ReadonlySet<string> = new Set([
 ]);
 
 const NOT_ALLOWED = 'Refused: that account is not one of the accounts this company has connected.';
+const SESSION_REFUSED = 'Refused: this bank connection cannot be used safely. It must be connected again.';
 const NO_CREDENTIALS =
   'Refused: no Enable Banking consent was given with the call (credentials.sessionId and credentials.accountIds are required).';
 
@@ -230,59 +232,66 @@ function isValidDate(value: string): boolean {
 }
 
 /**
- * A page token: where the next page starts (the Enable Banking continuation
- * key of the page to fetch, empty for the first page, and how many rows of
- * that page were already returned), bound to account, period and status.
- * Signed with HMAC-SHA256 under a random key of the gateway instance, so a
- * token is only accepted by the instance that issued it and cannot be made
- * by hand.
+ * Page tokens are opaque: 32 random bytes (base64url, 43 characters) that
+ * name, in the memory of the gateway instance that issued them, where the
+ * next page starts (Enable Banking's continuation key of the page to fetch,
+ * empty for the first page, and how many rows of it were already returned)
+ * and what it belongs to (session, account, period and status). Nothing of
+ * that is in the token. A token is accepted only by the instance that issued
+ * it, for PAGE_TOKEN_TTL_MS; at most MAX_PAGE_TOKENS are kept, the oldest
+ * dropped first.
  */
-interface PageToken {
+interface PageState {
   k: string;
   o: number;
+  session: string;
   a: string;
   f: string;
   t: string;
   s: string;
+  expires: number;
 }
 
+const PAGE_TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/;
+const PAGE_TOKEN_TTL_MS = 15 * 60_000;
+const MAX_PAGE_TOKENS = 10_000;
+/** Longest continuation key kept for a page token; a longer one ends the listing as incomplete. */
 const MAX_CONTINUATION_KEY_LENGTH = 2048;
 /** Rows of one bank page a token may skip (banks with very large pages). */
 const MAX_PAGE_OFFSET = 100_000;
+const PAGE_TOKEN_UNKNOWN = 'pageToken was not issued here, or it has expired; start again without it.';
+const PAGE_TOKEN_MISMATCH = 'pageToken does not belong to this account and period; start again without it.';
 
-/** The token's content, unverified (for resolving what a call reads). */
-function pagePayload(value: string): PageToken | undefined {
-  const [payload, mac, ...rest] = value.split('.');
-  if (!payload || !mac || rest.length > 0 || !/^[A-Za-z0-9_-]{1,4096}$/.test(payload) || !/^[A-Za-z0-9_-]{43}$/.test(mac)) {
-    return undefined;
-  }
-  try {
-    const parsed = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')) as Partial<PageToken>;
-    const strings = (['k', 'a', 'f', 't', 's'] as const).every(key => typeof parsed[key] === 'string');
-    const offset = parsed.o;
-    if (!strings || typeof offset !== 'number' || !Number.isSafeInteger(offset) || offset < 0 || offset > MAX_PAGE_OFFSET) {
-      return undefined;
+class PageTokens {
+  private readonly entries = new Map<string, PageState>();
+
+  constructor(private readonly now: () => number) {}
+
+  issue(state: Omit<PageState, 'expires'>): string {
+    this.prune();
+    while (this.entries.size >= MAX_PAGE_TOKENS) {
+      const oldest = this.entries.keys().next().value;
+      if (oldest === undefined) break;
+      this.entries.delete(oldest);
     }
-    if (parsed.k!.length > MAX_CONTINUATION_KEY_LENGTH || (!parsed.k && offset === 0)) return undefined;
-    return parsed as PageToken;
-  } catch {
-    return undefined;
+    const id = randomBytes(32).toString('base64url');
+    this.entries.set(id, { ...state, expires: this.now() + PAGE_TOKEN_TTL_MS });
+    return id;
   }
-}
 
-function signPageToken(key: Buffer, token: PageToken): string {
-  const payload = Buffer.from(JSON.stringify(token)).toString('base64url');
-  return `${payload}.${createHmac('sha256', key).update(payload).digest('base64url')}`;
-}
+  find(id: string): PageState | undefined {
+    this.prune();
+    return this.entries.get(id);
+  }
 
-/** The token's content when it carries this instance's signature (constant-time comparison). */
-function verifyPageToken(key: Buffer, value: string): PageToken | undefined {
-  const token = pagePayload(value);
-  if (!token) return undefined;
-  const [payload, mac] = value.split('.') as [string, string];
-  const expected = createHmac('sha256', key).update(payload).digest();
-  const given = Buffer.from(mac, 'base64url');
-  return given.length === expected.length && timingSafeEqual(given, expected) ? token : undefined;
+  /** Entries are kept in the order they were issued, so the expired ones come first. */
+  private prune(): void {
+    const now = this.now();
+    for (const [id, entry] of this.entries) {
+      if (entry.expires > now) break;
+      this.entries.delete(id);
+    }
+  }
 }
 
 /**
@@ -330,13 +339,8 @@ export function resolveEnableBankingReadTarget(
     return refuse(`The period is longer than ${MAX_RANGE_DAYS} days; ask for a shorter one.`);
   }
   const pageToken = input.pageToken as string | null | undefined;
-  if (pageToken) {
-    // The signature is checked by callTool, which holds the instance key.
-    const token = pagePayload(pageToken);
-    if (!token || token.a !== account || token.f !== from || token.t !== to || token.s !== status) {
-      return refuse('pageToken does not belong to this account and period; start again without it.');
-    }
-  }
+  // Only the form is checked here: what a token stands for is known only to the instance that issued it (callTool).
+  if (pageToken && !PAGE_TOKEN_PATTERN.test(pageToken)) return refuse(PAGE_TOKEN_UNKNOWN);
   return {
     ok: true,
     target: { tool: spec.name, exposure: spec.exposure, account, from, to, status, ...(pageToken ? { continued: true } : {}) },
@@ -380,6 +384,26 @@ function boundedInt(value: number | undefined, fallback: number, min: number, ma
 }
 
 export function createEnableBankingGateway(options: EnableBankingGatewayOptions) {
+  // Every construction error leaves through a redactor that holds the key, as the very last step: a fixed text of
+  // ours or an option can hold a piece of it.
+  const guard = new GatewayRedactor();
+  try {
+    const given: unknown = options && typeof options === 'object' ? options.privateKey : undefined;
+    if (typeof given === 'string') guard.addKey(given);
+    else if (given && typeof given === 'object' && (given as KeyObject).type === 'private') {
+      guard.addKey(String((given as KeyObject).export({ type: 'pkcs8', format: 'pem' })));
+    }
+  } catch {
+    // A key that cannot be exported cannot be echoed in this form either.
+  }
+  try {
+    return buildEnableBankingGateway(options);
+  } catch (error) {
+    throw new Error(guard.redact(error instanceof Error ? error.message : String(error)));
+  }
+}
+
+function buildEnableBankingGateway(options: EnableBankingGatewayOptions) {
   if (!options || typeof options !== 'object') throw new Error('createEnableBankingGateway: options are required.');
   const applicationId = typeof options.applicationId === 'string' ? options.applicationId.trim() : '';
   if (!applicationId || !/^[A-Za-z0-9-]{1,128}$/.test(applicationId)) {
@@ -388,8 +412,6 @@ export function createEnableBankingGateway(options: EnableBankingGatewayOptions)
     );
   }
   const redactor = new GatewayRedactor();
-  // Signs page tokens; never leaves the instance.
-  const pageKey = randomBytes(32);
   let key: KeyObject;
   if (typeof options.privateKey === 'string') {
     if (!options.privateKey.trim()) throw new Error('createEnableBankingGateway: privateKey is required.');
@@ -410,17 +432,20 @@ export function createEnableBankingGateway(options: EnableBankingGatewayOptions)
     throw new Error('createEnableBankingGateway: privateKey is required.');
   }
   if (key.asymmetricKeyType !== 'rsa') throw new Error('createEnableBankingGateway: privateKey must be an RSA key (RS256).');
-  // A key whose content overlaps the redaction marker would survive its own redaction.
+  // Key admission (src/key-admission.ts): key content, as given and as exported, that is short or shares a piece of
+  // 6 characters with any text of our own is refused with a fixed text that never repeats it.
+  const contents: string[] = [];
+  if (typeof options.privateKey === 'string') contents.push(pemContent(options.privateKey));
   try {
-    const content = String(key.export({ type: 'pkcs8', format: 'pem' })).replace(/-----(BEGIN|END) [A-Z ]*-----/g, '').replace(/\s+/g, '');
-    if (overlapsMarker(content)) throw new Error('overlap');
-  } catch (error) {
-    if (error instanceof Error && error.message === 'overlap') {
-      throw new Error(`createEnableBankingGateway: this privateKey overlaps the redaction marker ${REDACTION_MARKER}; use another key.`);
-    }
+    contents.push(pemContent(String(key.export({ type: 'pkcs8', format: 'pem' }))));
+  } catch {
+    // A key that cannot be exported cannot be echoed in this form either.
   }
+  for (const content of contents) if (!admitsKey(content)) throw new Error(keyRefusedText(content));
 
   const now = options.now ?? Date.now;
+  // Where each issued page token continues; never leaves the instance.
+  const pages = new PageTokens(now);
   const client = new GatewayClient({
     applicationId,
     key,
@@ -436,7 +461,8 @@ export function createEnableBankingGateway(options: EnableBankingGatewayOptions)
     for (const secret of secrets) callRedactor.add(secret);
     try {
       // The answer is the host's data (the session id included); only the instance's key is removed from it.
-      return redactor.redactDeep(await work()) as T;
+      // The outer pass is the final one, over the assembled answer.
+      return redactor.redactDeep(redactor.redactDeep(await work())) as T;
     } catch (error) {
       const details = httpDetails(error);
       throw new EnableBankingGatewayError(callRedactor.message(error), details);
@@ -456,45 +482,14 @@ export function createEnableBankingGateway(options: EnableBankingGatewayOptions)
 
     async callTool(toolName: string, input: GatewayJsonObject = {}, context?: GatewayCallContext): Promise<GatewayToolResult> {
       const callRedactor = redactor.fork();
+      let result: GatewayToolResult;
       try {
-        const resolution = resolveEnableBankingReadTarget(toolName, input ?? {}, now());
-        if (!resolution.ok) return errorResult(resolution.reason);
-        const target = resolution.target;
-
-        const credentials = callCredentials(context);
-        if (!credentials) return errorResult(NO_CREDENTIALS);
-        callRedactor.add(credentials.sessionId);
-        if (target.account !== undefined && !credentials.accountIds.has(target.account)) return errorResult(NOT_ALLOWED);
-
-        // The bank session must still be authorised and still contain the account.
-        const session = await client.getSession(credentials.sessionId);
-        const consent = consentState(session, now());
-        if (!consent.ok) return errorResult(consent.reason);
-        if (target.account !== undefined && !consent.accounts.has(target.account)) {
-          return errorResult('Refused: the bank consent no longer covers that account. It must be connected again.');
-        }
-
-        let result: GatewayToolResult;
-        switch (target.tool) {
-          case 'list_accounts':
-            result = await listAccounts(client, credentials.accountIds, consent);
-            break;
-          case 'get_balances':
-            result = await getBalances(client, target.account!);
-            break;
-          default: {
-            let start: PageToken | undefined;
-            if (target.continued) {
-              start = verifyPageToken(pageKey, input.pageToken as string);
-              if (!start) return errorResult('pageToken was not issued here for this account and period; start again without it.');
-            }
-            result = await listTransactions(client, pageKey, target, start, callRedactor);
-          }
-        }
-        return redactResult(result, callRedactor);
+        result = await runCall(toolName, input ?? {}, context, callRedactor);
       } catch (error) {
-        return errorResult(callRedactor.message(error));
+        result = errorResult(callRedactor.message(error));
       }
+      // Every result, refusals and errors included, through the call's redactor as the very last step.
+      return redactResult(result, callRedactor);
     },
 
     /** Banks (ASPSPs) offering account information in a country. */
@@ -591,6 +586,9 @@ export function createEnableBankingGateway(options: EnableBankingGatewayOptions)
         if (typeof sessionId !== 'string' || !ID_PATTERN.test(sessionId)) {
           throw new Error('completeSession: Enable Banking did not return a usable session.');
         }
+        if (!admitsKey(sessionId)) {
+          throw new Error('completeSession: Enable Banking returned a session this gateway cannot use safely; connect again.');
+        }
         const rawAccounts = Array.isArray(session?.accounts) ? session.accounts : [];
         const accounts: ConsentAccount[] = [];
         let accountsWithoutId = 0;
@@ -638,6 +636,51 @@ export function createEnableBankingGateway(options: EnableBankingGatewayOptions)
       });
     },
   };
+
+  async function runCall(
+    toolName: string,
+    input: GatewayJsonObject,
+    context: GatewayCallContext | undefined,
+    callRedactor: GatewayRedactor,
+  ): Promise<GatewayToolResult> {
+    const resolution = resolveEnableBankingReadTarget(toolName, input, now());
+    if (!resolution.ok) return errorResult(resolution.reason);
+    const target = resolution.target;
+
+    const credentials = callCredentials(context);
+    if (!credentials) return errorResult(NO_CREDENTIALS);
+    callRedactor.add(credentials.sessionId);
+    // Key admission for the session id, as for the key: one that shares text with our own texts is not used.
+    if (!admitsKey(credentials.sessionId)) return errorResult(SESSION_REFUSED);
+    if (target.account !== undefined && !credentials.accountIds.has(target.account)) return errorResult(NOT_ALLOWED);
+
+    // The bank session must still be authorised and still contain the account.
+    const session = await client.getSession(credentials.sessionId);
+    const consent = consentState(session, now());
+    if (!consent.ok) return errorResult(consent.reason);
+    if (target.account !== undefined && !consent.accounts.has(target.account)) {
+      return errorResult('Refused: the bank consent no longer covers that account. It must be connected again.');
+    }
+
+    switch (target.tool) {
+      case 'list_accounts':
+        return listAccounts(client, credentials.accountIds, consent);
+      case 'get_balances':
+        return getBalances(client, target.account!);
+      default: {
+        const bound = { session: credentials.sessionId, a: target.account!, f: target.from!, t: target.to!, s: target.status ?? 'booked' };
+        let start: PageState | undefined;
+        if (target.continued) {
+          start = pages.find(input.pageToken as string);
+          if (!start) return errorResult(PAGE_TOKEN_UNKNOWN);
+          if (start.session !== bound.session || start.a !== bound.a || start.f !== bound.f || start.t !== bound.t || start.s !== bound.s) {
+            return errorResult(PAGE_TOKEN_MISMATCH);
+          }
+        }
+        return listTransactions(client, target, start, next => pages.issue({ ...next, ...bound }));
+      }
+    }
+  }
 }
 
 /** One gateway instance, as returned by createEnableBankingGateway. */
@@ -726,6 +769,11 @@ function ibanOf(account: AccountResource): string | null {
   return other?.identification ? normalizeIban(other.identification) : null;
 }
 
+/** The content of a PEM key, without armour and whitespace: what the redactor holds pieces of. */
+function pemContent(pem: string): string {
+  return pem.replace(/-----(BEGIN|END) [A-Z ]*-----/g, '').replace(/\s+/g, '');
+}
+
 function text(value: unknown): string | null {
   // Over 200 characters is dropped, not cut: nothing is shortened before the result is redacted.
   const trimmed = typeof value === 'string' ? value.trim() : '';
@@ -773,10 +821,9 @@ async function getBalances(client: GatewayClient, account: string): Promise<Gate
 
 async function listTransactions(
   client: GatewayClient,
-  pageKey: Buffer,
   target: { account?: string; from?: string; to?: string; status?: 'booked' | 'pending' | 'all' },
-  start: PageToken | undefined,
-  redactor: GatewayRedactor,
+  start: { k: string; o: number } | undefined,
+  issue: (next: { k: string; o: number }) => string,
 ): Promise<GatewayToolResult> {
   const account = target.account!;
   const from = target.from!;
@@ -813,9 +860,8 @@ async function listTransactions(
     }
   }
   let incomplete = false;
-  if (next && (next.k.length > MAX_CONTINUATION_KEY_LENGTH || next.o > MAX_PAGE_OFFSET || redactor.redactValues(next.k) !== next.k)) {
-    // The bank's page key is too long (or a single page too large) to hand on, or it holds the key or the
-    // session id: it would be encoded into the page token, where no redaction could see it.
+  if (next && (next.k.length > MAX_CONTINUATION_KEY_LENGTH || next.o > MAX_PAGE_OFFSET)) {
+    // The bank's page key is too long to keep (or a single page too large): the listing ends here, incomplete.
     next = undefined;
     incomplete = true;
   }
@@ -824,7 +870,8 @@ async function listTransactions(
   if (status === 'booked') rows = rows.filter(row => row.status === 'BOOK');
   if (status === 'pending') rows = rows.filter(row => row.status !== 'BOOK');
   rows.sort((a, b) => (b.bookingDate ?? b.valueDate ?? '').localeCompare(a.bookingDate ?? a.valueDate ?? ''));
-  const nextPageToken = next ? signPageToken(pageKey, { ...next, a: account, f: from, t: to, s: status }) : undefined;
+  // An opaque id; the continuation key and the account stay in the instance.
+  const nextPageToken = next ? issue(next) : undefined;
   const structured = {
     account,
     from,
@@ -854,11 +901,16 @@ function jsonResult(text: string, structuredContent: unknown): GatewayToolResult
 function redactResult(result: GatewayToolResult, redactor: GatewayRedactor): GatewayToolResult {
   return {
     ...(result.isError ? { isError: true } : {}),
-    content: result.content.map(part => ({ type: 'text' as const, text: redactor.redactValues(part.text) })),
-    // Redacted first, as data and depth-limited, and only then copied as JSON.
+    content: result.content.map(part => ({ type: 'text' as const, text: redactor.redactValues(redactor.redactValues(part.text)) })),
+    // Redacted first, as data and depth-limited, and only then copied as JSON. The outer pass is the final one, over
+    // the assembled data with its depth placeholders.
     ...(result.structuredContent === undefined
       ? {}
-      : { structuredContent: JSON.parse(JSON.stringify(redactor.redactDeep(result.structuredContent))) as GatewayJsonValue }),
+      : {
+          structuredContent: JSON.parse(
+            JSON.stringify(redactor.redactDeep(redactor.redactDeep(result.structuredContent))),
+          ) as GatewayJsonValue,
+        }),
   };
 }
 
