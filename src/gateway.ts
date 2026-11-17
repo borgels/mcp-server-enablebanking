@@ -19,7 +19,8 @@ import {
   type GatewayJsonObject,
   type GatewayJsonValue,
 } from './gateway/catalog.js';
-import { GatewayRedactor } from './gateway/redact.js';
+import { EnableBankingHttpError, ERROR_CODES } from './errors.js';
+import { GatewayRedactor, overlapsMarker, REDACTION_MARKER } from './gateway/redact.js';
 
 /**
  * Embeddable entry point: a host that serves many companies from one process
@@ -409,6 +410,15 @@ export function createEnableBankingGateway(options: EnableBankingGatewayOptions)
     throw new Error('createEnableBankingGateway: privateKey is required.');
   }
   if (key.asymmetricKeyType !== 'rsa') throw new Error('createEnableBankingGateway: privateKey must be an RSA key (RS256).');
+  // A key whose content overlaps the redaction marker would survive its own redaction.
+  try {
+    const content = String(key.export({ type: 'pkcs8', format: 'pem' })).replace(/-----(BEGIN|END) [A-Z ]*-----/g, '').replace(/\s+/g, '');
+    if (overlapsMarker(content)) throw new Error('overlap');
+  } catch (error) {
+    if (error instanceof Error && error.message === 'overlap') {
+      throw new Error(`createEnableBankingGateway: this privateKey overlaps the redaction marker ${REDACTION_MARKER}; use another key.`);
+    }
+  }
 
   const now = options.now ?? Date.now;
   const client = new GatewayClient({
@@ -478,7 +488,7 @@ export function createEnableBankingGateway(options: EnableBankingGatewayOptions)
               start = verifyPageToken(pageKey, input.pageToken as string);
               if (!start) return errorResult('pageToken was not issued here for this account and period; start again without it.');
             }
-            result = await listTransactions(client, pageKey, target, start);
+            result = await listTransactions(client, pageKey, target, start, callRedactor);
           }
         }
         return redactResult(result, callRedactor);
@@ -661,15 +671,10 @@ function checkRedirectUrl(value: unknown): string {
   return url.toString();
 }
 
+/** Status and code of our own HTTP error only; the code is one of Enable Banking's documented codes. */
 function httpDetails(error: unknown): { status?: number; code?: string } {
-  if (error && typeof error === 'object' && 'status' in error && typeof (error as { status: unknown }).status === 'number') {
-    const code = (error as { code?: unknown }).code;
-    return {
-      status: (error as { status: number }).status,
-      ...(typeof code === 'string' && /^[A-Z_]{1,64}$/.test(code) ? { code } : {}),
-    };
-  }
-  return {};
+  if (!(error instanceof EnableBankingHttpError)) return {};
+  return { status: error.status, ...(error.code !== undefined && ERROR_CODES.has(error.code) ? { code: error.code } : {}) };
 }
 
 /** A date and time from Enable Banking as ISO 8601 in UTC, or null when it is not one. Nothing else of it is kept. */
@@ -771,6 +776,7 @@ async function listTransactions(
   pageKey: Buffer,
   target: { account?: string; from?: string; to?: string; status?: 'booked' | 'pending' | 'all' },
   start: PageToken | undefined,
+  redactor: GatewayRedactor,
 ): Promise<GatewayToolResult> {
   const account = target.account!;
   const from = target.from!;
@@ -807,8 +813,9 @@ async function listTransactions(
     }
   }
   let incomplete = false;
-  if (next && (next.k.length > MAX_CONTINUATION_KEY_LENGTH || next.o > MAX_PAGE_OFFSET)) {
-    // The bank's page key is too long (or a single page too large) to hand on.
+  if (next && (next.k.length > MAX_CONTINUATION_KEY_LENGTH || next.o > MAX_PAGE_OFFSET || redactor.redactValues(next.k) !== next.k)) {
+    // The bank's page key is too long (or a single page too large) to hand on, or it holds the key or the
+    // session id: it would be encoded into the page token, where no redaction could see it.
     next = undefined;
     incomplete = true;
   }
