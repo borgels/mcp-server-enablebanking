@@ -513,32 +513,45 @@ function buildEnableBankingGateway(options: EnableBankingGatewayOptions) {
   });
 
   /** Runs a consent helper; any failure becomes a redacted EnableBankingGatewayError without a cause. */
-  async function helper<T>(secrets: Array<string | undefined>, work: () => Promise<T>): Promise<T> {
+  async function helper<T>(
+    inputs: Array<string | undefined>,
+    work: (register: (secret: string) => void) => Promise<T>,
+  ): Promise<T> {
     const callRedactor = redactor.fork();
+    // Every secret of the call: the inputs and anything registered while the call runs (a returned session id).
+    // All of them are in the final seal and in the sink check of any error that leaves.
+    const secrets: string[] = [];
+    const register = (secret: string) => {
+      if (!PRINTABLE_SECRET.test(secret)) throw new Error(INPUT_REFUSED);
+      secrets.push(secret);
+      callRedactor.add(secret);
+      callRedactor.watch(secret);
+    };
     let answer: unknown;
     try {
       // Inside the error boundary: each value is checked as printable ASCII before anything encodes it (a lone
       // surrogate would make the encoding throw), then registered.
-      for (const secret of secrets) {
-        if (secret !== undefined && !PRINTABLE_SECRET.test(secret)) throw new Error(INPUT_REFUSED);
-        callRedactor.add(secret);
+      for (const input of inputs) {
+        if (input !== undefined) register(input);
       }
       // The answer is the host's data (the session id included); only the instance's key is removed from it.
       // The outer pass is the final one, over the assembled answer.
-      answer = redactor.redactDeep(redactor.redactDeep(await work()));
+      answer = redactor.redactDeep(redactor.redactDeep(await work(register)));
     } catch (error) {
       const details = httpDetails(error);
       const message = callRedactor.message(error);
-      // The sink check on the error as it leaves.
-      // A fresh error in final form: no cause, no frames, masked against the key and the call's values.
+      // A fresh error in final form (no cause, no frames, masked against the key and every secret of the call),
+      // then the sink check on the finished object against the same secrets.
+      const fallback = () => sealedError(new EnableBankingGatewayError(RESULT_WITHHELD), keyContent, ...secrets, ...inputs);
       throw released(
         sealedError(
           new EnableBankingGatewayError(leaksSecret(message, callRedactor) ? RESULT_WITHHELD : message, details),
           keyContent,
           ...secrets,
+          ...inputs,
         ),
         callRedactor,
-        () => sealedError(new EnableBankingGatewayError(RESULT_WITHHELD), keyContent, ...secrets),
+        fallback,
       );
     }
     // The sink check on the answer as it leaves: one that holds a piece of the key is withheld.
@@ -676,13 +689,15 @@ function buildEnableBankingGateway(options: EnableBankingGatewayOptions) {
      */
     completeSession(input: { code: string }): Promise<CompleteSessionResult> {
       const code = input && typeof input === 'object' ? input.code : undefined;
-      return helper([typeof code === 'string' ? code : undefined], async () => {
+      return helper([typeof code === 'string' ? code : undefined], async register => {
         if (typeof code !== 'string' || !CODE_PATTERN.test(code)) throw new Error('completeSession: code is missing or malformed.');
         const session = await client.createSession(code);
         const sessionId = session?.session_id;
         if (typeof sessionId !== 'string' || !ID_PATTERN.test(sessionId)) {
           throw new Error('completeSession: Enable Banking did not return a usable session.');
         }
+        // The returned session id is a secret of this call from here on: in the final seal and sink check.
+        register(sessionId);
         if (!sessionAdmitted(sessionId)) {
           // The sink check on the finished refusal, against the key and the session id.
           const check = redactor.fork();
