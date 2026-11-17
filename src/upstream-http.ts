@@ -27,11 +27,11 @@ export function registerSecret(value: string | undefined): void {
   }
 }
 
-/** Replaces every registered secret value with [REDACTED]. */
+/** Replaces every registered secret value with ‹redacted›. */
 export function redactRegisteredSecrets(value: string): string {
   let result = value;
   for (const secret of registeredSecrets) {
-    result = result.split(secret).join('[REDACTED]');
+    result = result.split(secret).join('‹redacted›');
   }
   return result;
 }
