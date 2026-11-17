@@ -2,6 +2,17 @@
 
 ## 0.4.1 (2026-11-17)
 
+- Errors leave in final form: every error a gateway throws is a fresh
+  error with no `cause`, a `stack` of just `name: message` (no frames,
+  paths or function names), and name, message and stack masked against the
+  secret; the sink check runs on the finished object, its non-enumerable
+  fields included.
+- Every element of a failure list (`failures`, `failure`, `errors`,
+  `error`, `warnings`), at any depth and whatever its fields, becomes
+  `{ status?, message }` with our own text; a failure context such as
+  `metadata` or `amount` holds through wrappers such as `data`.
+- Network, timeout and redirect errors name the method only, not the
+  configured address.
 - The sink check: every output of a gateway (the tool list, results, the consent helpers' answers and errors,
   construction errors) is checked in its final form, and one that holds a
   piece of 6 characters of the key or of the call's session id is
