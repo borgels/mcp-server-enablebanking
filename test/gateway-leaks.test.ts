@@ -424,3 +424,53 @@ describe('round 8', () => {
     expect(JSON.stringify(result)).not.toContain('Leverand');
   });
 });
+
+describe('round 9: consent helpers', () => {
+  const NAME_PIECE = (() => {
+    for (let i = 0; i + 6 <= CONTENT.length; i += 1) {
+      const piece = CONTENT.slice(i, i + 6);
+      if (/^[A-Za-z][A-Za-z0-9]{5}$/.test(piece)) return piece;
+    }
+    throw new Error('no usable piece');
+  })();
+
+  /** Runs `work` inside a function whose name holds a piece of the key, so a raw stack would name it. */
+  async function caughtIn(work: () => Promise<unknown>): Promise<Error> {
+    const name = `call${NAME_PIECE}`;
+    const holder = { [name]: () => work() };
+    try {
+      await holder[name]!();
+    } catch (error) {
+      return error as Error;
+    }
+    throw new Error('no error');
+  }
+
+  it('checks every helper input before encoding it, and throws every error in final form', async () => {
+    const gateway = gatewayWith(() => json({ error: 'X', message: 'no' }, 500));
+    const LONE = '12345678\uD800';
+    const errors = [
+      await caughtIn(() => gateway.completeSession({ code: LONE })),
+      await caughtIn(() => gateway.sessionStatus({ sessionId: LONE })),
+      await caughtIn(() => gateway.endSession({ sessionId: LONE })),
+      await caughtIn(() =>
+        gateway.startAuthorization({ bank: 'Fiktiv Bank', redirectUrl: 'https://example.test/return', state: `state-${LONE}-0123456789` }),
+      ),
+      await caughtIn(() => gateway.listBanks({ country: 'DK' })),
+      await caughtIn(() => gateway.completeSession({ code: 'code-0123456789' })),
+      await caughtIn(() => gateway.sessionStatus({ sessionId: '11111111-aaaa-4aaa-8aaa-111111111111' })),
+      await caughtIn(() => gateway.endSession({ sessionId: '11111111-aaaa-4aaa-8aaa-111111111111' })),
+    ];
+    for (const error of errors) {
+      expect(error).toBeInstanceOf(Error);
+      const stack = String(error.stack);
+      expect(stack).toBe(`${error.name}: ${error.message}`);
+      expect(stack).not.toMatch(/\n\s+at /);
+      expect(stack).not.toMatch(/URI malformed/);
+      expect((error as { cause?: unknown }).cause).toBeUndefined();
+      expect(stack).not.toContain(NAME_PIECE);
+      expect(leaks([stack, error.message, error.name])).toEqual([]);
+    }
+    expect(errors.slice(0, 4).map(error => error.message)).toEqual(Array(4).fill('Refused: a state, code or session id must be printable ASCII.'));
+  });
+});
