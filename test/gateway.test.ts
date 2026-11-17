@@ -436,8 +436,8 @@ describe('gateway: redaction', () => {
   it('does not carry one call’s session id into another call’s redactor', async () => {
     // A thrown error that contains company A's session id in a non-UUID form is redacted by value
     // in A's call, which shows the per-call fork holds it; B's call is unaffected by A's values.
-    const sessionA = 'session-of-company-a-0001';
-    const sessionB = 'session-of-company-b-0002';
+    const sessionA = 'firm-alpha-qqqq-0001';
+    const sessionB = 'firm-bravo-qqqq-0002';
     const fetchImpl = vi.fn<typeof fetch>(async () => {
       throw new Error(`boom ${sessionA} ${sessionB}`);
     });
