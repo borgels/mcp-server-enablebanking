@@ -194,6 +194,8 @@ construction error becomes the fixed refusal. Every error a gateway throws is a 
 closed set (`src/fallbacks.ts`), and a key that shares a piece with any of
 them, or with the tool list, is refused when the gateway is created.
 
+**Scope.** The host is the embedding router. It is trusted and already holds the key and every credential it passes in. Out of scope: host-supplied code that misbehaves (hooks, a `toJSON` on a hook's result), and echoing back to the host a value the host itself passed in (for example a session id given in a call's credentials). In scope: values the vendor returns, and anything persisted.
+
 **Key admission.** Every key is a secret the vendor issues. A gateway
 accepts only printable ASCII (0x21-0x7E) of at least 16 characters, checked
 before anything is built from the key. As a cheap first filter it also
