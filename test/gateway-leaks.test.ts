@@ -268,3 +268,94 @@ describe('round 5 of the threat model', () => {
     expect(helperError.code).toBeUndefined();
   });
 });
+
+describe('round 7: the sink check', () => {
+  const sessionPieces = (sessionId: string) => {
+    const out: string[] = [];
+    for (let i = 0; i + 6 <= sessionId.length; i += 1) out.push(sessionId.slice(i, i + 6));
+    return out;
+  };
+
+  /** Results of a normal session with this session id, or the refusal; and the pieces of it that leaked. */
+  async function runSession(sessionId: string): Promise<{ refused?: Error; leaked: string[]; outputs: unknown[] }> {
+    const gateway = gatewayWith(url =>
+      url.pathname.startsWith('/sessions/')
+        ? json({ status: 'AUTHORIZED', accounts: [ACCOUNT], access: { valid_until: '2027-05-01T00:00:00Z' } })
+        : url.pathname.endsWith('/details')
+          ? json({ name: 'Driftskonto', currency: 'DKK', product: 'Erhvervskonto' })
+          : json({ balances: [{ balance_type: 'CLBD', balance_amount: { currency: 'DKK', amount: '1250.00' } }] }),
+    );
+    const call = { credentials: { sessionId, accountIds: [ACCOUNT] } };
+    const outputs: unknown[] = [gateway.tools];
+    let refused: Error | undefined;
+    try {
+      outputs.push(
+        await gateway.callTool('list_accounts', {}, call),
+        await gateway.callTool('get_balances', { account: ACCOUNT }, call),
+        await gateway.callTool('list_transactions', { account: ACCOUNT, from: 'x' }, call),
+      );
+    } catch (error) {
+      refused = error as Error;
+      outputs.push(refused.message, refused.name, refused.stack ?? '');
+    }
+    const texts = outputs.map(output => (typeof output === 'string' ? output : JSON.stringify(output)));
+    const raw = outputs.flatMap(output => (typeof output === 'string' ? [output] : JSON.stringify(output) ?? ''));
+    const leaked = sessionPieces(sessionId).filter(piece => [...texts, ...raw].some(text => text.includes(piece)));
+    return { ...(refused ? { refused } : {}), leaked, outputs };
+  }
+
+  it('refuses a session id that shares a piece with a fixed field, as an error that repeats none of it', async () => {
+    const { refused, leaked } = await runSession('Zq7pX2visError9mWb4TnR');
+    expect(refused?.message).toMatch(/cannot be used safely|…/);
+    expect(leaked).toEqual([]);
+  });
+
+  it('refuses a key text that is not printable ASCII before anything is built from it', () => {
+    for (const privateKey of [`${PEM}\uD800`, `${PEM.slice(0, 40)}é${PEM.slice(40)}`]) {
+      let message = '';
+      try {
+        createEnableBankingGateway({ applicationId: 'app-0000-test', privateKey });
+      } catch (error) {
+        message = (error as Error).message;
+      }
+      expect(message).toMatch(/key was refused/);
+      expect(message).not.toMatch(/URI malformed/);
+      expect(leaks(message)).toEqual([]);
+    }
+  });
+
+  it('holds for session ids spliced from the outputs of a normal session', async () => {
+    const base = await runSession('11111111-aaaa-4aaa-8aaa-111111111111');
+    expect(base.refused).toBeUndefined();
+    const texts = base.outputs.map(output => (typeof output === 'string' ? output : JSON.stringify(output) ?? ''));
+    let seed = 17;
+    const random = (n: number) => {
+      seed = (seed * 1_103_515_245 + 12_345) % 2_147_483_648;
+      return seed % n;
+    };
+    const ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+    const filler = (n: number) => Array.from({ length: n }, () => ALPHABET[random(ALPHABET.length)]).join('');
+    let tried = 0;
+    for (let round = 0; round < 200 && tried < 30; round += 1) {
+      const text = texts[random(texts.length)]!;
+      const start = random(Math.max(1, text.length - 5));
+      const window = text.slice(start, start + 6);
+      if (!/^[A-Za-z0-9-]{6}$/.test(window)) continue;
+      tried += 1;
+      const sessionId = `${filler(6)}${window}${filler(6)}`;
+      const { leaked } = await runSession(sessionId);
+      expect(leaked, sessionId).toEqual([]);
+    }
+    expect(tried).toBeGreaterThan(0);
+  });
+
+  it('replaces texts in a failure list inside an amount', async () => {
+    const gateway = gatewayWith(url =>
+      url.pathname.startsWith('/sessions/')
+        ? session()
+        : json({ balances: [{ balance_amount: { amount: { failures: ['Leverandørens interne fejltekst'] } } }] }),
+    );
+    const result = await gateway.callTool('get_balances', { account: ACCOUNT }, ctx);
+    expect(JSON.stringify(result)).not.toContain('Leverand');
+  });
+});
