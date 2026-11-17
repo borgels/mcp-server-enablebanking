@@ -531,6 +531,31 @@ describe('round 11', () => {
   });
 });
 
+describe('round 13', () => {
+  it('registers a returned session id from the raw answer, before the normalisation can drop it', async () => {
+    const RETURNED = 'EnableBankingGatewayError_Zq7pX2';
+    const answers = [
+      () => json({ session_id: RETURNED, accounts: [], error: 'vendor diagnostic' }),
+      () => json({ session_id: RETURNED, accounts: [], status: 500 }),
+      () => json({ session_id: RETURNED, error: 'vendor diagnostic' }, 500),
+    ];
+    for (const answer of answers) {
+      const gateway = gatewayWith(url => (url.pathname === '/sessions' ? answer() : json({}, 404)));
+      let caught: Error | undefined;
+      try {
+        await gateway.completeSession({ code: 'code-0123456789' });
+      } catch (error) {
+        caught = error as Error;
+      }
+      expect(caught).toBeInstanceOf(Error);
+      const fields = [caught!.name, caught!.message, String(caught!.stack), JSON.stringify(caught)];
+      for (let i = 0; i + 6 <= RETURNED.length; i += 1) {
+        for (const field of fields) expect(field).not.toContain(RETURNED.slice(i, i + 6));
+      }
+    }
+  });
+});
+
 describe('round 12', () => {
   it('masks a returned session id that fails the format check in the final error', async () => {
     for (const RETURNED of ['EnableBankingGatewayError_Zq7pX2', 'EnableBankingGatewayError\uD800Zq7pX2']) {
