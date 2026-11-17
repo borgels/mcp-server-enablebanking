@@ -151,6 +151,12 @@ What the embedded gateway guarantees about the application's private key
 and a company's session, and what it does not. It is the yardstick for
 every change that touches errors or results.
 
+**Scope.** Guarantees (a), (b) and (c) apply to the embeddable gateway
+(`mcp-server-enablebanking/gateway`), the surface a multi-tenant host uses.
+The standalone MCP server and its consent page, configured from the
+environment for one company, keep best-effort redaction of errors; they are
+not held to these guarantees.
+
 **Guaranteed:**
 
 - **(a) The private key never reaches anything persisted or shared:** error
