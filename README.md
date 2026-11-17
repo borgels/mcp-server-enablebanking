@@ -179,9 +179,28 @@ echoing a company's session id or the key back in data. Results are redacted
 on a best-effort basis: the key exactly, URL- and JSON-escaped, and any
 piece of its content of 6 characters or more, and the session id whole, in
 strings, object keys and the string form of numbers and booleans, replaced
-by `"[REDACTED]"` before anything is serialised. Anything otherwise
+by `"‹redacted›"` before anything is serialised. Anything otherwise
 transformed is not recognised. Account ids stay: they are the data the host
 needs. The MCP server (one company per instance) applies this to errors.
+
+**Key admission.** The private key is a secret the application owner
+creates, and a session id is one Enable Banking issues. A gateway refuses a
+key whose content (without PEM armour) is shorter than 16 characters or
+shares a piece of 6 characters with any text of this server's own: every
+string literal in `src/` (markers, the depth placeholder, error texts,
+variable names), listed in `src/fixed-corpus.generated.ts` by
+`scripts/fixed-corpus.mjs` and kept up to date by a test. The same rule
+refuses a session id, at `completeSession` and in each call. The refusal is a
+fixed text that never repeats the key or the session id. So no text of ours
+can hold a piece of either, and redaction can never leave one in place. On
+top of that, every string leaving a gateway (results, refusals, construction
+errors and the consent helpers' answers and errors) passes the redactor as
+the very last step. Findings that rely on a key this rule refuses are out of
+scope.
+
+**Page tokens** are opaque: 32 random bytes that the issuing gateway
+instance maps, in memory and for 15 minutes, to where the next page starts.
+The token holds no account id, period or Enable Banking continuation key.
 
 ## Security model
 
@@ -269,7 +288,7 @@ const result = await gateway.callTool('get_balances', { account: accountId }, {
 |---|---|---|---|
 | `list_accounts` | The connected accounts: id, name, masked IBAN, currency, product; when the consent expires | `accounts` | no |
 | `get_balances` | Balances of one account (booked, available), decimal strings | `balances` | no |
-| `list_transactions` | Bank lines of one account in at most 366 days (default the last 30 including today, booked only), with counterparty, text, reference and totals; at most 1,000 rows per call, paged with `nextPageToken`/`pageToken` (signed by the gateway instance, bound to account, period and status) | `transactions` | yes |
+| `list_transactions` | Bank lines of one account in at most 366 days (default the last 30 including today, booked only), with counterparty, text, reference and totals; at most 1,000 rows per call, paged with `nextPageToken`/`pageToken` (an opaque id kept by the gateway instance for 15 minutes, bound to session, account, period and status) | `transactions` | yes |
 
 `enableBankingToolCatalog` (deeply frozen) gives each tool's definition plus
 `upstream` (every request it may make), `broad` (always `false`),
