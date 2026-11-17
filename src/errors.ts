@@ -106,30 +106,47 @@ export class EnableBankingHttpError extends Error {
 const FAILURE_CONTEXTS = new Set(['failures', 'failure', 'errors', 'error', 'metadata', 'warnings', 'amount']);
 /** Fields that make an object in a failure context a failure. */
 const FAILURE_FIELDS = ['error', 'errors', 'failures', 'warnings', 'message', 'detail', 'description'];
-/** Failure contexts that are lists of failures: a text in one is the vendor's own and is replaced by ours. */
+/** Failure lists: every element in one is a failure, whatever its fields. */
 const FAILURE_LISTS = new Set(['failures', 'failure', 'errors', 'error', 'warnings']);
 
-function failureContext(key: string): false | 'list' | 'object' {
-  return FAILURE_LISTS.has(key) ? 'list' : FAILURE_CONTEXTS.has(key) ? 'object' : false;
+/** One element of a failure list, reduced to a numeric status (when it has one) and our own text. */
+function failureEntry(value: unknown): { status?: number; message: string } {
+  const status =
+    typeof value === 'object' && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>).status : undefined;
+  return typeof status === 'number' && Number.isInteger(status) && status >= 100 && status <= 599
+    ? { status, message: `Enable Banking reported a failure with HTTP ${status}.` }
+    : { message: 'Enable Banking reported a failure.' };
+}
+
+/** A failure list: every element (an object with any fields, a text, a list) becomes a failureEntry. */
+function failureList(value: unknown): unknown {
+  if (value === null || value === undefined) {
+    return value;
+  }
+  return Array.isArray(value) ? value.map(failureEntry) : failureEntry(value);
 }
 
 /**
  * Copy of a successful body with every failure reported inside it reduced to
- * its HTTP status and our own text. A failure is an object with a numeric
- * `status` of 400 or more, an object with an `error` field, or an
- * object in a failure context (`failures[]`, `errors[]`, `metadata`, `amount`
- * and the like) with any of `error`, `errors`, `message`, `detail` or
- * `description`. Its message, code, detail and every other field are
- * dropped. A text in a failure list (`failures`, `errors`, `warnings` and
- * the like) is replaced by our own text too; a text elsewhere, an amount
- * among them, is kept. Depth-limited.
+ * its HTTP status and our own text.
+ *
+ * - Every element of a failure list (`failures`, `failure`, `errors`,
+ *   `error`, `warnings`), at any depth, becomes `{ status?, message }`: a
+ *   numeric status is kept, and every other field, whatever its name, is
+ *   dropped. Nothing below a failure list is kept.
+ * - Elsewhere a failure is an object with a numeric `status` of 400 or
+ *   more, an object with an `error` field, or an object in a failure
+ *   context (`metadata`, `amount` and the like, also through wrappers such
+ *   as `data` below them) with any of `error`, `errors`, `failures`,
+ *   `warnings`, `message`, `detail` or `description`. It becomes
+ *   `{ status?, error }` with our own text.
+ *
+ * A text outside a failure list, an amount among them, is kept.
+ * Depth-limited.
  */
-export function nestedFailuresAsStatus(value: unknown, depth = 0, context: false | 'list' | 'object' = false): unknown {
+export function nestedFailuresAsStatus(value: unknown, depth = 0, context = false): unknown {
   if (depth > 64) {
     return '[nested too deep]';
-  }
-  if (typeof value === 'string' && context === 'list') {
-    return 'Enable Banking reported a failure.';
   }
   if (typeof value !== 'object' || value === null) {
     return value;
@@ -147,7 +164,13 @@ export function nestedFailuresAsStatus(value: unknown, depth = 0, context: false
       : { error: 'Enable Banking reported a failure.' };
   }
   return Object.fromEntries(
-    Object.entries(record).map(([key, entry]) => [key, nestedFailuresAsStatus(entry, depth + 1, failureContext(key))]),
+    Object.entries(record).map(([key, entry]) => [
+      key,
+      FAILURE_LISTS.has(key)
+        ? failureList(entry)
+        : // A failure context holds through wrappers such as `data` below it.
+          nestedFailuresAsStatus(entry, depth + 1, context || FAILURE_CONTEXTS.has(key)),
+    ]),
   );
 }
 
