@@ -81,7 +81,8 @@ function clampInt(name: string, value: string | undefined, fallback: number, min
   const trimmed = value?.trim();
   if (!trimmed) return fallback;
   if (!/^[+-]?\d+$/.test(trimmed) || !Number.isSafeInteger(Number(trimmed))) {
-    throw new Error(`${name} must be an integer (${min}-${max}); got ${JSON.stringify(trimmed.slice(0, 40))}.`);
+    // The value is not quoted: a variable may hold a secret put there by mistake.
+    throw new Error(`${name} must be an integer (${min}-${max}).`);
   }
   return Math.min(max, Math.max(min, Number(trimmed)));
 }
