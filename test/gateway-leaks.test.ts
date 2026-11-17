@@ -474,3 +474,39 @@ describe('round 9: consent helpers', () => {
     expect(errors.slice(0, 4).map(error => error.message)).toEqual(Array(4).fill('Refused: a state, code or session id must be printable ASCII.'));
   });
 });
+
+describe('round 10', () => {
+  it('refuses a key object that cannot be exported or exports no content, never running without a secret', () => {
+    const throwing = { type: 'private', asymmetricKeyType: 'rsa', export: () => { throw new Error(`export failed ${PIECE}`); } };
+    const empty = { type: 'private', asymmetricKeyType: 'rsa', export: () => '' };
+    for (const privateKey of [throwing, empty]) {
+      let caught: Error | undefined;
+      try {
+        createEnableBankingGateway({ applicationId: 'app-0000-test', privateKey: privateKey as never });
+      } catch (error) {
+        caught = error as Error;
+      }
+      expect(caught).toBeInstanceOf(Error);
+      expect(caught!.message).toMatch(/key was refused/);
+      expect(String(caught!.stack)).toBe(`${caught!.name}: ${caught!.message}`);
+      expect(leaks([caught!.message, String(caught!.stack)])).toEqual([]);
+    }
+  });
+
+  it('refuses a session id as an error that holds no piece of it or of the key, in any field', async () => {
+    const gateway = gatewayWith(() => json({ status: 'AUTHORIZED', accounts: [ACCOUNT] }));
+    for (const sessionId of ['Zq7pX2visError9mWb4TnR', 'EnableBankingGatewayErrorZq7pX2']) {
+      let caught: Error | undefined;
+      try {
+        await gateway.callTool('list_accounts', {}, { credentials: { sessionId, accountIds: [ACCOUNT] } });
+      } catch (error) {
+        caught = error as Error;
+      }
+      expect(caught, sessionId).toBeInstanceOf(Error);
+      const fields = [caught!.name, caught!.message, String(caught!.stack), JSON.stringify(caught)];
+      for (let i = 0; i + 6 <= sessionId.length; i += 1) {
+        for (const field of fields) expect(field, sessionId).not.toContain(sessionId.slice(i, i + 6));
+      }
+    }
+  });
+});
