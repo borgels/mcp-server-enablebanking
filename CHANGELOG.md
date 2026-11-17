@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.4.0 (2026-11-17)
+
+Embedding surface `mcp-server-enablebanking/gateway`, so one host process can
+serve many companies. The standalone stdio/HTTP server is unchanged.
+
+- `createEnableBankingGateway({ applicationId, privateKey, apiBaseUrl?, timeoutMs?, maxResponseBytes?, fetchImpl? })`
+  holds the application's credentials; nothing is read from the environment.
+- `callTool(name, input, { caller?, requestId?, credentials: { sessionId, accountIds } })`.
+  `accountIds` is the company's account allowlist and replaces the registry on
+  this path: an account outside it is refused before any request, and the
+  session at Enable Banking must still be authorised and contain it. Missing
+  or empty credentials are refused with no fallback.
+- Tools `list_accounts`, `get_balances` (balances only) and
+  `list_transactions` (at most 366 days per period, default the last 30 days
+  including today; at most 1,000 rows per call, paged with a token signed by
+  the gateway instance and bound to account, period and status). Read-only: no
+  payment surface.
+- `enableBankingToolCatalog` (frozen; `upstream`, `broad`, `defaultRead`,
+  `summary`, `exposure`, `transactionDetails`), `enableBankingServiceCatalog`
+  and `resolveEnableBankingReadTarget`.
+- Consent helpers on the instance (not tools): `listBanks`,
+  `startAuthorization` (checks `valid_until` against the bank's maximum),
+  `completeSession`, `sessionStatus`, `endSession`.
+- A redactor per gateway and per call; fixed upstream targets, time limits,
+  bounded response bodies, no redirects.
+- `package.json` gains an `exports` map (`.`, `./gateway` and
+  `./package.json`) and the build emits type declarations.
+
+Upgrade notes: with the `exports` map, deep imports such as
+`mcp-server-enablebanking/dist/server.js` no longer resolve through the
+package name; import `mcp-server-enablebanking` (the stdio entry),
+`mcp-server-enablebanking/gateway` or `mcp-server-enablebanking/package.json`.
+The `bin` command and the container image are unchanged.
+
 ## 0.3.0 (2026-11-16)
 
 HTTP transport hardening, upstream client hardening and dependency updates.

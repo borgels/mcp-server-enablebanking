@@ -1,9 +1,17 @@
 {
   "name": "mcp-server-enablebanking",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Read-only MCP server for bank accounts via Enable Banking (PSD2 AIS), hard-scoped to one company per instance.",
   "type": "module",
   "main": "./dist/transports/stdio.js",
+  "exports": {
+    ".": "./dist/transports/stdio.js",
+    "./gateway": {
+      "types": "./dist/gateway.d.ts",
+      "default": "./dist/gateway.js"
+    },
+    "./package.json": "./package.json"
+  },
   "files": [
     "dist",
     "README.md",
@@ -15,7 +23,7 @@
     "mcp-server-enablebanking": "./dist/transports/stdio.js"
   },
   "scripts": {
-    "build": "tsup src/server.ts src/transports/stdio.ts src/transports/http.ts --format esm --clean --sourcemap",
+    "build": "tsup src/server.ts src/transports/stdio.ts src/transports/http.ts src/gateway.ts --format esm --dts --clean --sourcemap",
     "dev": "tsx src/transports/stdio.ts",
     "dev:http": "tsx src/transports/http.ts",
     "check:accounts": "tsx src/enablebanking/check-registry.ts",

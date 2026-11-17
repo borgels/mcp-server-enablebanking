@@ -7,7 +7,7 @@ import { parseKey, SessionStore } from './enablebanking/store.js';
 import { registerTools } from './tools/enablebanking.js';
 
 /** Package version reported by the MCP server. Kept in sync with package.json (checked by a test). */
-export const VERSION = '0.3.0';
+export const VERSION = '0.4.0';
 
 /** One Bank per process: it holds the read cache, and the config never changes at runtime. */
 export function createBank(config: EnableBankingConfig = loadConfig(), client?: EnableBankingClient): Bank {
