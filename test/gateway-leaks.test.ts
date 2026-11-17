@@ -530,3 +530,23 @@ describe('round 11', () => {
     expect(leaks(fields)).toEqual([]);
   });
 });
+
+describe('round 12', () => {
+  it('masks a returned session id that fails the format check in the final error', async () => {
+    for (const RETURNED of ['EnableBankingGatewayError_Zq7pX2', 'EnableBankingGatewayError\uD800Zq7pX2']) {
+      const gateway = gatewayWith(url => (url.pathname === '/sessions' ? json({ session_id: RETURNED, accounts: [] }) : json({}, 404)));
+      let caught: Error | undefined;
+      try {
+        await gateway.completeSession({ code: 'code-0123456789' });
+      } catch (error) {
+        caught = error as Error;
+      }
+      expect(caught, RETURNED).toBeInstanceOf(Error);
+      const fields = [caught!.name, caught!.message, String(caught!.stack), JSON.stringify(caught)];
+      for (let i = 0; i + 6 <= RETURNED.length; i += 1) {
+        for (const field of fields) expect(field, RETURNED).not.toContain(RETURNED.slice(i, i + 6));
+      }
+      expect(String(caught!.stack)).toBe(`${caught!.name}: ${caught!.message}`);
+    }
+  });
+});
