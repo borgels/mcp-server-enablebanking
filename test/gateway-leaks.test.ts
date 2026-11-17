@@ -361,3 +361,66 @@ describe('round 7: the sink check', () => {
     expect(JSON.stringify(result)).not.toContain('Leverand');
   });
 });
+
+describe('round 8', () => {
+  /** A piece of the key content that can be part of a function name. */
+  const NAME_PIECE = (() => {
+    for (let i = 0; i + 6 <= CONTENT.length; i += 1) {
+      const piece = CONTENT.slice(i, i + 6);
+      if (/^[A-Za-z][A-Za-z0-9]{5}$/.test(piece)) return piece;
+    }
+    throw new Error('no usable piece');
+  })();
+
+  /** Runs `work` inside a function whose name holds a piece of the key, so a raw stack would name it. */
+  function inNamedFunction<T>(work: () => T): T {
+    const name = `call${NAME_PIECE}`;
+    const holder = { [name]: () => work() };
+    return holder[name]!();
+  }
+
+  function expectFinalForm(error: Error): void {
+    const stack = String(error.stack);
+    expect(stack).toBe(`${error.name}: ${error.message}`);
+    expect(stack).not.toMatch(/\n\s+at /);
+    expect((error as { cause?: unknown }).cause).toBeUndefined();
+    expect(leaks([stack, error.message, error.name])).toEqual([]);
+  }
+
+  it('throws construction errors in final form, also from a caller whose name holds a piece of the key', () => {
+    let caught: Error | undefined;
+    try {
+      inNamedFunction(() => createEnableBankingGateway({ applicationId: 'app-0000-test', privateKey: PEM, timeoutMs: 0 }));
+    } catch (error) {
+      caught = error as Error;
+    }
+    expect(caught).toBeInstanceOf(Error);
+    expectFinalForm(caught!);
+  });
+
+  it('throws consent-helper errors in final form', async () => {
+    const gateway = gatewayWith(() => json({ error: 'X', message: 'no' }, 500));
+    let caught: Error | undefined;
+    try {
+      await inNamedFunction(() => gateway.listBanks({ country: 'DK' }));
+    } catch (error) {
+      caught = error as Error;
+    }
+    expect(caught).toBeInstanceOf(Error);
+    expectFinalForm(caught!);
+  });
+
+  it('reduces every element of a failure list, whatever its fields, also below a wrapper', async () => {
+    const gateway = gatewayWith(url =>
+      url.pathname.startsWith('/sessions/')
+        ? session()
+        : json({
+            balances: [
+              { balance_type: 'CLBD', balance_amount: { currency: 'DKK', amount: { data: { failures: [{ reason: 'Leverandørens interne fejltekst' }] } } } },
+            ],
+          }),
+    );
+    const result = await gateway.callTool('get_balances', { account: ACCOUNT }, ctx);
+    expect(JSON.stringify(result)).not.toContain('Leverand');
+  });
+});
