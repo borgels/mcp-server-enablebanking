@@ -41,11 +41,19 @@ function magnitude(value: string | undefined): string {
   }
 }
 
+/** A date from the bank as YYYY-MM-DD, or null: the bank's text is never cut, only a date we parsed is written. */
+function isoDay(value: unknown): string | null {
+  if (typeof value !== 'string' || value.length > 64) return null;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(value)) return value;
+  const ms = Date.parse(value);
+  return Number.isNaN(ms) ? null : new Date(ms).toISOString().slice(0, 10);
+}
+
 export function transactionView(row: TransactionResource): TransactionView {
   const debit = row.credit_debit_indicator === 'DBIT';
   const amount = magnitude(row.transaction_amount?.amount);
   const remittance = Array.isArray(row.remittance_information) ? row.remittance_information.map(String) : [];
-  const bookingDate = (row.booking_date ?? null)?.slice(0, 10) ?? null;
+  const bookingDate = isoDay(row.booking_date);
   const counterpartyAccount = debit ? row.creditor_account?.iban : row.debtor_account?.iban;
   const reference =
     row.entry_reference ||
@@ -55,7 +63,7 @@ export function transactionView(row: TransactionResource): TransactionView {
   const view: TransactionView = {
     reference,
     bookingDate,
-    valueDate: (row.value_date ?? null)?.slice(0, 10) ?? null,
+    valueDate: isoDay(row.value_date),
     amount: debit && amount !== '0.00' ? `-${amount}` : amount,
     currency: row.transaction_amount?.currency ?? 'DKK',
     direction: debit ? 'out' : 'in',
