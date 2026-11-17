@@ -145,6 +145,38 @@ outside their range are clamped as before. The `ENABLEBANKING_*` flags
 `ENABLEBANKING_CONSENT_CALLBACK`) are only on with exactly `true`; any other value
 (including `TRUE` or `1`) leaves them off, unlike the `MCP_*` flags above.
 
+## Threat model
+
+What the embedded gateway guarantees about the application's private key
+and a company's session, and what it does not. It is the yardstick for
+every change that touches errors or results.
+
+**Guaranteed:**
+
+- **(a) The private key never reaches anything persisted or shared:** error
+  texts, results, logs or files. It never leaves the instance except as a
+  JWT signature to Enable Banking's fixed origin; errors are our own texts,
+  and every result is redacted with the key before it leaves the instance.
+- **(b) No vendor-controlled free text in errors.** An error carries our own
+  fixed text, the HTTP status and an error code from Enable Banking's
+  documented list; never a response body, a message or detail, a redirect's
+  `Location`, an undocumented session status, or the cause of a network
+  failure. Errors never quote a configuration value, the tool name or field
+  names.
+- **(c) Results go only to the company whose session it is.** The session id
+  and the allowed accounts come with each call; nothing about a company is
+  kept in process-wide state; an account outside the call's list is refused
+  before any request.
+
+**Not guaranteed (residual risk):** Enable Banking or a bank deliberately
+echoing a company's session id or the key back in data. Results are redacted
+on a best-effort basis: the key exactly, URL- and JSON-escaped, and any
+piece of its content of 6 characters or more, and the session id whole, in
+strings, object keys and the string form of numbers and booleans, replaced
+by `"[REDACTED]"` before anything is serialised. Anything otherwise
+transformed is not recognised. Account ids stay: they are the data the host
+needs. The MCP server (one company per instance) applies this to errors.
+
 ## Security model
 
 - All callers share one Enable Banking application identity and the consents
