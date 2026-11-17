@@ -105,7 +105,13 @@ export class EnableBankingHttpError extends Error {
 /** Keys whose value is a failure context: anything inside that carries an error or a message is a failure. */
 const FAILURE_CONTEXTS = new Set(['failures', 'failure', 'errors', 'error', 'metadata', 'warnings', 'amount']);
 /** Fields that make an object in a failure context a failure. */
-const FAILURE_FIELDS = ['error', 'errors', 'message', 'detail', 'description'];
+const FAILURE_FIELDS = ['error', 'errors', 'failures', 'warnings', 'message', 'detail', 'description'];
+/** Failure contexts that are lists of failures: a text in one is the vendor's own and is replaced by ours. */
+const FAILURE_LISTS = new Set(['failures', 'failure', 'errors', 'error', 'warnings']);
+
+function failureContext(key: string): false | 'list' | 'object' {
+  return FAILURE_LISTS.has(key) ? 'list' : FAILURE_CONTEXTS.has(key) ? 'object' : false;
+}
 
 /**
  * Copy of a successful body with every failure reported inside it reduced to
@@ -114,11 +120,16 @@ const FAILURE_FIELDS = ['error', 'errors', 'message', 'detail', 'description'];
  * object in a failure context (`failures[]`, `errors[]`, `metadata`, `amount`
  * and the like) with any of `error`, `errors`, `message`, `detail` or
  * `description`. Its message, code, detail and every other field are
- * dropped. Depth-limited.
+ * dropped. A text in a failure list (`failures`, `errors`, `warnings` and
+ * the like) is replaced by our own text too; a text elsewhere, an amount
+ * among them, is kept. Depth-limited.
  */
-export function nestedFailuresAsStatus(value: unknown, depth = 0, context = false): unknown {
+export function nestedFailuresAsStatus(value: unknown, depth = 0, context: false | 'list' | 'object' = false): unknown {
   if (depth > 64) {
     return '[nested too deep]';
+  }
+  if (typeof value === 'string' && context === 'list') {
+    return 'Enable Banking reported a failure.';
   }
   if (typeof value !== 'object' || value === null) {
     return value;
@@ -136,7 +147,7 @@ export function nestedFailuresAsStatus(value: unknown, depth = 0, context = fals
       : { error: 'Enable Banking reported a failure.' };
   }
   return Object.fromEntries(
-    Object.entries(record).map(([key, entry]) => [key, nestedFailuresAsStatus(entry, depth + 1, FAILURE_CONTEXTS.has(key))]),
+    Object.entries(record).map(([key, entry]) => [key, nestedFailuresAsStatus(entry, depth + 1, failureContext(key))]),
   );
 }
 
