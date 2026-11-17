@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.4.1 (2026-11-17)
+
+- No Enable Banking text in errors (also for the MCP server): an HTTP error
+  gives the status, our hint and an error code from Enable Banking's
+  documented list; the body's message and detail are not kept, an over-limit
+  error body is discarded, and an undocumented code is dropped.
+- Gateway: every result is redacted as data before it is serialised, keys
+  included, with the instance's key (exact, URL- and JSON-escaped, and any
+  6-character piece of its content) and the call's session id. A key given as
+  a `KeyObject` is redacted too. The consent helpers' answers are redacted
+  with the key.
+- Gateway: errors no longer repeat the tool name or unknown field names; a
+  session status is named only when documented; consent dates are returned
+  as ISO 8601 in UTC (`validUntil`), or null when they are not a date.
+- Account names over 200 characters are left out instead of cut.
+- Configuration errors no longer quote the rejected value.
+
 ## 0.4.0 (2026-11-17)
 
 Embedding surface `mcp-server-enablebanking/gateway`, so one host process can
