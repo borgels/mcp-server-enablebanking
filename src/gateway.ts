@@ -416,14 +416,16 @@ export function createEnableBankingGateway(options: EnableBankingGatewayOptions)
 }
 
 /** What a PEM key given as text may consist of. */
-const PEM_TEXT = /^[\t\n\r\x20-\x7E]+$/;
+const PEM_TEXT = /^[\t\n\r\x20-\x7E]*$/;
 
 /** Whether a session id can be used: admitted like a key, and sharing no piece with a fixed output. */
 function sessionAdmitted(sessionId: string): boolean {
   if (!admitsKey(sessionId)) return false;
   const probe = new GatewayRedactor();
   probe.watch(sessionId);
-  return !leaksSecret(fixedOutputs(), probe);
+  // The tool list goes to the host too: a session id that shares a piece with it is refused like one that shares a
+  // piece with a fallback.
+  return !leaksSecret([fixedOutputs(), enableBankingGatewayTools], probe);
 }
 
 /** The error a call or a consent helper is refused with: its text and its name hold no piece of the secret. */
