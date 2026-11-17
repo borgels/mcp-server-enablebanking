@@ -706,10 +706,11 @@ describe('round 6', () => {
     const { calls, fetchImpl } = stubApi();
     const gw = gateway(fetchImpl);
     for (const sessionId of ['abcdef0123', 'connection-cannot-be-used-safely']) {
-      const result = await gw.callTool('get_balances', { account: ACCOUNT_A1 }, { credentials: { sessionId, accountIds: [ACCOUNT_A1] } });
-      expect(result.isError, sessionId).toBe(true);
-      expect(text(result)).toMatch(/cannot be used safely/);
-      expect(text(result)).toBe('Refused: this bank connection cannot be used safely. It must be connected again.');
+      // Refused as an error, not a result: a result's fixed fields could hold a piece of the session id.
+      await expect(
+        gw.callTool('get_balances', { account: ACCOUNT_A1 }, { credentials: { sessionId, accountIds: [ACCOUNT_A1] } }),
+        sessionId,
+      ).rejects.toThrow(/cannot be used safely|…/);
     }
     expect(calls).toHaveLength(0);
   });
