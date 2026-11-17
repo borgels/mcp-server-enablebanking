@@ -180,3 +180,20 @@ describe('no piece of the key leaves an instance', () => {
     expect(leaks(messages)).toEqual([]);
   });
 });
+
+describe('numbers', () => {
+  it('redacts a numeric session id echoed as a number, and the result stays valid JSON', async () => {
+    const NUMERIC = '12345678';
+    const gateway = gatewayWith(url =>
+      url.pathname.startsWith('/sessions/')
+        ? json({ status: 'AUTHORIZED', accounts: [ACCOUNT], access: { valid_until: '2027-05-01T00:00:00Z' } })
+        : json({ balances: [{ balance_type: 'CLBD', name: Number(NUMERIC), balance_amount: { currency: 'DKK', amount: Number(NUMERIC) } }] }),
+    );
+    const result = await gateway.callTool('get_balances', { account: ACCOUNT }, { credentials: { sessionId: NUMERIC, accountIds: [ACCOUNT] } });
+    expect(result.isError, JSON.stringify(result.content)).toBeUndefined();
+    const serialised = JSON.stringify(result);
+    expect(JSON.parse(serialised)).toEqual(result);
+    expect(serialised).not.toContain(NUMERIC);
+    expect(result.structuredContent).toMatchObject({ balances: [{ name: '[REDACTED]', amount: '[REDACTED]' }] });
+  });
+});
