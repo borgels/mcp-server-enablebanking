@@ -286,7 +286,8 @@ describe('round 7: the sink check', () => {
           : json({ balances: [{ balance_type: 'CLBD', balance_amount: { currency: 'DKK', amount: '1250.00' } }] }),
     );
     const call = { credentials: { sessionId, accountIds: [ACCOUNT] } };
-    const outputs: unknown[] = [gateway.tools];
+    // The tool list counts for a session that is used; a refused one is used for nothing.
+    const outputs: unknown[] = [];
     let refused: Error | undefined;
     try {
       outputs.push(
@@ -294,6 +295,7 @@ describe('round 7: the sink check', () => {
         await gateway.callTool('get_balances', { account: ACCOUNT }, call),
         await gateway.callTool('list_transactions', { account: ACCOUNT, from: 'x' }, call),
       );
+      outputs.push(gateway.tools);
     } catch (error) {
       refused = error as Error;
       outputs.push(refused.message, refused.name, refused.stack ?? '');
