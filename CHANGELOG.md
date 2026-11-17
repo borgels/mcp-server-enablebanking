@@ -2,6 +2,9 @@
 
 ## 0.4.1 (2026-11-17)
 
+- `completeSession` registers the session id Enable Banking returns from
+  the raw answer (success or error body), before the client's
+  normalisation, which can drop it, and before its format is checked.
 - `completeSession` registers the session id Enable Banking returns before
   its format is checked; a value that is not printable ASCII is masked in
   the final error without being encoded. The README states the scope: the
