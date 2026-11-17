@@ -15,6 +15,10 @@
   session status is named only when documented; consent dates are returned
   as ISO 8601 in UTC (`validUntil`), or null when they are not a date.
 - Account names over 200 characters are left out instead of cut.
+- Gateway: numbers and booleans whose string form matches are replaced by
+  the string `"[REDACTED]"`; a result is redacted first and copied as JSON
+  afterwards. The README has a threat model: what is guaranteed and the
+  residual risk.
 - Configuration errors no longer quote the rejected value.
 
 ## 0.4.0 (2026-11-17)
