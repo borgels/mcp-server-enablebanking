@@ -22,7 +22,7 @@ import {
 import { EnableBankingHttpError, ERROR_CODES } from './errors.js';
 import { GatewayRedactor } from './gateway/redact.js';
 import { fixedOutputs, RESULT_WITHHELD, SESSION_REFUSED, withheldResult } from './fallbacks.js';
-import { admitsKey, KEY_REFUSED, keyRefusedText, leaksSecret, maskedText } from './key-admission.js';
+import { admitsKey, KEY_REFUSED, keyRefusedText, leaksSecret, sealedError } from './key-admission.js';
 
 /**
  * Embeddable entry point: a host that serves many companies from one process
@@ -392,8 +392,8 @@ export function createEnableBankingGateway(options: EnableBankingGatewayOptions)
     const given: unknown = options && typeof options === 'object' ? options.privateKey : undefined;
     if (typeof given === 'string') {
       // Admission of the text before anything is built from it: PEM is printable ASCII with line breaks.
-      if (!PEM_TEXT.test(given)) throw new Error(KEY_REFUSED);
       content = pemContent(given);
+      if (!PEM_TEXT.test(given)) throw new Error(KEY_REFUSED);
       guard.addKey(given);
     } else if (given && typeof given === 'object' && (given as KeyObject).type === 'private') {
       try {
@@ -411,7 +411,11 @@ export function createEnableBankingGateway(options: EnableBankingGatewayOptions)
   } catch (error) {
     let message = guard.redact(error instanceof Error ? error.message : String(error));
     if (leaksSecret(message, guard)) message = keyRefusedText(content);
-    throw new Error(message);
+    // A fresh error in final form (src/key-admission.ts, sealedError): no cause, a stack without frames, and name,
+    // message and stack masked against the key. Then the sink check on the finished object.
+    const final = sealedError(new Error(message), content);
+    if (leaksSecret(final, guard)) throw sealedError(new Error(keyRefusedText(content)), content);
+    throw final;
   }
 }
 
@@ -428,12 +432,9 @@ function sessionAdmitted(sessionId: string): boolean {
   return !leaksSecret([fixedOutputs(), enableBankingGatewayTools], probe);
 }
 
-/** The error a call or a consent helper is refused with: its text and its name hold no piece of the secret. */
-function refusal(text: string, secret: string): EnableBankingGatewayError {
-  const error = new EnableBankingGatewayError(maskedText(text, secret));
-  error.name = maskedText(error.name, secret);
-  error.stack = `${error.name}: ${error.message}`;
-  return error;
+/** The error a call or a consent helper is refused with, in final form: masked against every secret, no frames. */
+function refusal(text: string, ...secrets: string[]): EnableBankingGatewayError {
+  return sealedError(new EnableBankingGatewayError(text), ...secrets);
 }
 
 function buildEnableBankingGateway(options: EnableBankingGatewayOptions) {
@@ -475,6 +476,8 @@ function buildEnableBankingGateway(options: EnableBankingGatewayOptions) {
     // A key that cannot be exported cannot be echoed in this form either.
   }
   for (const content of contents) if (!admitsKey(content)) throw new Error(keyRefusedText(content));
+  /** The key content, which every error is masked against. */
+  const keyContent = contents[0] ?? '';
   // The fixed outputs of the sink check (src/fallbacks.ts) must hold no piece of the key.
   if (leaksSecret(fixedOutputs(), redactor)) throw new Error(keyRefusedText(contents[0] ?? ''));
 
@@ -503,10 +506,15 @@ function buildEnableBankingGateway(options: EnableBankingGatewayOptions) {
       const details = httpDetails(error);
       const message = callRedactor.message(error);
       // The sink check on the error as it leaves.
-      throw new EnableBankingGatewayError(leaksSecret(message, callRedactor) ? RESULT_WITHHELD : message, details);
+      // A fresh error in final form: no cause, no frames, masked against the key and the call's values.
+      throw sealedError(
+        new EnableBankingGatewayError(leaksSecret(message, callRedactor) ? RESULT_WITHHELD : message, details),
+        keyContent,
+        ...secrets,
+      );
     }
     // The sink check on the answer as it leaves: one that holds a piece of the key is withheld.
-    if (leaksSecret(answer, redactor)) throw new EnableBankingGatewayError(RESULT_WITHHELD);
+    if (leaksSecret(answer, redactor)) throw sealedError(new EnableBankingGatewayError(RESULT_WITHHELD), keyContent);
     return answer as T;
   }
 
@@ -528,7 +536,7 @@ function buildEnableBankingGateway(options: EnableBankingGatewayOptions) {
         // Session admission, before anything else: a session id that is not printable ASCII of 16 characters or
         // more, or shares a piece with our texts or a fixed output, is refused. Not as a result, whose fixed fields
         // could hold a piece of it, but as an error whose text and name are masked.
-        if (!sessionAdmitted(sessionId)) throw refusal(SESSION_REFUSED, sessionId);
+        if (!sessionAdmitted(sessionId)) throw refusal(SESSION_REFUSED, sessionId, keyContent);
         callRedactor.add(sessionId);
         callRedactor.watch(sessionId);
       }
@@ -638,7 +646,7 @@ function buildEnableBankingGateway(options: EnableBankingGatewayOptions) {
         if (typeof sessionId !== 'string' || !ID_PATTERN.test(sessionId)) {
           throw new Error('completeSession: Enable Banking did not return a usable session.');
         }
-        if (!sessionAdmitted(sessionId)) throw refusal(SESSION_REFUSED, sessionId);
+        if (!sessionAdmitted(sessionId)) throw refusal(SESSION_REFUSED, sessionId, keyContent);
         const rawAccounts = Array.isArray(session?.accounts) ? session.accounts : [];
         const accounts: ConsentAccount[] = [];
         let accountsWithoutId = 0;
