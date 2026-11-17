@@ -41,12 +41,19 @@ function magnitude(value: string | undefined): string {
   }
 }
 
-/** A date from the bank as YYYY-MM-DD, or null: the bank's text is never cut, only a date we parsed is written. */
+/**
+ * The bank's calendar date as YYYY-MM-DD, or null. The date is kept as the
+ * bank gave it, never converted between time zones: a value that starts
+ * with a valid YYYY-MM-DD (alone or followed by a time) keeps that date, so
+ * `2026-11-02T00:30:00+01:00` is 2 November. Anything else is null.
+ */
 function isoDay(value: unknown): string | null {
   if (typeof value !== 'string' || value.length > 64) return null;
-  if (/^\d{4}-\d{2}-\d{2}$/.test(value)) return value;
-  const ms = Date.parse(value);
-  return Number.isNaN(ms) ? null : new Date(ms).toISOString().slice(0, 10);
+  const match = /^(\d{4}-\d{2}-\d{2})(?:$|T)/.exec(value);
+  if (!match) return null;
+  const day = match[1]!;
+  const parsed = new Date(`${day}T00:00:00Z`);
+  return !Number.isNaN(parsed.getTime()) && parsed.toISOString().slice(0, 10) === day ? day : null;
 }
 
 export function transactionView(row: TransactionResource): TransactionView {
