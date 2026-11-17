@@ -639,7 +639,7 @@ describe('consent helpers', () => {
 
     const ended = await gw.endSession({ sessionId: 'session-not-a-uuid-xyz' }).catch((e: unknown) => e);
     expect((ended as Error).message).not.toContain('session-not-a-uuid-xyz');
-    await expect(gw.completeSession({ code: 'has space' })).rejects.toThrow(/malformed/);
+    await expect(gw.completeSession({ code: 'has space' })).rejects.toThrow(/malformed|printable ASCII/);
   });
 
   it('reads the status of a session and ends it', async () => {
