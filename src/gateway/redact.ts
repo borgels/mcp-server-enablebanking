@@ -15,6 +15,21 @@
  * values (redactDeep), before they are serialised.
  */
 
+/**
+ * What a redacted value is replaced by. Its brackets are not ASCII, so it cannot be a piece of the key's base64
+ * content or of a session id; a key whose content shares a FRAGMENT_LENGTH piece with it is refused (overlapsMarker).
+ */
+export const REDACTION_MARKER = '‹redacted›';
+
+/** Whether a secret could survive its own redaction: it contains the marker, or shares a piece with it. */
+export function overlapsMarker(value: string): boolean {
+  if (value.includes(REDACTION_MARKER)) return true;
+  for (let i = 0; i + 6 <= REDACTION_MARKER.length; i += 1) {
+    if (value.includes(REDACTION_MARKER.slice(i, i + 6))) return true;
+  }
+  return false;
+}
+
 /** Values shorter than this are not redacted by value (too likely to hit normal text). */
 export const MIN_SECRET_LENGTH = 8;
 /** Pieces of the key material this long or longer are redacted wherever they appear. */
@@ -27,13 +42,13 @@ export const MAX_REDACTED_VALUES = 64;
 export const MAX_ERROR_MESSAGE_LENGTH = 500;
 
 const PATTERNS: Array<[RegExp, string]> = [
-  [/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(-----END [A-Z ]*PRIVATE KEY-----|$)/g, '[REDACTED KEY]'],
-  [/\bbearer\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer [REDACTED]'],
+  [/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(-----END [A-Z ]*PRIVATE KEY-----|$)/g, '‹redacted›'],
+  [/\bbearer\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer ‹redacted›'],
   // A signed JWT, wherever it appears.
-  [/\beyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]*/g, '[REDACTED JWT]'],
-  [/\b(code|state|session_id|sessionId|continuation_key)(["']?\s*[=:]\s*["']?)[^&\s"',}]+/gi, '$1$2[REDACTED]'],
+  [/\beyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]*/g, '‹redacted›'],
+  [/\b(code|state|session_id|sessionId|continuation_key)(["']?\s*[=:]\s*["']?)[^&\s"',}]+/gi, '$1$2‹redacted›'],
   // Session ids and account uids at Enable Banking are UUIDs.
-  [/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi, '[REDACTED ID]'],
+  [/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi, '‹redacted›'],
 ];
 
 export class GatewayRedactor {
@@ -74,7 +89,7 @@ export class GatewayRedactor {
     let result = text;
     // Longest first, so a value containing another is removed whole.
     for (const value of [...this.values].sort((a, b) => b.length - a.length)) {
-      result = result.split(value).join('[REDACTED]');
+      result = result.split(value).join('‹redacted›');
     }
     return this.fragments.size === 0 ? result : this.redactFragments(result);
   }
@@ -89,16 +104,16 @@ export class GatewayRedactor {
   /**
    * Copy of a JSON-like value with every string, object keys included, passed
    * through redactValues, and every number or boolean whose string form would
-   * be redacted replaced by the string "[REDACTED]". Anything nested deeper
+   * be redacted replaced by the string "‹redacted›". Anything nested deeper
    * than MAX_REDACT_DEPTH is replaced, never passed on.
    */
   redactDeep(value: unknown, depth = 0): unknown {
     if (depth > MAX_REDACT_DEPTH) return '[nested too deep]';
     if (typeof value === 'string') return this.redactValues(value);
     if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') {
-      // The string form of a primitive is checked too; a match becomes the string "[REDACTED]", so JSON stays valid.
+      // The string form of a primitive is checked too; a match becomes the string "‹redacted›", so JSON stays valid.
       const text = String(value);
-      if (this.redactValues(text) !== text) return '[REDACTED]';
+      if (this.redactValues(text) !== text) return '‹redacted›';
       return typeof value === 'bigint' ? text : value;
     }
     if (typeof value !== 'object' || value === null) return value;
@@ -119,7 +134,7 @@ export class GatewayRedactor {
       : redacted;
   }
 
-  /** Every run of text covered by a piece of the key becomes one [REDACTED]. */
+  /** Every run of text covered by a piece of the key becomes one ‹redacted›. */
   private redactFragments(text: string): string {
     const covered = new Uint8Array(text.length);
     let any = false;
@@ -133,7 +148,7 @@ export class GatewayRedactor {
     let out = '';
     for (let i = 0; i < text.length; i += 1) {
       if (!covered[i]) out += text[i];
-      else if (i === 0 || !covered[i - 1]) out += '[REDACTED]';
+      else if (i === 0 || !covered[i - 1]) out += '‹redacted›';
     }
     return out;
   }
