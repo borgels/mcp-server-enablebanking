@@ -54,6 +54,8 @@ const PATTERNS: Array<[RegExp, string]> = [
 export class GatewayRedactor {
   private readonly values = new Set<string>();
   private readonly fragments = new Set<string>();
+  /** Pieces the sink check looks for: of the key content and of the call's session id, in every form. */
+  private readonly watched = new Set<string>();
 
   /** Adds a value (and its URL-encoded and JSON-escaped forms), matched whole. Short or empty values are ignored. */
   add(value: string | undefined): void {
@@ -70,6 +72,27 @@ export class GatewayRedactor {
     const content = value.replace(/-----(BEGIN|END) [A-Z ]*-----/g, '').replace(/\s+/g, '');
     this.add(content);
     for (let i = 0; i + FRAGMENT_LENGTH <= content.length; i += 1) this.fragments.add(content.slice(i, i + FRAGMENT_LENGTH));
+    this.watch(content);
+  }
+
+  /**
+   * Adds a secret to the sink check only (`matches`): every piece of it, in
+   * every form, makes an output withheld. Redaction is not changed, so a
+   * session id is still matched whole there and account ids stay.
+   */
+  watch(value: string | undefined): void {
+    if (typeof value !== 'string') return;
+    for (const form of forms(value)) {
+      for (let i = 0; i + FRAGMENT_LENGTH <= form.length; i += 1) this.watched.add(form.slice(i, i + FRAGMENT_LENGTH));
+    }
+  }
+
+  /** Whether a text holds a piece of the key content or of a watched session id (the sink check). */
+  matches(text: string): boolean {
+    for (let i = 0; i + FRAGMENT_LENGTH <= text.length; i += 1) {
+      if (this.watched.has(text.slice(i, i + FRAGMENT_LENGTH))) return true;
+    }
+    return false;
   }
 
   /** A new redactor with the same values; adding to the fork does not change this one. */
@@ -77,6 +100,7 @@ export class GatewayRedactor {
     const copy = new GatewayRedactor();
     for (const value of this.values) copy.remember(value);
     for (const fragment of this.fragments) copy.fragments.add(fragment);
+    for (const piece of this.watched) copy.watched.add(piece);
     return copy;
   }
 
