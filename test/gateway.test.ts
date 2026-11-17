@@ -443,15 +443,21 @@ describe('gateway: redaction', () => {
     // The client never repeats the cause of a network failure at all.
     expect(text(a)).toBe('Enable Banking could not be reached (GET /sessions/{session_id}).');
 
-    const thrower = gateway(
-      vi.fn<typeof fetch>(async () => json({ error: 'X', message: `seen ${sessionA} and ${sessionB}` }, 500)),
+    // An answer that names both sessions in its data: each call removes its own session id only.
+    const echo = vi.fn<typeof fetch>(async input =>
+      new URL(String(input)).pathname.startsWith('/sessions/')
+        ? json({ status: 'AUTHORIZED', accounts: [ACCOUNT_A1], access: { valid_until: '2027-05-01T00:00:00Z' } })
+        : json({ name: `seen ${sessionA} and ${sessionB}`, currency: 'DKK' }),
     );
-    const resultA = text(await thrower.callTool('list_accounts', {}, { credentials: { sessionId: sessionA, accountIds: [ACCOUNT_A1] } }));
-    const resultB = text(await thrower.callTool('list_accounts', {}, { credentials: { sessionId: sessionB, accountIds: [ACCOUNT_A1] } }));
+    const echoing = gateway(echo);
+    const resultA = JSON.stringify(await echoing.callTool('list_accounts', {}, { credentials: { sessionId: sessionA, accountIds: [ACCOUNT_A1] } }));
+    const resultB = JSON.stringify(await echoing.callTool('list_accounts', {}, { credentials: { sessionId: sessionB, accountIds: [ACCOUNT_A1] } }));
     expect(resultA).not.toContain(sessionA);
     expect(resultA).toContain(sessionB);
     expect(resultB).not.toContain(sessionB);
     expect(resultB).toContain(sessionA);
+    // Account ids are data the host needs: they stay.
+    expect(resultA).toContain(ACCOUNT_A1);
   });
 });
 
@@ -600,7 +606,7 @@ describe('consent helpers', () => {
     expect(calls[0]!.body).toEqual({ code: 'code-0000-1111' });
     expect(done).toEqual({
       sessionId: SESSION_A,
-      validUntil: '2027-05-16T09:55:00+00:00',
+      validUntil: '2027-05-16T09:55:00.000Z',
       bank: { name: 'Opdigtet Bank', country: 'DK' },
       psuType: 'business',
       accounts: [
@@ -616,13 +622,13 @@ describe('consent helpers', () => {
     const code = 'very-secret-code-4242';
     const failing = consentApi(call =>
       call.url.pathname.startsWith('/sessions')
-        ? json({ error: 'WRONG_CODE', message: `code ${code} for ${SESSION_B} rejected; key ${PEM}` }, 400)
+        ? json({ error: 'WRONG_AUTHORIZATION_CODE', message: `code ${code} for ${SESSION_B} rejected; key ${PEM}` }, 400)
         : undefined,
     );
     const gw = gateway(failing.fetchImpl);
     const error = await gw.completeSession({ code }).catch((e: unknown) => e);
     expect(error).toBeInstanceOf(gatewayModule.EnableBankingGatewayError);
-    expect((error as Error).message).toMatch(/HTTP 400 \(WRONG_CODE\)/);
+    expect((error as Error).message).toMatch(/HTTP 400 \(WRONG_AUTHORIZATION_CODE\)/);
     expect((error as { status: number }).status).toBe(400);
     expect((error as Error).cause).toBeUndefined();
     for (const secret of [code, SESSION_B, 'PRIVATE KEY']) expect((error as Error).message).not.toContain(secret);
@@ -638,7 +644,7 @@ describe('consent helpers', () => {
     const gw = gateway(fetchImpl);
     expect(await gw.sessionStatus({ sessionId: SESSION_A })).toEqual({
       status: 'AUTHORIZED',
-      validUntil: '2027-05-01T00:00:00+00:00',
+      validUntil: '2027-05-01T00:00:00.000Z',
       accountIds: [ACCOUNT_A1, ACCOUNT_A2],
     });
     await gw.endSession({ sessionId: SESSION_A });
