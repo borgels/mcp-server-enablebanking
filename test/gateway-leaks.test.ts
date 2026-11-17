@@ -194,6 +194,74 @@ describe('numbers', () => {
     const serialised = JSON.stringify(result);
     expect(JSON.parse(serialised)).toEqual(result);
     expect(serialised).not.toContain(NUMERIC);
-    expect(result.structuredContent).toMatchObject({ balances: [{ name: '[REDACTED]', amount: '[REDACTED]' }] });
+    expect(result.structuredContent).toMatchObject({ balances: [{ name: '‹redacted›', amount: '‹redacted›' }] });
+  });
+});
+
+describe('round 5 of the threat model', () => {
+  const failing = (status: number) =>
+    new Response(
+      new ReadableStream({
+        start(controller) {
+          controller.error(Object.assign(new Error(`Vendor diagnostic ${PIECE.slice(0, 5)}`), { status: 500, code: 'VENDOR_UNLISTED' }));
+        },
+      }),
+      { status, headers: { 'Content-Type': 'application/json' } },
+    );
+
+  it('does not encode a continuation key that holds the key or the session id into a page token', async () => {
+    for (const continuation of [PIECE, `page-${SESSION}`]) {
+      const gateway = gatewayWith(url =>
+        url.pathname.startsWith('/sessions/')
+          ? session()
+          : json({
+              transactions: [{ entry_reference: 'r1', transaction_amount: { currency: 'DKK', amount: '1.00' }, status: 'BOOK', booking_date: '2026-11-02' }],
+              continuation_key: continuation,
+            }),
+      );
+      const result = await gateway.callTool('list_transactions', { account: ACCOUNT, from: '2026-11-01', to: '2026-11-17' }, ctx);
+      expect(result.isError, JSON.stringify(result.content)).toBeUndefined();
+      expect(result.structuredContent).toMatchObject({ incomplete: true });
+      expect(result.structuredContent).not.toHaveProperty('nextPageToken');
+      expect(leaks(result)).toEqual([]);
+    }
+  });
+
+  it('keeps only the status of a failure reported inside an answer', async () => {
+    const gateway = gatewayWith(url =>
+      url.pathname.startsWith('/sessions/')
+        ? session()
+        : json({
+            balances: [
+              {
+                balance_type: 'CLBD',
+                balance_amount: { currency: 'DKK', amount: { status: 500, error: 'Vendor text', message: 'Vendor message', code: 'VENDOR' } },
+              },
+            ],
+          }),
+    );
+    const result = await gateway.callTool('get_balances', { account: ACCOUNT }, ctx);
+    expect(result.isError, JSON.stringify(result.content)).toBeUndefined();
+    expect(result.structuredContent).toMatchObject({
+      balances: [{ amount: { status: 500, error: 'Enable Banking reported a failure with HTTP 500.' } }],
+    });
+    expect(JSON.stringify(result)).not.toContain('Vendor');
+  });
+
+  it('gives our own text when an answer or an error body cannot be read', async () => {
+    for (const status of [200, 401, 500]) {
+      const gateway = gatewayWith(url => (url.pathname.startsWith('/sessions/') ? session() : failing(status)));
+      const result = await gateway.callTool('get_balances', { account: ACCOUNT }, ctx);
+      expect(result.isError).toBe(true);
+      expect(JSON.stringify(result)).not.toContain('Vendor');
+      expect(JSON.stringify(result)).not.toContain(PIECE.slice(0, 5));
+      if (status !== 200) expect(result.content[0]?.text).toContain(`HTTP ${status}`);
+    }
+    const helperError = await gatewayWith(() => failing(200))
+      .completeSession({ code: 'code-0123456789' })
+      .catch((error: unknown) => error as { message: string; status?: number; code?: string });
+    expect(helperError.message).not.toContain('Vendor');
+    expect(helperError.status).toBeUndefined();
+    expect(helperError.code).toBeUndefined();
   });
 });
