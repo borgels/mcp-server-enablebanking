@@ -183,20 +183,33 @@ by `"‹redacted›"` before anything is serialised. Anything otherwise
 transformed is not recognised. Account ids stay: they are the data the host
 needs. The MCP server (one company per instance) applies this to errors.
 
-**Key admission.** The private key is a secret the application owner
-creates, and a session id is one Enable Banking issues. A gateway refuses a
-key whose content (without PEM armour) is shorter than 16 characters or
-shares a piece of 6 characters with any text of this server's own: every
-string literal in `src/` (markers, the depth placeholder, error texts,
-variable names), listed in `src/fixed-corpus.generated.ts` by
-`scripts/fixed-corpus.mjs` and kept up to date by a test. The same rule
-refuses a session id, at `completeSession` and in each call. The refusal is a
-fixed text that never repeats the key or the session id. So no text of ours
-can hold a piece of either, and redaction can never leave one in place. On
-top of that, every string leaving a gateway (results, refusals, construction
-errors and the consent helpers' answers and errors) passes the redactor as
-the very last step. Findings that rely on a key this rule refuses are out of
-scope.
+**What leaves a gateway holds no piece of the key.** This is checked at
+the sink, not inferred from our texts: every output is checked in its final
+form, and one that holds a piece of 6 characters of the key (or of one of
+its encoded forms) is replaced by a fixed fallback. The outputs are the tool
+list, every tool result as a whole (outer fields such as `isError`
+included), the consent helpers' answers and errors, and construction errors. A result becomes a fixed
+"withheld" error, an audit record or line becomes a fixed one, and a
+construction error becomes the fixed refusal. The fallbacks are a small,
+closed set (`src/fallbacks.ts`), and a key that shares a piece with any of
+them, or with the tool list, is refused when the gateway is created.
+
+**Key admission.** Every key is a secret the vendor issues. A gateway
+accepts only printable ASCII (0x21-0x7E) of at least 16 characters, checked
+before anything is built from the key. As a cheap first filter it also
+refuses a key that shares a piece of 6 characters with a string literal in
+`src/` (`src/fixed-corpus.generated.ts`, kept up to date by a test). The
+refusal is a fixed text that never repeats the key.
+
+**The session id** is held to the same rule. Each call's session id must be
+printable ASCII of at least 16 characters and share no piece with our texts
+or a fallback, or the call is refused, as a thrown
+`EnableBankingGatewayError` whose text and name are masked. It is not
+refused as a result, because the fixed fields of a result (`isError`) could
+hold a piece of it. Its pieces are then part of the sink check for that
+call. A result that holds one is withheld; this can happen when an id in the
+data happens to share 6 characters with it. `completeSession` refuses such
+a session id too.
 
 **Page tokens** are opaque: 32 random bytes that the issuing gateway
 instance maps, in memory and for 15 minutes, to where the next page starts.
