@@ -21,7 +21,7 @@ import {
 } from './gateway/catalog.js';
 import { EnableBankingHttpError, ERROR_CODES } from './errors.js';
 import { GatewayRedactor } from './gateway/redact.js';
-import { fixedOutputs, RESULT_WITHHELD, SESSION_REFUSED, withheldResult } from './fallbacks.js';
+import { fixedOutputs, INPUT_REFUSED, RESULT_WITHHELD, SESSION_REFUSED, withheldResult } from './fallbacks.js';
 import { admitsKey, KEY_REFUSED, keyRefusedText, leaksSecret, sealedError } from './key-admission.js';
 
 /**
@@ -419,6 +419,9 @@ export function createEnableBankingGateway(options: EnableBankingGatewayOptions)
   }
 }
 
+/** What a value a consent helper registers as a secret (state, code, session id) may consist of. */
+const PRINTABLE_SECRET = /^[\x21-\x7E]*$/;
+
 /** What a PEM key given as text may consist of. */
 const PEM_TEXT = /^[\t\n\r\x20-\x7E]*$/;
 
@@ -496,9 +499,14 @@ function buildEnableBankingGateway(options: EnableBankingGatewayOptions) {
   /** Runs a consent helper; any failure becomes a redacted EnableBankingGatewayError without a cause. */
   async function helper<T>(secrets: Array<string | undefined>, work: () => Promise<T>): Promise<T> {
     const callRedactor = redactor.fork();
-    for (const secret of secrets) callRedactor.add(secret);
     let answer: unknown;
     try {
+      // Inside the error boundary: each value is checked as printable ASCII before anything encodes it (a lone
+      // surrogate would make the encoding throw), then registered.
+      for (const secret of secrets) {
+        if (secret !== undefined && !PRINTABLE_SECRET.test(secret)) throw new Error(INPUT_REFUSED);
+        callRedactor.add(secret);
+      }
       // The answer is the host's data (the session id included); only the instance's key is removed from it.
       // The outer pass is the final one, over the assembled answer.
       answer = redactor.redactDeep(redactor.redactDeep(await work()));
