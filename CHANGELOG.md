@@ -2,6 +2,10 @@
 
 ## 0.4.1 (2026-11-17)
 
+- `completeSession` registers the session id Enable Banking returns before
+  its format is checked; a value that is not printable ASCII is masked in
+  the final error without being encoded. The README states the scope: the
+  host is trusted; vendor values and anything persisted are in scope.
 - Every secret registered during a consent helper's call, the session id
   `completeSession` receives included, is part of the final seal and the
   sink check of any error that leaves the call.
