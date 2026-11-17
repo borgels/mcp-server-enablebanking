@@ -9,6 +9,8 @@ import {
   resolveEnableBankingReadTarget,
   type GatewayCallContext,
 } from '../src/gateway.js';
+import { transactionView } from '../src/enablebanking/format.js';
+import { nestedFailuresAsStatus } from '../src/errors.js';
 import { dkIban, KEY } from './helpers.js';
 
 const PEM = KEY.privateKey.export({ type: 'pkcs8', format: 'pem' }).toString();
@@ -283,7 +285,7 @@ describe('gateway: reads', () => {
     expect(data.transactions[0]!.amount).toBe('-100.00');
 
     const other = await gw.callTool('list_transactions', { account: ACCOUNT_A1, from: '2026-11-01', to: '2026-11-10', pageToken: 'bogus' }, ctxA);
-    expect(text(other)).toMatch(/pageToken does not belong/);
+    expect(text(other)).toMatch(/pageToken was not issued here/);
   });
 
   it('stops after a bounded number of pages and continues from the token', async () => {
@@ -297,7 +299,7 @@ describe('gateway: reads', () => {
     const first = await gw.callTool('list_transactions', period, ctxA);
     expect(calls.filter(call => call.url.pathname.endsWith('/transactions'))).toHaveLength(5);
     const token = (first.structuredContent as { nextPageToken: string }).nextPageToken;
-    expect(token).toMatch(/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{43}$/);
+    expect(token).toMatch(/^[A-Za-z0-9_-]{43}$/);
 
     // The token works only with the same account and period.
     expect(text(await gw.callTool('list_transactions', { ...period, to: '2026-11-09', pageToken: token }, ctxA))).toMatch(/does not belong/);
@@ -322,14 +324,15 @@ describe('gateway: reads', () => {
     const gw = gateway(fetchImpl);
     const period = { account: ACCOUNT_A1, from: '2026-11-01', to: '2026-11-10' };
     const issued = (await gw.callTool('list_transactions', period, ctxA)).structuredContent as { nextPageToken: string };
-    const [payload, mac] = issued.nextPageToken.split('.') as [string, string];
+    const payload = issued.nextPageToken;
+    const mac = payload;
     const claims = { k: 'chosen-key', o: 0, a: ACCOUNT_A1, f: '2026-11-01', t: '2026-11-10', s: 'booked' };
     const forged = Buffer.from(JSON.stringify(claims)).toString('base64url');
-    const flipped = `${mac.slice(0, -1)}${mac.endsWith('A') ? 'B' : 'A'}`;
+    const flipped = `${payload.slice(0, -1)}${payload.endsWith('A') ? 'B' : 'A'}`;
     const foreign = ((await gateway(fetchImpl).callTool('list_transactions', period, ctxA)).structuredContent as { nextPageToken: string })
       .nextPageToken;
     calls.length = 0;
-    for (const token of [`${forged}.${mac}`, `${forged}.${'A'.repeat(43)}`, `${payload}.${flipped}`, foreign, forged, `${payload}.${mac}.x`]) {
+    for (const token of [`${forged}.${mac}`, `${forged}.${'A'.repeat(43)}`, flipped, foreign, forged, `${payload}.x`, 'A'.repeat(43)]) {
       const result = await gw.callTool('list_transactions', { ...period, pageToken: token }, ctxA);
       expect(result.isError, token).toBe(true);
       expect(text(result)).toMatch(/pageToken (was not issued here|does not belong)/);
@@ -651,5 +654,81 @@ describe('consent helpers', () => {
     expect(calls.at(-1)).toMatchObject({ method: 'DELETE' });
     expect(calls.at(-1)!.url.pathname).toBe(`/sessions/${SESSION_A}`);
     await expect(gw.endSession({ sessionId: '../aspsps' })).rejects.toThrow(/malformed/);
+  });
+});
+
+describe('round 6', () => {
+  it('issues opaque page tokens that hold no account id and no continuation key', async () => {
+    const { fetchImpl } = stubApi({
+      handle: call =>
+        call.url.pathname.endsWith('/transactions') ? json({ transactions: [], continuation_key: 'page-9-key' }) : undefined,
+    });
+    const gw = gateway(fetchImpl);
+    const period = { account: ACCOUNT_A1, from: '2026-11-01', to: '2026-11-10' };
+    const token = ((await gw.callTool('list_transactions', period, ctxA)).structuredContent as { nextPageToken: string }).nextPageToken;
+    expect(token).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    const decoded = Buffer.from(token, 'base64url').toString('latin1');
+    for (const value of [ACCOUNT_A1, 'page-9-key', '2026-11-01', SESSION_A]) {
+      expect(token).not.toContain(value);
+      expect(decoded).not.toContain(value);
+    }
+  });
+
+  it('forgets a page token after its time, and accepts it only from the instance that issued it', async () => {
+    let clock = NOW;
+    const { calls, fetchImpl } = stubApi({
+      handle: call => (call.url.pathname.endsWith('/transactions') ? json({ transactions: [], continuation_key: 'next-key' }) : undefined),
+    });
+    const gw = gateway(fetchImpl, { now: () => clock });
+    const period = { account: ACCOUNT_A1, from: '2026-11-01', to: '2026-11-10' };
+    const token = ((await gw.callTool('list_transactions', period, ctxA)).structuredContent as { nextPageToken: string }).nextPageToken;
+    clock += 14 * 60_000;
+    expect((await gw.callTool('list_transactions', { ...period, pageToken: token }, ctxA)).isError).toBeUndefined();
+    expect(text(await gateway(fetchImpl, { now: () => clock }).callTool('list_transactions', { ...period, pageToken: token }, ctxA))).toMatch(
+      /was not issued here/,
+    );
+    clock += 2 * 60_000;
+    calls.length = 0;
+    expect(text(await gw.callTool('list_transactions', { ...period, pageToken: token }, ctxA))).toMatch(/was not issued here, or it has expired/);
+    expect(calls.some(call => call.url.pathname.endsWith('/transactions'))).toBe(false);
+  });
+
+  it('keeps the bank calendar date as given, without converting time zones', () => {
+    const row = (booking_date: string, value_date?: string) =>
+      transactionView({ transaction_amount: { currency: 'DKK', amount: '1.00' }, status: 'BOOK', booking_date, value_date } as never);
+    expect(row('2026-11-02T00:30:00+01:00', '2026-11-01T23:30:00-01:00')).toMatchObject({ bookingDate: '2026-11-02', valueDate: '2026-11-01' });
+    expect(row('2026-11-02')).toMatchObject({ bookingDate: '2026-11-02' });
+    expect(row('2026-02-30')).toMatchObject({ bookingDate: null });
+    expect(row('02-11-2026')).toMatchObject({ bookingDate: null });
+  });
+
+  it('refuses a session id that is short or shares text with our own texts, without repeating it', async () => {
+    const { calls, fetchImpl } = stubApi();
+    const gw = gateway(fetchImpl);
+    for (const sessionId of ['abcdef0123', 'connection-cannot-be-used-safely']) {
+      const result = await gw.callTool('get_balances', { account: ACCOUNT_A1 }, { credentials: { sessionId, accountIds: [ACCOUNT_A1] } });
+      expect(result.isError, sessionId).toBe(true);
+      expect(text(result)).toMatch(/cannot be used safely/);
+      expect(text(result)).toBe('Refused: this bank connection cannot be used safely. It must be connected again.');
+    }
+    expect(calls).toHaveLength(0);
+  });
+
+  it('reduces failures without an error field, by status or in a failure context', () => {
+    expect(
+      nestedFailuresAsStatus({
+        failures: [{ status: 403, message: 'Vendor diagnostic' }],
+        metadata: { status: 401, error: null, message: 'Vendor diagnostic' },
+        errors: [{ message: 'Vendor diagnostic' }],
+        amount: { errors: [{ message: 'Vendor diagnostic' }] },
+        rows: [{ status: 200, message: 'kept' }],
+      }),
+    ).toEqual({
+      failures: [{ status: 403, error: 'Enable Banking reported a failure with HTTP 403.' }],
+      metadata: { status: 401, error: 'Enable Banking reported a failure with HTTP 401.' },
+      errors: [{ error: 'Enable Banking reported a failure.' }],
+      amount: { error: 'Enable Banking reported a failure.' },
+      rows: [{ status: 200, message: 'kept' }],
+    });
   });
 });
