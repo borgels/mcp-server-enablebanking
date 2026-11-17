@@ -88,6 +88,7 @@ export function readEnvList(name: string, env: Env = process.env): string[] {
     .filter(Boolean);
 }
 
+/** The rejected value is not quoted: a variable may hold a secret put there by mistake. */
 function describe(value: string): string {
-  return JSON.stringify(value.length > 40 ? `${value.slice(0, 40)}...` : value);
+  return `a value of ${value.length} character${value.length === 1 ? '' : 's'}`;
 }
