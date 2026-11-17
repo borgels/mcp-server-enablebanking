@@ -834,8 +834,9 @@ async function listTransactions(
   return jsonResult(`${rows.length} transaction(s) from ${from} to ${to}.${more}`, structured);
 }
 
+/** The data as it came; callTool redacts it and only then copies it as JSON. */
 function jsonResult(text: string, structuredContent: unknown): GatewayToolResult {
-  return { content: [{ type: 'text', text }], structuredContent: JSON.parse(JSON.stringify(structuredContent ?? null)) as GatewayJsonValue };
+  return { content: [{ type: 'text', text }], structuredContent: (structuredContent ?? null) as GatewayJsonValue };
 }
 
 /**
@@ -847,9 +848,10 @@ function redactResult(result: GatewayToolResult, redactor: GatewayRedactor): Gat
   return {
     ...(result.isError ? { isError: true } : {}),
     content: result.content.map(part => ({ type: 'text' as const, text: redactor.redactValues(part.text) })),
+    // Redacted first, as data and depth-limited, and only then copied as JSON.
     ...(result.structuredContent === undefined
       ? {}
-      : { structuredContent: redactor.redactDeep(result.structuredContent) as GatewayJsonValue }),
+      : { structuredContent: JSON.parse(JSON.stringify(redactor.redactDeep(result.structuredContent))) as GatewayJsonValue }),
   };
 }
 
