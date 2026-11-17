@@ -88,13 +88,22 @@ export class GatewayRedactor {
 
   /**
    * Copy of a JSON-like value with every string, object keys included, passed
-   * through redactValues. Anything nested deeper than MAX_REDACT_DEPTH is
-   * replaced, never passed on.
+   * through redactValues, and every number or boolean whose string form would
+   * be redacted replaced by the string "[REDACTED]". Anything nested deeper
+   * than MAX_REDACT_DEPTH is replaced, never passed on.
    */
   redactDeep(value: unknown, depth = 0): unknown {
     if (depth > MAX_REDACT_DEPTH) return '[nested too deep]';
     if (typeof value === 'string') return this.redactValues(value);
+    if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') {
+      // The string form of a primitive is checked too; a match becomes the string "[REDACTED]", so JSON stays valid.
+      const text = String(value);
+      if (this.redactValues(text) !== text) return '[REDACTED]';
+      return typeof value === 'bigint' ? text : value;
+    }
     if (typeof value !== 'object' || value === null) return value;
+    const json = (value as { toJSON?: unknown }).toJSON;
+    if (typeof json === 'function') return this.redactDeep(json.call(value), depth + 1);
     if (Array.isArray(value)) return value.map(entry => this.redactDeep(entry, depth + 1));
     return Object.fromEntries(
       Object.entries(value).map(([key, entry]) => [this.redactValues(key), this.redactDeep(entry, depth + 1)]),
