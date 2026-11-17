@@ -190,7 +190,7 @@ its encoded forms) is replaced by a fixed fallback. The outputs are the tool
 list, every tool result as a whole (outer fields such as `isError`
 included), the consent helpers' answers and errors, and construction errors. A result becomes a fixed
 "withheld" error, an audit record or line becomes a fixed one, and a
-construction error becomes the fixed refusal. The fallbacks are a small,
+construction error becomes the fixed refusal. Every error a gateway throws is a fresh error in final form: no `cause`, a `stack` of only `name: message` (no frames, paths or function names), and name, message and stack masked against the secret. The fallbacks are a small,
 closed set (`src/fallbacks.ts`), and a key that shares a piece with any of
 them, or with the tool list, is refused when the gateway is created.
 
