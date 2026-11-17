@@ -20,7 +20,7 @@ export interface TransactionView {
 /** "123.4" → 12340n; signed. Throws on anything that is not a plain decimal with ≤ 2 decimals. */
 export function toMinor(value: string): bigint {
   const match = /^([+-]?)(\d+)(?:[.,](\d{1,2}))?$/.exec(value.trim());
-  if (!match) throw new Error(`not a decimal amount: ${value}`);
+  if (!match) throw new Error('not a decimal amount');
   const [, sign, whole, fraction = ''] = match;
   const minor = BigInt(whole!) * 100n + BigInt(fraction.padEnd(2, '0'));
   return sign === '-' ? -minor : minor;
