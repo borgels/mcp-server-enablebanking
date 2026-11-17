@@ -259,7 +259,10 @@ describe('round 5 of the threat model', () => {
     }
     const helperError = await gatewayWith(() => failing(200))
       .completeSession({ code: 'code-0123456789' })
-      .catch((error: unknown) => error as { message: string; status?: number; code?: string });
+      .then(
+        () => ({ message: 'no error' }) as { message: string; status?: number; code?: string },
+        (error: unknown) => error as { message: string; status?: number; code?: string },
+      );
     expect(helperError.message).not.toContain('Vendor');
     expect(helperError.status).toBeUndefined();
     expect(helperError.code).toBeUndefined();
