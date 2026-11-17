@@ -323,6 +323,7 @@ export const FIXED_CORPUS: readonly string[] = [
   "Re-read which accounts an existing consent covers and bind them against the account registry as it is now — use after ",
   "Received ",
   "Referrer-Policy",
+  "Refused: a state, code or session id must be printable ASCII.",
   "Refused: no Enable Banking consent was given with the call (credentials.sessionId and credentials.accountIds are required).",
   "Refused: that account is not one of the accounts this company has connected.",
   "Refused: the bank consent no longer covers that account. It must be connected again.",
