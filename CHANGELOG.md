@@ -2,6 +2,19 @@
 
 ## 0.4.1 (2026-11-17)
 
+- The sink check: every output of a gateway (the tool list, results, the consent helpers' answers and errors,
+  construction errors) is checked in its final form, and one that holds a
+  piece of 6 characters of the key or of the call's session id is
+  replaced by a fixed fallback (`src/fallbacks.ts`): a withheld result or
+  error, or the fixed refusal. A session id that fails admission makes
+  `callTool` throw a masked `EnableBankingGatewayError`. A key that shares a
+  piece with a fallback or with the tool list is refused at creation.
+- Key admission: printable ASCII (0x21-0x7E) of at least 16 characters,
+  checked before anything is built from the key; the corpus of our own
+  string literals stays as a cheap first filter.
+- A text in a failure list of a successful answer (`failures`, `errors`,
+  `warnings` and the like) is replaced by our own text, like a failure
+  object.
 - No Enable Banking text in errors (also for the MCP server): an HTTP error
   gives the status, our hint and an error code from Enable Banking's
   documented list; the body's message and detail are not kept, an over-limit
