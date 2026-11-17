@@ -510,3 +510,23 @@ describe('round 10', () => {
     }
   });
 });
+
+describe('round 11', () => {
+  it('keeps a session id returned by completeSession in the final seal and sink check of the call', async () => {
+    const RETURNED = 'EnableBankingGatewayErrorZq7pX2';
+    const gateway = gatewayWith(url => (url.pathname === '/sessions' ? json({ session_id: RETURNED, accounts: [] }) : json({}, 404)));
+    let caught: Error | undefined;
+    try {
+      await gateway.completeSession({ code: 'code-0123456789' });
+    } catch (error) {
+      caught = error as Error;
+    }
+    expect(caught).toBeInstanceOf(Error);
+    const fields = [caught!.name, caught!.message, String(caught!.stack), JSON.stringify(caught)];
+    for (let i = 0; i + 6 <= RETURNED.length; i += 1) {
+      for (const field of fields) expect(field).not.toContain(RETURNED.slice(i, i + 6));
+    }
+    expect(String(caught!.stack)).toBe(`${caught!.name}: ${caught!.message}`);
+    expect(leaks(fields)).toEqual([]);
+  });
+});
