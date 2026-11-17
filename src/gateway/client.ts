@@ -69,11 +69,16 @@ export class GatewayClient {
     return `${input}.${b64url(createSign('RSA-SHA256').update(input).sign(this.options.key))}`;
   }
 
+  /**
+   * `onRaw` sees the parsed answer (a success or an error body) before any
+   * lossy normalisation: a caller registers vendor-returned secrets there.
+   */
   private async request<T>(
     name: UpstreamName,
     params: { session_id?: string; account_id?: string } = {},
     query?: URLSearchParams,
     body?: unknown,
+    onRaw?: (raw: unknown) => void,
   ): Promise<T> {
     const target = UPSTREAM[name];
     let path: string = target.path;
@@ -115,6 +120,7 @@ export class GatewayClient {
     if (!response.ok) {
       // A body that cannot be read is dropped: the error is then the status alone.
       const payload = errorPayload(await readErrorBody(response).catch(() => null));
+      onRaw?.(payload);
       // The template, not the concrete path: no identifier reaches the message.
       throw new EnableBankingHttpError({ status: response.status, method: target.method, path: target.path, payload });
     }
@@ -135,8 +141,10 @@ export class GatewayClient {
     }
     if (!text) return undefined as T;
     try {
+      const parsed: unknown = JSON.parse(text);
+      onRaw?.(parsed);
       // Failures Enable Banking or a bank reports inside a successful answer become status-only text.
-      return nestedFailuresAsStatus(JSON.parse(text)) as T;
+      return nestedFailuresAsStatus(parsed) as T;
     } catch {
       throw new Error(`Enable Banking ${target.method} ${target.path} answered with something that is not JSON.`);
     }
@@ -191,8 +199,8 @@ export class GatewayClient {
     return this.request('startAuthorization', {}, undefined, body);
   }
 
-  createSession(code: string): Promise<SessionResource | undefined> {
-    return this.request('createSession', {}, undefined, { code });
+  createSession(code: string, onRaw?: (raw: unknown) => void): Promise<SessionResource | undefined> {
+    return this.request('createSession', {}, undefined, { code }, onRaw);
   }
 
   async deleteSession(sessionId: string): Promise<void> {
