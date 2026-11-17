@@ -102,6 +102,29 @@ export class EnableBankingHttpError extends Error {
   }
 }
 
+/** Values nested deeper than this are replaced by nestedFailuresAsStatus. */
+const MAX_DEPTH = 64;
+
+/**
+ * Copy of a successful answer with every failure reported inside it (an
+ * object with an `error` field) reduced to its HTTP status and our own text:
+ * message, code, detail and the like are dropped. Depth-limited.
+ */
+export function nestedFailuresAsStatus(value: unknown, depth = 0): unknown {
+  if (depth > MAX_DEPTH) return '[nested too deep]';
+  if (typeof value !== 'object' || value === null) return value;
+  if (Array.isArray(value)) return value.map(entry => nestedFailuresAsStatus(entry, depth + 1));
+  const record = value as Record<string, unknown>;
+  if (Object.hasOwn(record, 'error') && record.error !== null && record.error !== undefined) {
+    const status = record.status;
+    const valid = typeof status === 'number' && Number.isInteger(status) && status >= 100 && status <= 599;
+    return valid
+      ? { status, error: `Enable Banking reported a failure with HTTP ${status}.` }
+      : { error: 'Enable Banking reported a failure.' };
+  }
+  return Object.fromEntries(Object.entries(record).map(([key, entry]) => [key, nestedFailuresAsStatus(entry, depth + 1)]));
+}
+
 /** Account uids and session ids are bearer-like in combination with the key: keep them out of messages. */
 export function redactPath(path: string): string {
   return path
@@ -118,7 +141,7 @@ const SECRET_PATTERNS = [
 
 export function redactSecrets(value: string): string {
   return SECRET_PATTERNS.reduce(
-    (current, pattern) => current.replace(pattern, match => `${match.split(/[\s=]/)[0]} [REDACTED]`),
+    (current, pattern) => current.replace(pattern, match => `${match.split(/[\s=]/)[0]} ‹redacted›`),
     value,
   );
 }
