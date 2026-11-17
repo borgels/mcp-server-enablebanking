@@ -18,13 +18,28 @@
 - Gateway: the redaction marker is `‹redacted›`; failures reported inside a
   successful answer keep only their status; an answer body that cannot be
   read becomes our own text (an error body is dropped); consent-helper errors
-  carry a code only from the documented list; a continuation key that holds
-  the key or the session id is not encoded into a page token (the result is
-  marked incomplete). Transaction dates are parsed, not cut. The threat
-  model's guarantees apply to the gateway; the standalone server keeps
-  best-effort redaction.
+  carry a code only from the documented list. The threat model's guarantees
+  apply to the gateway; the standalone server keeps best-effort redaction.
+- Gateway: page tokens are opaque ids (32 random bytes) that the issuing
+  instance maps, in memory and for 15 minutes, to where the next page
+  starts; no account id, period or continuation key is in the token. A
+  continuation key over 2,048 characters ends the listing as incomplete.
+- Transaction dates keep the bank's calendar date as given: a value that
+  starts with a valid `YYYY-MM-DD` keeps that date (`2026-11-02T00:30:00+01:00`
+  is 2 November); time zones are never converted. Anything else is null.
+- Gateway key admission: a key whose content is shorter than 16 characters,
+  or shares a 6-character piece with any of this server's own texts
+  (`src/fixed-corpus.generated.ts`), is refused with a fixed text that never
+  repeats it; the same rule refuses a session id at `completeSession` and in
+  each call.
+- Gateway: every string leaving it passes the redactor as the last step:
+  results and refusals, construction errors, and the consent helpers'
+  answers and errors.
+- Failures reported inside a successful answer: a `status` of 400 or more,
+  an `error` field, or a message in `failures`, `errors`, `metadata`,
+  `amount` and the like keep only their status and our own text.
 - Gateway: numbers and booleans whose string form matches are replaced by
-  the string `"[REDACTED]"`; a result is redacted first and copied as JSON
+  the string `"‹redacted›"`; a result is redacted first and copied as JSON
   afterwards. The README has a threat model: what is guaranteed and the
   residual risk.
 - Configuration errors no longer quote the rejected value.
