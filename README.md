@@ -207,11 +207,23 @@ const result = await gateway.callTool('get_balances', { account: accountId }, {
   Identifiers placed in a path must be letters, digits and dashes. Redirects
   are not followed, every request has a time limit, and response bodies are
   read up to `maxResponseBytes`.
-- **Redaction.** Each gateway owns a redactor holding its key; each call
-  forks it and adds the call's session id (the consent helpers add the code).
-  Error messages are redacted (also UUID-shaped identifiers, JWTs and PEM
-  blocks) and shortened before they are returned. Nothing is added to
-  process-wide state.
+- **No Enable Banking text in errors.** An HTTP error gives the status, our
+  own hint and, when Enable Banking names one, an error code from its
+  documented list; never the body's message or detail (an over-limit body is
+  discarded). Redirect errors do not quote the `Location`, network errors do
+  not repeat their cause, a session status is named only when it is a
+  documented one, and errors about the options, the environment or the
+  input do not quote the rejected value, tool name or field names.
+- **Redaction.** Each gateway owns a redactor holding its private key; each
+  call forks it and adds the call's session id (the consent helpers add the
+  code). Every result is redacted as data, before it is serialised, object
+  keys included: the key exactly, URL- and JSON-escaped, and any piece of its
+  content of 6 characters or more; the session id whole. Account ids stay.
+  The consent helpers' answers are redacted with the key alone (they carry the
+  session id on purpose). Error messages are also redacted for UUID-shaped
+  identifiers, JWTs and PEM blocks, and only then shortened. Nothing is added
+  to process-wide state. `test/gateway-leaks.test.ts` proves this through
+  every channel.
 
 ### Tools
 
