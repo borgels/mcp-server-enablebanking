@@ -2,6 +2,9 @@
 
 ## 0.4.1 (2026-11-17)
 
+- Every secret registered during a consent helper's call, the session id
+  `completeSession` receives included, is part of the final seal and the
+  sink check of any error that leaves the call.
 - A key object that cannot be exported, or exports no content, is refused:
   a gateway never runs without a secret to check against. Every error that
   leaves (helper errors and fallbacks, the session refusal) passes the sink
