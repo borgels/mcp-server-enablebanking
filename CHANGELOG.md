@@ -15,6 +15,14 @@
   session status is named only when documented; consent dates are returned
   as ISO 8601 in UTC (`validUntil`), or null when they are not a date.
 - Account names over 200 characters are left out instead of cut.
+- Gateway: the redaction marker is `‹redacted›`; failures reported inside a
+  successful answer keep only their status; an answer body that cannot be
+  read becomes our own text (an error body is dropped); consent-helper errors
+  carry a code only from the documented list; a continuation key that holds
+  the key or the session id is not encoded into a page token (the result is
+  marked incomplete). Transaction dates are parsed, not cut. The threat
+  model's guarantees apply to the gateway; the standalone server keeps
+  best-effort redaction.
 - Gateway: numbers and booleans whose string form matches are replaced by
   the string `"[REDACTED]"`; a result is redacted first and copied as JSON
   afterwards. The README has a threat model: what is guaranteed and the
