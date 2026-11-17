@@ -125,13 +125,13 @@ export async function readTextUpTo(
 }
 
 /**
- * Reads an error response body up to MAX_ERROR_BODY_BYTES. JSON is parsed
- * only when the body is complete; otherwise the (partial) text is returned.
- * An empty body gives null.
+ * Reads an error response body up to MAX_ERROR_BODY_BYTES, only to find a
+ * documented error code in it. JSON is parsed only when the body is complete.
+ * An empty body, or one over the limit, gives null: nothing of it is kept.
  */
 export async function readErrorBody(response: Response): Promise<unknown> {
   const { text, exceeded } = await readTextUpTo(response, MAX_ERROR_BODY_BYTES);
-  if (!text) {
+  if (!text || exceeded) {
     return null;
   }
   const contentType = response.headers.get('content-type') ?? '';
