@@ -696,7 +696,12 @@ function buildEnableBankingGateway(options: EnableBankingGatewayOptions) {
       const code = input && typeof input === 'object' ? input.code : undefined;
       return helper([typeof code === 'string' ? code : undefined], async register => {
         if (typeof code !== 'string' || !CODE_PATTERN.test(code)) throw new Error('completeSession: code is missing or malformed.');
-        const session = await client.createSession(code);
+        // The session id Enable Banking returns is a secret of this call from the raw answer on, before the
+        // normalisation (which can drop it) and before its format is checked: in the final seal and sink check.
+        const session = await client.createSession(code, raw => {
+          const returned = raw && typeof raw === 'object' ? (raw as { session_id?: unknown }).session_id : undefined;
+          if (typeof returned === 'string') register(returned);
+        });
         const sessionId = session?.session_id;
         // The returned session id is a secret of this call from here on, before its format is checked: in the final
         // seal and, when printable, in the sink check.
