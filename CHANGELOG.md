@@ -2,6 +2,13 @@
 
 ## 0.4.1 (2026-11-17)
 
+- A terminating check after sealing: an error a consent helper or a call
+  throws is checked against every registered value in its raw form
+  (non-ASCII included) and its encoded forms, and replaced by the
+  ultimate fallback (`Error`, empty message, stack `Error`) when it
+  holds a piece of one; masking can no longer create a piece. A session
+  id Enable Banking returns that is not printable ASCII is never masked
+  into a text: the call ends in the ultimate fallback.
 - `completeSession` registers the session id Enable Banking returns from
   the raw answer (success or error body), before the client's
   normalisation, which can drop it, and before its format is checked.
