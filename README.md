@@ -160,6 +160,100 @@ outside their range are clamped as before. The `ENABLEBANKING_*` flags
 - The HTTP server does not terminate TLS. Run it on loopback or a private
   network, behind a TLS-terminating proxy when traffic leaves the host.
 
+## Embedding (`mcp-server-enablebanking/gateway`)
+
+For a host that serves many companies from one process and does its own
+per-user authorization and logging. The standalone server above is unchanged;
+the registry, the session store and the consent tools are not used on this
+path. Instead the host keeps each company's consent and passes it with every
+call.
+
+```ts
+import {
+  createEnableBankingGateway,
+  enableBankingToolCatalog,
+  enableBankingServiceCatalog,
+  resolveEnableBankingReadTarget,
+} from 'mcp-server-enablebanking/gateway';
+
+const gateway = createEnableBankingGateway({
+  applicationId: '<application id>', // the JWT kid
+  privateKey: pemText,                // or a KeyObject
+  // apiBaseUrl, timeoutMs (default 30 s), maxResponseBytes (default 4 MB), fetchImpl
+});
+
+const result = await gateway.callTool('get_balances', { account: accountId }, {
+  caller: 'someone',
+  requestId: 'r-1',
+  credentials: { sessionId, accountIds }, // this company's consent, as stored by the host
+});
+```
+
+- **Nothing from the environment.** The application id and key are given at
+  creation; no `ENABLEBANKING_*` variable is read. A call without
+  `credentials`, or with a blank session id or an empty `accountIds`, is
+  refused before any request; there is no fallback.
+- **The account allowlist.** `accountIds` are the Enable Banking account uids
+  the company consented to and the host stored. They take the place of the
+  registry: an `account` argument must equal one of them exactly (no case
+  folding, trimming or decoding), and anything else is refused before any
+  request. Each call also reads the session at Enable Banking and refuses an
+  account the session no longer contains, a session that is not `AUTHORIZED`,
+  and a consent past its `valid_until`.
+- **Read-only.** There is no payment initiation anywhere in this surface: no
+  tool, no client method, no endpoint in the catalog.
+- **Fixed targets.** Every request is one of the endpoints in
+  `enableBankingServiceCatalog`, on the one origin given at creation (https).
+  Identifiers placed in a path must be letters, digits and dashes. Redirects
+  are not followed, every request has a time limit, and response bodies are
+  read up to `maxResponseBytes`.
+- **Redaction.** Each gateway owns a redactor holding its key; each call
+  forks it and adds the call's session id (the consent helpers add the code).
+  Error messages are redacted (also UUID-shaped identifiers, JWTs and PEM
+  blocks) and shortened before they are returned. Nothing is added to
+  process-wide state.
+
+### Tools
+
+| Tool | Returns | Exposes | Transaction details |
+|---|---|---|---|
+| `list_accounts` | The connected accounts: id, name, masked IBAN, currency, product; when the consent expires | `accounts` | no |
+| `get_balances` | Balances of one account (booked, available), decimal strings | `balances` | no |
+| `list_transactions` | Bank lines of one account in at most 366 days (default the last 30, booked only), with counterparty, text, reference and totals; paged with `nextPageToken`/`pageToken` | `transactions` | yes |
+
+`enableBankingToolCatalog` (deeply frozen) gives each tool's definition plus
+`upstream` (every request it may make), `broad` (always `false`),
+`defaultRead`, a one-sentence `summary` for people, `exposure` and
+`transactionDetails`, so a host can build fixed roles: a role that may see
+balances only gets the tools where `transactionDetails` is `false`.
+`resolveEnableBankingReadTarget(tool, input)` applies callTool's input checks
+and returns the account and period a call will read, for the host's log.
+
+### Consent helpers
+
+Plain functions on the gateway instance, for the host's own connect page.
+They are not tools, so an AI client cannot reach them. They throw
+`EnableBankingGatewayError` with a redacted message and no `cause`.
+
+- `listBanks({ country = 'DK', psuType = 'business' })`: banks offering
+  account information, with `maximumConsentDays`.
+- `startAuthorization({ bank, country, psuType, redirectUrl, state, validUntil?, language? })`:
+  checks `validUntil` against the bank's `maximum_consent_validity` (default:
+  the maximum; 90 days when the bank states none), and returns the bank's
+  `url`. `redirectUrl` must be registered with the application. `state` is the
+  host's own unguessable, single-use value: keep it, and compare it with the
+  `state` on the redirect before completing.
+- `completeSession({ code })`: exchanges the code from the redirect for
+  `{ sessionId, validUntil, bank, psuType, accounts: [{ id, name, maskedIban, currency }] }`.
+  Store `sessionId` and the ids of the accounts the company chose as its
+  credentials.
+- `sessionStatus({ sessionId })`: status, `validUntil` and account ids, for
+  renewal reminders.
+- `endSession({ sessionId })`: closes the session and ends the consent at the
+  bank.
+
+Enable Banking API reference: <https://enablebanking.com/docs/api/reference/>.
+
 ## Run
 
 ```bash
