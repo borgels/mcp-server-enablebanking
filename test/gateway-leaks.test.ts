@@ -183,7 +183,7 @@ describe('no piece of the key leaves an instance', () => {
 
 describe('numbers', () => {
   it('redacts a numeric session id echoed as a number, and the result stays valid JSON', async () => {
-    const NUMERIC = '12345678';
+    const NUMERIC = '1234567890123456';
     const gateway = gatewayWith(url =>
       url.pathname.startsWith('/sessions/')
         ? json({ status: 'AUTHORIZED', accounts: [ACCOUNT], access: { valid_until: '2027-05-01T00:00:00Z' } })
@@ -209,7 +209,7 @@ describe('round 5 of the threat model', () => {
       { status, headers: { 'Content-Type': 'application/json' } },
     );
 
-  it('does not encode a continuation key that holds the key or the session id into a page token', async () => {
+  it('keeps a continuation key that holds the key or the session id inside the gateway: the page token is opaque', async () => {
     for (const continuation of [PIECE, `page-${SESSION}`]) {
       const gateway = gatewayWith(url =>
         url.pathname.startsWith('/sessions/')
@@ -221,8 +221,8 @@ describe('round 5 of the threat model', () => {
       );
       const result = await gateway.callTool('list_transactions', { account: ACCOUNT, from: '2026-11-01', to: '2026-11-17' }, ctx);
       expect(result.isError, JSON.stringify(result.content)).toBeUndefined();
-      expect(result.structuredContent).toMatchObject({ incomplete: true });
-      expect(result.structuredContent).not.toHaveProperty('nextPageToken');
+      expect(result.structuredContent).not.toHaveProperty('incomplete');
+      expect((result.structuredContent as { nextPageToken: string }).nextPageToken).toMatch(/^[A-Za-z0-9_-]{43}$/);
       expect(leaks(result)).toEqual([]);
     }
   });
