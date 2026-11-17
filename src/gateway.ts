@@ -20,9 +20,9 @@ import {
   type GatewayJsonValue,
 } from './gateway/catalog.js';
 import { EnableBankingHttpError, ERROR_CODES } from './errors.js';
-import { GatewayRedactor } from './gateway/redact.js';
+import { FRAGMENT_LENGTH, GatewayRedactor } from './gateway/redact.js';
 import { fixedOutputs, INPUT_REFUSED, RESULT_WITHHELD, SESSION_REFUSED, withheldResult } from './fallbacks.js';
-import { admitsKey, KEY_REFUSED, keyRefusedText, leaksSecret, sealedError } from './key-admission.js';
+import { admitsKey, KEY_REFUSED, keyRefusedText, leaksSecret, sealedError, type LeakMatcher } from './key-admission.js';
 
 /**
  * Embeddable entry point: a host that serves many companies from one process
@@ -448,6 +448,45 @@ function released<E extends Error>(error: E, check: GatewayRedactor, fallback: (
   return leaksSecret(error, check) ? fallback() : error;
 }
 
+/** Every piece of FRAGMENT_LENGTH characters of the given values exactly as they are: no encoding, non-ASCII included. */
+function rawPieces(values: Array<string | undefined>): LeakMatcher {
+  const pieces = new Set<string>();
+  for (const value of values) {
+    if (typeof value !== 'string') continue;
+    for (let i = 0; i + FRAGMENT_LENGTH <= value.length; i += 1) pieces.add(value.slice(i, i + FRAGMENT_LENGTH));
+  }
+  return {
+    matches(text: string): boolean {
+      for (let i = 0; i + FRAGMENT_LENGTH <= text.length; i += 1) {
+        if (pieces.has(text.slice(i, i + FRAGMENT_LENGTH))) return true;
+      }
+      return false;
+    },
+  };
+}
+
+/**
+ * The ultimate fallback: name `Error`, an empty message and the stack `Error`. Its only text has five characters, so
+ * no piece of FRAGMENT_LENGTH can match it: masking ends here.
+ */
+function ultimateError(): Error {
+  const error = new Error('');
+  delete (error as { cause?: unknown }).cause;
+  for (const [key, value] of [['name', 'Error'], ['message', ''], ['stack', 'Error']] as const) {
+    Object.defineProperty(error, key, { value, writable: true, configurable: true, enumerable: false });
+  }
+  return error;
+}
+
+/**
+ * The terminating check on a finished, sealed error, right before it leaves: against every registered value in its
+ * raw form and, through `encoded`, its encoded forms. Masking can itself make a piece of a value (the "…" it writes
+ * next to the text left over), so an error that holds one is replaced by the ultimate fallback, never masked again.
+ */
+function terminal(error: Error, raw: Array<string | undefined>, encoded: GatewayRedactor): Error {
+  return leaksSecret(error, rawPieces(raw)) || leaksSecret(error, encoded) ? ultimateError() : error;
+}
+
 /** The error a call or a consent helper is refused with, in final form: masked against every secret, no frames. */
 function refusal(text: string, ...secrets: string[]): EnableBankingGatewayError {
   return sealedError(new EnableBankingGatewayError(text), ...secrets);
@@ -515,16 +554,23 @@ function buildEnableBankingGateway(options: EnableBankingGatewayOptions) {
   /** Runs a consent helper; any failure becomes a redacted EnableBankingGatewayError without a cause. */
   async function helper<T>(
     inputs: Array<string | undefined>,
-    work: (register: (secret: string) => void) => Promise<T>,
+    work: (register: (secret: string, fromVendor?: boolean) => void) => Promise<T>,
   ): Promise<T> {
     const callRedactor = redactor.fork();
     // Every secret of the call: the inputs and anything registered while the call runs (a returned session id).
     // All of them are in the final seal and in the sink check of any error that leaves.
     const secrets: string[] = [];
-    // A value of the call: always in the final mask; added to redaction and the sink check (which encode it) only
-    // when it is printable ASCII, so nothing is encoded that could make the encoding throw.
-    const register = (secret: string) => {
+    // A value Enable Banking returned that is not printable ASCII is never masked into a text: the call ends in the
+    // ultimate fallback.
+    let vendorUnprintable = false;
+    // A value of the call: always in the final mask and the raw final check; added to redaction and the sink check
+    // (which encode it) only when it is printable ASCII, so nothing is encoded that could make the encoding throw.
+    const register = (secret: string, fromVendor = false) => {
       secrets.push(secret);
+      if (fromVendor && !PRINTABLE_SECRET.test(secret)) {
+        vendorUnprintable = true;
+        throw new Error(RESULT_WITHHELD);
+      }
       if (PRINTABLE_SECRET.test(secret)) {
         callRedactor.add(secret);
         callRedactor.watch(secret);
@@ -542,13 +588,15 @@ function buildEnableBankingGateway(options: EnableBankingGatewayOptions) {
       // The answer is the host's data (the session id included); only the instance's key is removed from it.
       // The outer pass is the final one, over the assembled answer.
       answer = redactor.redactDeep(redactor.redactDeep(await work(register)));
+      if (vendorUnprintable) throw new Error(RESULT_WITHHELD);
     } catch (error) {
+      if (vendorUnprintable) throw ultimateError();
       const details = httpDetails(error);
       const message = callRedactor.message(error);
       // A fresh error in final form (no cause, no frames, masked against the key and every secret of the call),
       // then the sink check on the finished object against the same secrets.
       const fallback = () => sealedError(new EnableBankingGatewayError(RESULT_WITHHELD), keyContent, ...secrets, ...inputs);
-      throw released(
+      const sealed = released(
         sealedError(
           new EnableBankingGatewayError(leaksSecret(message, callRedactor) ? RESULT_WITHHELD : message, details),
           keyContent,
@@ -558,11 +606,13 @@ function buildEnableBankingGateway(options: EnableBankingGatewayOptions) {
         callRedactor,
         fallback,
       );
+      // Then the terminating check against every registered value, raw and encoded.
+      throw terminal(sealed, [keyContent, ...secrets, ...inputs], callRedactor);
     }
     // The sink check on the answer as it leaves: one that holds a piece of the key is withheld.
     if (leaksSecret(answer, redactor)) {
       const withheld = () => sealedError(new EnableBankingGatewayError(RESULT_WITHHELD), keyContent);
-      throw released(withheld(), redactor, withheld);
+      throw terminal(released(withheld(), redactor, withheld), [keyContent], redactor);
     }
     return answer as T;
   }
@@ -590,7 +640,7 @@ function buildEnableBankingGateway(options: EnableBankingGatewayOptions) {
           const check = redactor.fork();
           check.watch(sessionId);
           const fallback = () => refusal(RESULT_WITHHELD, sessionId, keyContent);
-          throw released(refusal(SESSION_REFUSED, sessionId, keyContent), check, fallback);
+          throw terminal(released(refusal(SESSION_REFUSED, sessionId, keyContent), check, fallback), [sessionId, keyContent], check);
         }
         callRedactor.add(sessionId);
         callRedactor.watch(sessionId);
@@ -700,12 +750,12 @@ function buildEnableBankingGateway(options: EnableBankingGatewayOptions) {
         // normalisation (which can drop it) and before its format is checked: in the final seal and sink check.
         const session = await client.createSession(code, raw => {
           const returned = raw && typeof raw === 'object' ? (raw as { session_id?: unknown }).session_id : undefined;
-          if (typeof returned === 'string') register(returned);
+          if (typeof returned === 'string') register(returned, true);
         });
         const sessionId = session?.session_id;
         // The returned session id is a secret of this call from here on, before its format is checked: in the final
         // seal and, when printable, in the sink check.
-        if (typeof sessionId === 'string') register(sessionId);
+        if (typeof sessionId === 'string') register(sessionId, true);
         if (typeof sessionId !== 'string' || !ID_PATTERN.test(sessionId)) {
           throw new Error('completeSession: Enable Banking did not return a usable session.');
         }
