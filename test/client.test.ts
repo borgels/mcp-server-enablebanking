@@ -20,17 +20,27 @@ describe('EnableBankingClient upstream hardening', () => {
     expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 
-  it('reads at most 64 KB of an error body and shortens upstream text', async () => {
+  it('keeps only a documented code of an error body, and nothing of an over-limit body', async () => {
     const fetchImpl = vi.fn<typeof fetch>(async () =>
-      new Response(JSON.stringify({ error: 'BAD', message: 'm'.repeat(10_000) }), {
+      new Response(JSON.stringify({ error: 'WRONG_REQUEST_PARAMETERS', message: 'm'.repeat(10_000) }), {
         status: 400,
         headers: { 'Content-Type': 'application/json' },
       }),
     );
     const error = await client(fetchImpl).getApplication().catch((e: unknown) => e);
     expect(error).toBeInstanceOf(EnableBankingHttpError);
-    expect((error as EnableBankingHttpError).code).toBe('BAD');
-    expect((error as Error).message.length).toBeLessThan(1_000);
+    expect((error as EnableBankingHttpError).code).toBe('WRONG_REQUEST_PARAMETERS');
+    expect((error as Error).message).toBe('Enable Banking GET /application failed with HTTP 400 (WRONG_REQUEST_PARAMETERS).');
+
+    const undocumented = vi.fn<typeof fetch>(async () => new Response(JSON.stringify({ error: 'SOMETHING_ELSE', code: 'x' }), { status: 400 }));
+    const undocumentedError = (await client(undocumented).getApplication().catch((e: unknown) => e)) as EnableBankingHttpError;
+    expect(undocumentedError.code).toBeUndefined();
+    expect(undocumentedError.message).not.toContain('SOMETHING_ELSE');
+
+    const over = vi.fn<typeof fetch>(async () =>
+      new Response(JSON.stringify({ error: 'EXPIRED_SESSION', pad: 'p'.repeat(70_000) }), { status: 401, headers: { 'Content-Type': 'application/json' } }),
+    );
+    expect(((await client(over).getApplication().catch((e: unknown) => e)) as EnableBankingHttpError).code).toBeUndefined();
 
     const huge = vi.fn<typeof fetch>(async () => new Response('x'.repeat(1_000_000), { status: 502 }));
     const hugeError = await client(huge).getApplication().catch((e: unknown) => e);
@@ -78,7 +88,8 @@ describe('error codes from non-JSON content types', () => {
     expect(error).toBeInstanceOf(EnableBankingHttpError);
     expect(error.code).toBe('EXPIRED_SESSION');
     expect(error.consentLost).toBe(true);
-    expect(error.message).toContain('Session expired');
+    // Enable Banking's own text is not kept.
+    expect(error.message).not.toContain('Session expired');
   });
 
   it('ignores a non-JSON text body', async () => {
