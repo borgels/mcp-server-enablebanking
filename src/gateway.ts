@@ -200,6 +200,17 @@ const CODE_PATTERN = /^[A-Za-z0-9._~+/=-]{1,2048}$/;
 const COUNTRY_PATTERN = /^[A-Z]{2}$/;
 const LANGUAGE_PATTERN = /^[a-z]{2}$/;
 const DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+/** Enable Banking's documented session statuses (API reference, SessionStatus). */
+const SESSION_STATUSES: ReadonlySet<string> = new Set([
+  'AUTHORIZED',
+  'CANCELLED',
+  'CLOSED',
+  'EXPIRED',
+  'INVALID',
+  'PENDING_AUTHORIZATION',
+  'RETURNED_FROM_BANK',
+  'REVOKED',
+]);
 
 const NOT_ALLOWED = 'Refused: that account is not one of the accounts this company has connected.';
 const NO_CREDENTIALS =
@@ -285,12 +296,13 @@ export function resolveEnableBankingReadTarget(
   now: number = Date.now(),
 ): EnableBankingReadTargetResolution {
   const spec = typeof toolName === 'string' ? SPEC_BY_NAME.get(toolName) : undefined;
-  if (!spec) return refuse(`Unsupported Enable Banking gateway tool: ${String(toolName).slice(0, 100)}`);
+  // The name and the field names are the host's input: not repeated, so nothing it carries is echoed.
+  if (!spec) return refuse('Unsupported Enable Banking gateway tool.');
   if (input === null || typeof input !== 'object' || Array.isArray(input)) return refuse('Input must be an object.');
   const properties = (spec.inputSchema.properties ?? {}) as GatewayJsonObject;
   const unknown = Object.keys(input).filter(key => !Object.hasOwn(properties, key));
   if (unknown.length > 0) {
-    return refuse(`Unknown input field(s) for ${spec.name}: ${unknown.map(key => key.slice(0, 40)).join(', ')}.`);
+    return refuse(`Unknown input field(s) for ${spec.name}: ${unknown.length}.`);
   }
 
   if (spec.name === 'list_accounts') return { ok: true, target: { tool: spec.name, exposure: spec.exposure } };
@@ -380,7 +392,7 @@ export function createEnableBankingGateway(options: EnableBankingGatewayOptions)
   let key: KeyObject;
   if (typeof options.privateKey === 'string') {
     if (!options.privateKey.trim()) throw new Error('createEnableBankingGateway: privateKey is required.');
-    redactor.add(options.privateKey);
+    redactor.addKey(options.privateKey);
     try {
       key = createPrivateKey(options.privateKey);
     } catch {
@@ -388,6 +400,11 @@ export function createEnableBankingGateway(options: EnableBankingGatewayOptions)
     }
   } else if (options.privateKey && typeof options.privateKey === 'object' && options.privateKey.type === 'private') {
     key = options.privateKey;
+    try {
+      redactor.addKey(String(key.export({ type: 'pkcs8', format: 'pem' })));
+    } catch {
+      // A key that cannot be exported cannot be echoed in this form either.
+    }
   } else {
     throw new Error('createEnableBankingGateway: privateKey is required.');
   }
@@ -408,7 +425,8 @@ export function createEnableBankingGateway(options: EnableBankingGatewayOptions)
     const callRedactor = redactor.fork();
     for (const secret of secrets) callRedactor.add(secret);
     try {
-      return await work();
+      // The answer is the host's data (the session id included); only the instance's key is removed from it.
+      return redactor.redactDeep(await work()) as T;
     } catch (error) {
       const details = httpDetails(error);
       throw new EnableBankingGatewayError(callRedactor.message(error), details);
@@ -446,20 +464,24 @@ export function createEnableBankingGateway(options: EnableBankingGatewayOptions)
           return errorResult('Refused: the bank consent no longer covers that account. It must be connected again.');
         }
 
+        let result: GatewayToolResult;
         switch (target.tool) {
           case 'list_accounts':
-            return await listAccounts(client, credentials.accountIds, consent);
+            result = await listAccounts(client, credentials.accountIds, consent);
+            break;
           case 'get_balances':
-            return await getBalances(client, target.account!);
+            result = await getBalances(client, target.account!);
+            break;
           default: {
             let start: PageToken | undefined;
             if (target.continued) {
               start = verifyPageToken(pageKey, input.pageToken as string);
               if (!start) return errorResult('pageToken was not issued here for this account and period; start again without it.');
             }
-            return await listTransactions(client, pageKey, target, start);
+            result = await listTransactions(client, pageKey, target, start);
           }
         }
+        return redactResult(result, callRedactor);
       } catch (error) {
         return errorResult(callRedactor.message(error));
       }
@@ -571,7 +593,7 @@ export function createEnableBankingGateway(options: EnableBankingGatewayOptions)
         }
         return {
           sessionId,
-          validUntil: typeof session?.access?.valid_until === 'string' ? session.access.valid_until : null,
+          validUntil: instant(session?.access?.valid_until),
           bank:
             session?.aspsp && typeof session.aspsp.name === 'string' && typeof session.aspsp.country === 'string'
               ? { name: session.aspsp.name, country: session.aspsp.country }
@@ -590,8 +612,8 @@ export function createEnableBankingGateway(options: EnableBankingGatewayOptions)
         if (typeof sessionId !== 'string' || !ID_PATTERN.test(sessionId)) throw new Error('sessionStatus: sessionId is missing or malformed.');
         const session = await client.getSession(sessionId);
         return {
-          status: typeof session?.status === 'string' ? session.status : null,
-          validUntil: typeof session?.access?.valid_until === 'string' ? session.access.valid_until : null,
+          status: typeof session?.status === 'string' && SESSION_STATUSES.has(session.status) ? session.status : null,
+          validUntil: instant(session?.access?.valid_until),
           accountIds: [...sessionAccounts(session)],
         };
       });
@@ -650,6 +672,13 @@ function httpDetails(error: unknown): { status?: number; code?: string } {
   return {};
 }
 
+/** A date and time from Enable Banking as ISO 8601 in UTC, or null when it is not one. Nothing else of it is kept. */
+function instant(value: unknown): string | null {
+  if (typeof value !== 'string' || value.length > 64) return null;
+  const ms = Date.parse(value);
+  return Number.isNaN(ms) ? null : new Date(ms).toISOString();
+}
+
 function sessionAccounts(session: SessionStatus | undefined): Set<string> {
   const ids = new Set<string>();
   for (const id of Array.isArray(session?.accounts) ? session.accounts : []) if (typeof id === 'string') ids.add(id);
@@ -670,12 +699,13 @@ type ConsentCheck =
 function consentState(session: SessionStatus | undefined, now: number): ConsentCheck {
   const status = typeof session?.status === 'string' ? session.status : undefined;
   if (status !== 'AUTHORIZED') {
+    // Only a documented status is named; anything else from Enable Banking is not repeated.
     return {
       ok: false,
-      reason: `The bank consent is not active${status && /^[A-Z_]{1,32}$/.test(status) ? ` (${status})` : ''}. It must be renewed.`,
+      reason: `The bank consent is not active${status && SESSION_STATUSES.has(status) ? ` (${status})` : ''}. It must be renewed.`,
     };
   }
-  const validUntil = typeof session?.access?.valid_until === 'string' ? session.access.valid_until : null;
+  const validUntil = instant(session?.access?.valid_until);
   if (validUntil && Date.parse(validUntil) <= now) {
     return { ok: false, reason: `The bank consent expired on ${validUntil.slice(0, 10)}. It must be renewed.` };
   }
@@ -692,7 +722,9 @@ function ibanOf(account: AccountResource): string | null {
 }
 
 function text(value: unknown): string | null {
-  return typeof value === 'string' && value.trim() ? value.trim().slice(0, 200) : null;
+  // Over 200 characters is dropped, not cut: nothing is shortened before the result is redacted.
+  const trimmed = typeof value === 'string' ? value.trim() : '';
+  return trimmed && trimmed.length <= 200 ? trimmed : null;
 }
 
 function consentAccount(account: AccountResource & { uid: string }): ConsentAccount {
@@ -724,7 +756,8 @@ async function listAccounts(
     ...(readable.length > shown.length ? { notShown: readable.length - shown.length } : {}),
     ...(allowed.size > readable.length ? { noLongerInConsent: allowed.size - readable.length } : {}),
   };
-  const until = consent.validUntil ? `; the consent runs until ${consent.validUntil.slice(0, 10)}` : '';
+  const untilMs = consent.validUntil ? Date.parse(consent.validUntil) : Number.NaN;
+  const until = Number.isNaN(untilMs) ? '' : `; the consent runs until ${isoDate(new Date(untilMs))}`;
   return jsonResult(`${accounts.length} bank account(s)${until}.`, structured);
 }
 
@@ -803,6 +836,21 @@ async function listTransactions(
 
 function jsonResult(text: string, structuredContent: unknown): GatewayToolResult {
   return { content: [{ type: 'text', text }], structuredContent: JSON.parse(JSON.stringify(structuredContent ?? null)) as GatewayJsonValue };
+}
+
+/**
+ * A result as returned to the host: its structured data normalised to JSON
+ * and then redacted as values (object keys included), its text redacted.
+ * Account ids stay: only the call's values and pieces of the key are removed.
+ */
+function redactResult(result: GatewayToolResult, redactor: GatewayRedactor): GatewayToolResult {
+  return {
+    ...(result.isError ? { isError: true } : {}),
+    content: result.content.map(part => ({ type: 'text' as const, text: redactor.redactValues(part.text) })),
+    ...(result.structuredContent === undefined
+      ? {}
+      : { structuredContent: redactor.redactDeep(result.structuredContent) as GatewayJsonValue }),
+  };
 }
 
 function errorResult(text: string): GatewayToolResult {
