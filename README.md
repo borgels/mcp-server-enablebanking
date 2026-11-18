@@ -145,6 +145,78 @@ outside their range are clamped as before. The `ENABLEBANKING_*` flags
 `ENABLEBANKING_CONSENT_CALLBACK`) are only on with exactly `true`; any other value
 (including `TRUE` or `1`) leaves them off, unlike the `MCP_*` flags above.
 
+## Threat model
+
+What the embedded gateway guarantees about the application's private key
+and a company's session, and what it does not. It is the yardstick for
+every change that touches errors or results.
+
+**Scope.** Guarantees (a), (b) and (c) apply to the embeddable gateway
+(`mcp-server-enablebanking/gateway`), the surface a multi-tenant host uses.
+The standalone MCP server and its consent page, configured from the
+environment for one company, keep best-effort redaction of errors; they are
+not held to these guarantees.
+
+**Guaranteed:**
+
+- **(a) The private key never reaches anything persisted or shared:** error
+  texts, results, logs or files. It never leaves the instance except as a
+  JWT signature to Enable Banking's fixed origin; errors are our own texts,
+  and every result is redacted with the key before it leaves the instance.
+- **(b) No vendor-controlled free text in errors.** An error carries our own
+  fixed text, the HTTP status and an error code from Enable Banking's
+  documented list; never a response body, a message or detail, a redirect's
+  `Location`, an undocumented session status, or the cause of a network
+  failure. Errors never quote a configuration value, the tool name or field
+  names.
+- **(c) Results go only to the company whose session it is.** The session id
+  and the allowed accounts come with each call; nothing about a company is
+  kept in process-wide state; an account outside the call's list is refused
+  before any request.
+
+**Not guaranteed (residual risk):** Enable Banking or a bank deliberately
+echoing a company's session id or the key back in data. Results are redacted
+on a best-effort basis: the key exactly, URL- and JSON-escaped, and any
+piece of its content of 6 characters or more, and the session id whole, in
+strings, object keys and the string form of numbers and booleans, replaced
+by `"‹redacted›"` before anything is serialised. Anything otherwise
+transformed is not recognised. Account ids stay: they are the data the host
+needs. The MCP server (one company per instance) applies this to errors.
+
+**What leaves a gateway holds no piece of the key.** This is checked at
+the sink, not inferred from our texts: every output is checked in its final
+form, and one that holds a piece of 6 characters of the key (or of one of
+its encoded forms) is replaced by a fixed fallback. The outputs are the tool
+list, every tool result as a whole (outer fields such as `isError`
+included), the consent helpers' answers and errors, and construction errors. A result becomes a fixed
+"withheld" error, an audit record or line becomes a fixed one, and a
+construction error becomes the fixed refusal. Every error a gateway throws is a fresh error in final form: no `cause`, a `stack` of only `name: message` (no frames, paths or function names), and name, message and stack masked against the secret. The fallbacks are a small,
+closed set (`src/fallbacks.ts`), and a key that shares a piece with any of
+them, or with the tool list, is refused when the gateway is created.
+
+**Scope.** The host is the embedding router. It is trusted and already holds the key and every credential it passes in. Out of scope: host-supplied code that misbehaves (hooks, a `toJSON` on a hook's result), and echoing back to the host a value the host itself passed in (for example a session id given in a call's credentials). In scope: values the vendor returns, and anything persisted.
+
+**Key admission.** Every key is a secret the vendor issues. A gateway
+accepts only printable ASCII (0x21-0x7E) of at least 16 characters, checked
+before anything is built from the key. As a cheap first filter it also
+refuses a key that shares a piece of 6 characters with a string literal in
+`src/` (`src/fixed-corpus.generated.ts`, kept up to date by a test). The
+refusal is a fixed text that never repeats the key.
+
+**The session id** is held to the same rule. Each call's session id must be
+printable ASCII of at least 16 characters and share no piece with our texts
+or a fallback, or the call is refused, as a thrown
+`EnableBankingGatewayError` whose text and name are masked. It is not
+refused as a result, because the fixed fields of a result (`isError`) could
+hold a piece of it. Its pieces are then part of the sink check for that
+call. A result that holds one is withheld; this can happen when an id in the
+data happens to share 6 characters with it. `completeSession` refuses such
+a session id too.
+
+**Page tokens** are opaque: 32 random bytes that the issuing gateway
+instance maps, in memory and for 15 minutes, to where the next page starts.
+The token holds no account id, period or Enable Banking continuation key.
+
 ## Security model
 
 - All callers share one Enable Banking application identity and the consents
@@ -207,11 +279,23 @@ const result = await gateway.callTool('get_balances', { account: accountId }, {
   Identifiers placed in a path must be letters, digits and dashes. Redirects
   are not followed, every request has a time limit, and response bodies are
   read up to `maxResponseBytes`.
-- **Redaction.** Each gateway owns a redactor holding its key; each call
-  forks it and adds the call's session id (the consent helpers add the code).
-  Error messages are redacted (also UUID-shaped identifiers, JWTs and PEM
-  blocks) and shortened before they are returned. Nothing is added to
-  process-wide state.
+- **No Enable Banking text in errors.** An HTTP error gives the status, our
+  own hint and, when Enable Banking names one, an error code from its
+  documented list; never the body's message or detail (an over-limit body is
+  discarded). Redirect errors do not quote the `Location`, network errors do
+  not repeat their cause, a session status is named only when it is a
+  documented one, and errors about the options, the environment or the
+  input do not quote the rejected value, tool name or field names.
+- **Redaction.** Each gateway owns a redactor holding its private key; each
+  call forks it and adds the call's session id (the consent helpers add the
+  code). Every result is redacted as data, before it is serialised, object
+  keys included: the key exactly, URL- and JSON-escaped, and any piece of its
+  content of 6 characters or more; the session id whole. Account ids stay.
+  The consent helpers' answers are redacted with the key alone (they carry the
+  session id on purpose). Error messages are also redacted for UUID-shaped
+  identifiers, JWTs and PEM blocks, and only then shortened. Nothing is added
+  to process-wide state. `test/gateway-leaks.test.ts` proves this through
+  every channel.
 
 ### Tools
 
@@ -219,7 +303,7 @@ const result = await gateway.callTool('get_balances', { account: accountId }, {
 |---|---|---|---|
 | `list_accounts` | The connected accounts: id, name, masked IBAN, currency, product; when the consent expires | `accounts` | no |
 | `get_balances` | Balances of one account (booked, available), decimal strings | `balances` | no |
-| `list_transactions` | Bank lines of one account in at most 366 days (default the last 30 including today, booked only), with counterparty, text, reference and totals; at most 1,000 rows per call, paged with `nextPageToken`/`pageToken` (signed by the gateway instance, bound to account, period and status) | `transactions` | yes |
+| `list_transactions` | Bank lines of one account in at most 366 days (default the last 30 including today, booked only), with counterparty, text, reference and totals; at most 1,000 rows per call, paged with `nextPageToken`/`pageToken` (an opaque id kept by the gateway instance for 15 minutes, bound to session, account, period and status) | `transactions` | yes |
 
 `enableBankingToolCatalog` (deeply frozen) gives each tool's definition plus
 `upstream` (every request it may make), `broad` (always `false`),
@@ -233,7 +317,11 @@ and returns the account and period a call will read, for the host's log.
 
 Plain functions on the gateway instance, for the host's own connect page.
 They are not tools, so an AI client cannot reach them. They throw
-`EnableBankingGatewayError` with a redacted message and no `cause`.
+`EnableBankingGatewayError` with a redacted message and no `cause`. An
+error that would still hold a piece of a registered value after sealing
+(checked raw and encoded), and any call where Enable Banking returned a
+session id that is not printable ASCII, ends in the ultimate fallback
+instead: a plain `Error` with an empty message and the stack `Error`.
 
 - `listBanks({ country = 'DK', psuType = 'business' })`: banks offering
   account information, with `maximumConsentDays`.

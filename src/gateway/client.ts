@@ -1,6 +1,6 @@
 import { createSign, type KeyObject } from 'node:crypto';
 import type { AccountResource, Aspsp, BalanceResource, SessionResource, SessionStatus, TransactionResource } from '../enablebanking/client.js';
-import { EnableBankingHttpError } from '../errors.js';
+import { EnableBankingHttpError, nestedFailuresAsStatus } from '../errors.js';
 import { discardBody, isRedirect, readErrorBody, readTextUpTo } from '../upstream-http.js';
 
 /**
@@ -69,11 +69,16 @@ export class GatewayClient {
     return `${input}.${b64url(createSign('RSA-SHA256').update(input).sign(this.options.key))}`;
   }
 
+  /**
+   * `onRaw` sees the parsed answer (a success or an error body) before any
+   * lossy normalisation: a caller registers vendor-returned secrets there.
+   */
   private async request<T>(
     name: UpstreamName,
     params: { session_id?: string; account_id?: string } = {},
     query?: URLSearchParams,
     body?: unknown,
+    onRaw?: (raw: unknown) => void,
   ): Promise<T> {
     const target = UPSTREAM[name];
     let path: string = target.path;
@@ -113,17 +118,33 @@ export class GatewayClient {
       throw new Error(`Enable Banking ${target.method} ${target.path} answered with a redirect (HTTP ${response.status}); redirects are not followed.`);
     }
     if (!response.ok) {
-      const payload = errorPayload(await readErrorBody(response));
+      // A body that cannot be read is dropped: the error is then the status alone.
+      const payload = errorPayload(await readErrorBody(response).catch(() => null));
+      onRaw?.(payload);
       // The template, not the concrete path: no identifier reaches the message.
       throw new EnableBankingHttpError({ status: response.status, method: target.method, path: target.path, payload });
     }
-    const { text, exceeded } = await readTextUpTo(response, this.options.maxResponseBytes);
+    let read: { text: string; exceeded: boolean };
+    try {
+      read = await readTextUpTo(response, this.options.maxResponseBytes);
+    } catch (error) {
+      // Anything thrown while reading the body is replaced by our own text: its message is not ours.
+      const name = error instanceof Error ? error.name : '';
+      if (name === 'TimeoutError' || name === 'AbortError') {
+        throw new Error(`Enable Banking did not answer within ${Math.round(this.options.timeoutMs / 1000)} seconds (${target.method} ${target.path}).`);
+      }
+      throw new Error(`The Enable Banking answer to ${target.method} ${target.path} could not be read.`);
+    }
+    const { text, exceeded } = read;
     if (exceeded) {
       throw new Error(`Enable Banking ${target.method} ${target.path} answered with more than ${this.options.maxResponseBytes} bytes; refused.`);
     }
     if (!text) return undefined as T;
     try {
-      return JSON.parse(text) as T;
+      const parsed: unknown = JSON.parse(text);
+      onRaw?.(parsed);
+      // Failures Enable Banking or a bank reports inside a successful answer become status-only text.
+      return nestedFailuresAsStatus(parsed) as T;
     } catch {
       throw new Error(`Enable Banking ${target.method} ${target.path} answered with something that is not JSON.`);
     }
@@ -178,8 +199,8 @@ export class GatewayClient {
     return this.request('startAuthorization', {}, undefined, body);
   }
 
-  createSession(code: string): Promise<SessionResource | undefined> {
-    return this.request('createSession', {}, undefined, { code });
+  createSession(code: string, onRaw?: (raw: unknown) => void): Promise<SessionResource | undefined> {
+    return this.request('createSession', {}, undefined, { code }, onRaw);
   }
 
   async deleteSession(sessionId: string): Promise<void> {

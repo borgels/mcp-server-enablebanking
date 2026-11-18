@@ -20,7 +20,7 @@ export interface TransactionView {
 /** "123.4" → 12340n; signed. Throws on anything that is not a plain decimal with ≤ 2 decimals. */
 export function toMinor(value: string): bigint {
   const match = /^([+-]?)(\d+)(?:[.,](\d{1,2}))?$/.exec(value.trim());
-  if (!match) throw new Error(`not a decimal amount: ${value}`);
+  if (!match) throw new Error('not a decimal amount');
   const [, sign, whole, fraction = ''] = match;
   const minor = BigInt(whole!) * 100n + BigInt(fraction.padEnd(2, '0'));
   return sign === '-' ? -minor : minor;
@@ -41,11 +41,26 @@ function magnitude(value: string | undefined): string {
   }
 }
 
+/**
+ * The bank's calendar date as YYYY-MM-DD, or null. The date is kept as the
+ * bank gave it, never converted between time zones: a value that starts
+ * with a valid YYYY-MM-DD (alone or followed by a time) keeps that date, so
+ * `2026-11-02T00:30:00+01:00` is 2 November. Anything else is null.
+ */
+function isoDay(value: unknown): string | null {
+  if (typeof value !== 'string' || value.length > 64) return null;
+  const match = /^(\d{4}-\d{2}-\d{2})(?:$|T)/.exec(value);
+  if (!match) return null;
+  const day = match[1]!;
+  const parsed = new Date(`${day}T00:00:00Z`);
+  return !Number.isNaN(parsed.getTime()) && parsed.toISOString().slice(0, 10) === day ? day : null;
+}
+
 export function transactionView(row: TransactionResource): TransactionView {
   const debit = row.credit_debit_indicator === 'DBIT';
   const amount = magnitude(row.transaction_amount?.amount);
   const remittance = Array.isArray(row.remittance_information) ? row.remittance_information.map(String) : [];
-  const bookingDate = (row.booking_date ?? null)?.slice(0, 10) ?? null;
+  const bookingDate = isoDay(row.booking_date);
   const counterpartyAccount = debit ? row.creditor_account?.iban : row.debtor_account?.iban;
   const reference =
     row.entry_reference ||
@@ -55,7 +70,7 @@ export function transactionView(row: TransactionResource): TransactionView {
   const view: TransactionView = {
     reference,
     bookingDate,
-    valueDate: (row.value_date ?? null)?.slice(0, 10) ?? null,
+    valueDate: isoDay(row.value_date),
     amount: debit && amount !== '0.00' ? `-${amount}` : amount,
     currency: row.transaction_amount?.currency ?? 'DKK',
     direction: debit ? 'out' : 'in',

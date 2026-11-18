@@ -1,5 +1,98 @@
 # Changelog
 
+## 0.4.1 (2026-11-17)
+
+- A terminating check after sealing: an error a consent helper or a call
+  throws is checked against every registered value in its raw form
+  (non-ASCII included) and its encoded forms, and replaced by the
+  ultimate fallback (`Error`, empty message, stack `Error`) when it
+  holds a piece of one; masking can no longer create a piece. A session
+  id Enable Banking returns that is not printable ASCII is never masked
+  into a text: the call ends in the ultimate fallback.
+- `completeSession` registers the session id Enable Banking returns from
+  the raw answer (success or error body), before the client's
+  normalisation, which can drop it, and before its format is checked.
+- `completeSession` registers the session id Enable Banking returns before
+  its format is checked; a value that is not printable ASCII is masked in
+  the final error without being encoded. The README states the scope: the
+  host is trusted; vendor values and anything persisted are in scope.
+- Every secret registered during a consent helper's call, the session id
+  `completeSession` receives included, is part of the final seal and the
+  sink check of any error that leaves the call.
+- A key object that cannot be exported, or exports no content, is refused:
+  a gateway never runs without a secret to check against. Every error that
+  leaves (helper errors and fallbacks, the session refusal) passes the sink
+  check as a finished object, name, message, stack, status and code
+  included, and is replaced by the sealed fixed fallback when it leaks.
+- Consent helpers check the state, code or session id they are given as
+  printable ASCII inside their error boundary, before anything encodes it,
+  and refuse anything else with a fixed error in final form.
+- Errors leave in final form: every error a gateway throws is a fresh
+  error with no `cause`, a `stack` of just `name: message` (no frames,
+  paths or function names), and name, message and stack masked against the
+  secret; the sink check runs on the finished object, its non-enumerable
+  fields included.
+- Every element of a failure list (`failures`, `failure`, `errors`,
+  `error`, `warnings`), at any depth and whatever its fields, becomes
+  `{ status?, message }` with our own text; a failure context such as
+  `metadata` or `amount` holds through wrappers such as `data`.
+- Network, timeout and redirect errors name the method only, not the
+  configured address.
+- The sink check: every output of a gateway (the tool list, results, the consent helpers' answers and errors,
+  construction errors) is checked in its final form, and one that holds a
+  piece of 6 characters of the key or of the call's session id is
+  replaced by a fixed fallback (`src/fallbacks.ts`): a withheld result or
+  error, or the fixed refusal. A session id that fails admission makes
+  `callTool` throw a masked `EnableBankingGatewayError`. A key that shares a
+  piece with a fallback or with the tool list is refused at creation.
+- Key admission: printable ASCII (0x21-0x7E) of at least 16 characters,
+  checked before anything is built from the key; the corpus of our own
+  string literals stays as a cheap first filter.
+- A text in a failure list of a successful answer (`failures`, `errors`,
+  `warnings` and the like) is replaced by our own text, like a failure
+  object.
+- No Enable Banking text in errors (also for the MCP server): an HTTP error
+  gives the status, our hint and an error code from Enable Banking's
+  documented list; the body's message and detail are not kept, an over-limit
+  error body is discarded, and an undocumented code is dropped.
+- Gateway: every result is redacted as data before it is serialised, keys
+  included, with the instance's key (exact, URL- and JSON-escaped, and any
+  6-character piece of its content) and the call's session id. A key given as
+  a `KeyObject` is redacted too. The consent helpers' answers are redacted
+  with the key.
+- Gateway: errors no longer repeat the tool name or unknown field names; a
+  session status is named only when documented; consent dates are returned
+  as ISO 8601 in UTC (`validUntil`), or null when they are not a date.
+- Account names over 200 characters are left out instead of cut.
+- Gateway: the redaction marker is `‹redacted›`; failures reported inside a
+  successful answer keep only their status; an answer body that cannot be
+  read becomes our own text (an error body is dropped); consent-helper errors
+  carry a code only from the documented list. The threat model's guarantees
+  apply to the gateway; the standalone server keeps best-effort redaction.
+- Gateway: page tokens are opaque ids (32 random bytes) that the issuing
+  instance maps, in memory and for 15 minutes, to where the next page
+  starts; no account id, period or continuation key is in the token. A
+  continuation key over 2,048 characters ends the listing as incomplete.
+- Transaction dates keep the bank's calendar date as given: a value that
+  starts with a valid `YYYY-MM-DD` keeps that date (`2026-11-02T00:30:00+01:00`
+  is 2 November); time zones are never converted. Anything else is null.
+- Gateway key admission: a key whose content is shorter than 16 characters,
+  or shares a 6-character piece with any of this server's own texts
+  (`src/fixed-corpus.generated.ts`), is refused with a fixed text that never
+  repeats it; the same rule refuses a session id at `completeSession` and in
+  each call.
+- Gateway: every string leaving it passes the redactor as the last step:
+  results and refusals, construction errors, and the consent helpers'
+  answers and errors.
+- Failures reported inside a successful answer: a `status` of 400 or more,
+  an `error` field, or a message in `failures`, `errors`, `metadata`,
+  `amount` and the like keep only their status and our own text.
+- Gateway: numbers and booleans whose string form matches are replaced by
+  the string `"‹redacted›"`; a result is redacted first and copied as JSON
+  afterwards. The README has a threat model: what is guaranteed and the
+  residual risk.
+- Configuration errors no longer quote the rejected value.
+
 ## 0.4.0 (2026-11-17)
 
 Embedding surface `mcp-server-enablebanking/gateway`, so one host process can
