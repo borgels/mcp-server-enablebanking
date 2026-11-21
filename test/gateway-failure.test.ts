@@ -45,6 +45,13 @@ describe('gateway: failure metadata', () => {
     expect(personal.failure).toEqual({ httpStatus: 500 });
   });
 
+  it('drops a request id in form that redaction changes (here the session id itself), and gives the status alone', async () => {
+    const result = await gateway(() => json({}, 503, { 'x-request-id': SESSION })).callTool('get_balances', { account: ACCOUNT }, ctx);
+    expect(result.isError).toBe(true);
+    expect(result.failure).toEqual({ httpStatus: 503 });
+    expect(JSON.stringify(result)).not.toContain(SESSION);
+  });
+
   it('gives the status of a refused redirect, never its address', async () => {
     const result = await gateway(() => new Response(null, { status: 307, headers: { location: 'https://elsewhere.example.org/' } })).callTool(
       'get_balances',
