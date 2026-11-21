@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.0 (2026-11-21)
+
+- License changed from Apache-2.0 to the Functional Source License, Version 1.1,
+  ALv2 Future License (FSL-1.1-ALv2). You may read, run, modify and use the code
+  internally and contribute changes; offering it as a competing commercial
+  product or service is not allowed. Each version becomes Apache-2.0 two years
+  after its release. Versions released before 0.5.0 remain under Apache-2.0
+  (see `NOTICE`).
+
 ## 0.4.1 (2026-11-17)
 
 - A terminating check after sealing: an error a consent helper or a call
