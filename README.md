@@ -286,6 +286,12 @@ const result = await gateway.callTool('get_balances', { account: accountId }, {
   not repeat their cause, a session status is named only when it is a
   documented one, and errors about the options, the environment or the
   input do not quote the rejected value, tool name or field names.
+- **Failures.** An error result from `callTool` caused by an HTTP error from
+  Enable Banking (or a refused redirect) carries
+  `failure: { httpStatus, requestId? }`, in the shape of mcp-server-template:
+  the status, and Enable Banking's request id only when a response header
+  gives one as a UUID or hex id, checked again after redaction. Never the
+  body, the error code or message, or the input. A refusal of ours has none.
 - **Redaction.** Each gateway owns a redactor holding its private key; each
   call forks it and adds the call's session id (the consent helpers add the
   code). Every result is redacted as data, before it is serialised, object

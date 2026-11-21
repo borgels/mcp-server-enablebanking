@@ -20,6 +20,7 @@ import {
   type GatewayJsonValue,
 } from './gateway/catalog.js';
 import { EnableBankingHttpError, ERROR_CODES } from './errors.js';
+import { failureInForm, failureMetadata, type FailureMetadata } from './gateway/failure.js';
 import { FRAGMENT_LENGTH, GatewayRedactor } from './gateway/redact.js';
 import { fixedOutputs, INPUT_REFUSED, RESULT_WITHHELD, SESSION_REFUSED, withheldResult } from './fallbacks.js';
 import { admitsKey, KEY_REFUSED, keyRefusedText, leaksSecret, sealedError, type LeakMatcher } from './key-admission.js';
@@ -60,10 +61,19 @@ export {
   type GatewayUpstreamOperation,
 } from './gateway/catalog.js';
 
+/**
+ * Metadata about a failed call, on an error result whose cause is known: the HTTP status Enable Banking answered with,
+ * and its own request id when a response header gives one as a UUID or hex id. For a host that counts failures
+ * without reading their text. Never the response body, the error code or message, or the input.
+ */
+export type GatewayFailure = FailureMetadata;
+
 export interface GatewayToolResult {
   content: Array<{ type: 'text'; text: string }>;
   structuredContent?: GatewayJsonValue;
   isError?: boolean;
+  /** On an error result from Enable Banking's API only: its HTTP status and request id (see GatewayFailure). */
+  failure?: GatewayFailure;
 }
 
 /** One company's consent, passed with each call. */
@@ -649,7 +659,7 @@ function buildEnableBankingGateway(options: EnableBankingGatewayOptions) {
       try {
         result = await runCall(toolName, input ?? {}, context, callRedactor);
       } catch (error) {
-        result = errorResult(callRedactor.message(error));
+        result = errorResult(callRedactor.message(error), failureMetadata(error));
       }
       // Every result, refusals and errors included, through the call's redactor, and then the sink check as the very
       // last step: a result that holds a piece of the key or the session id anywhere is withheld whole.
@@ -1073,8 +1083,11 @@ function jsonResult(text: string, structuredContent: unknown): GatewayToolResult
  * Account ids stay: only the call's values and pieces of the key are removed.
  */
 function redactResult(result: GatewayToolResult, redactor: GatewayRedactor): GatewayToolResult {
+  // The failure metadata in form or dropped: a status of 100-599 and a request id that is still one after redaction.
+  const failure = failureInForm(result.isError, redactor.redactDeep(result.failure));
   return {
     ...(result.isError ? { isError: true } : {}),
+    ...(failure ? { failure } : {}),
     content: result.content.map(part => ({ type: 'text' as const, text: redactor.redactValues(redactor.redactValues(part.text)) })),
     // Redacted first, as data and depth-limited, and only then copied as JSON. The outer pass is the final one, over
     // the assembled data with its depth placeholders.
@@ -1088,6 +1101,6 @@ function redactResult(result: GatewayToolResult, redactor: GatewayRedactor): Gat
   };
 }
 
-function errorResult(text: string): GatewayToolResult {
-  return { isError: true, content: [{ type: 'text', text }] };
+function errorResult(text: string, failure?: GatewayFailure): GatewayToolResult {
+  return { isError: true, content: [{ type: 'text', text }], ...(failure ? { failure } : {}) };
 }

@@ -2,6 +2,7 @@ import { createSign, type KeyObject } from 'node:crypto';
 import type { AccountResource, Aspsp, BalanceResource, SessionResource, SessionStatus, TransactionResource } from '../enablebanking/client.js';
 import { EnableBankingHttpError, nestedFailuresAsStatus } from '../errors.js';
 import { discardBody, isRedirect, readErrorBody, readTextUpTo } from '../upstream-http.js';
+import { EnableBankingRedirectError, requestIdFrom } from './failure.js';
 
 /**
  * The embedded gateway's client for Enable Banking. Account information and
@@ -115,14 +116,24 @@ export class GatewayClient {
 
     if (isRedirect(response.status)) {
       await discardBody(response);
-      throw new Error(`Enable Banking ${target.method} ${target.path} answered with a redirect (HTTP ${response.status}); redirects are not followed.`);
+      throw new EnableBankingRedirectError(
+        `Enable Banking ${target.method} ${target.path} answered with a redirect (HTTP ${response.status}); redirects are not followed.`,
+        response.status,
+        requestIdFrom(response.headers),
+      );
     }
     if (!response.ok) {
       // A body that cannot be read is dropped: the error is then the status alone.
       const payload = errorPayload(await readErrorBody(response).catch(() => null));
       onRaw?.(payload);
       // The template, not the concrete path: no identifier reaches the message.
-      throw new EnableBankingHttpError({ status: response.status, method: target.method, path: target.path, payload });
+      throw new EnableBankingHttpError({
+        status: response.status,
+        method: target.method,
+        path: target.path,
+        payload,
+        requestId: requestIdFrom(response.headers),
+      });
     }
     let read: { text: string; exceeded: boolean };
     try {
