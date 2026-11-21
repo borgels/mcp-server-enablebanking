@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.0 (2026-11-22)
+
+- Gateway: `failure: { httpStatus, requestId? }` on a `callTool` error result
+  caused by an HTTP error from Enable Banking or a refused redirect, as in
+  mcp-server-template 0.2.1. The request id only as a UUID or hex id (never
+  one with the shape of a personal number), checked again after redaction;
+  never the body, the error code or message, or the input. Refusals of the
+  gateway's own carry none.
+
 ## 0.5.0 (2026-11-21)
 
 - License changed from Apache-2.0 to the Functional Source License, Version 1.1,

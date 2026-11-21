@@ -1,3 +1,5 @@
+import { vendorRequestId } from './gateway/failure.js';
+
 /**
  * Errors from Enable Banking.
  *
@@ -80,8 +82,10 @@ export class EnableBankingHttpError extends Error {
   readonly status: number;
   readonly path: string;
   readonly code?: string;
+  /** Enable Banking's own id for the request, when a response header gives one as a UUID or hex id. */
+  readonly requestId?: string;
 
-  constructor(init: { status: number; method: string; path: string; payload?: unknown }) {
+  constructor(init: { status: number; method: string; path: string; payload?: unknown; requestId?: string }) {
     const code = documentedErrorCode(init.payload);
     const path = redactPath(init.path);
     const hint = statusHint(init.status);
@@ -90,6 +94,8 @@ export class EnableBankingHttpError extends Error {
     this.status = init.status;
     this.path = path;
     if (code !== undefined) this.code = code;
+    const requestId = vendorRequestId(init.requestId);
+    if (requestId !== undefined) this.requestId = requestId;
   }
 
   /** The bank or Enable Banking no longer honours the consent behind this call. */
