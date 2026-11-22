@@ -620,3 +620,47 @@ describe('round 12', () => {
     }
   });
 });
+
+describe('identification hashes', () => {
+  const HASH = 'WwUJU8ZJw2Xy0rFdrDFBF2tV3+sRuI3qPk4ZdHs/fTI=.zQx6z2rN4qkc9u1D4TfjtWAeFqa+X7LrV7K0J6P5jVZtnF8KfE';
+  const session = (hash: string) => ({
+    session_id: SESSION,
+    status: 'AUTHORIZED',
+    aspsp: { name: 'Opdigtet Bank', country: 'DK' },
+    access: { valid_until: '2099-01-01T00:00:00Z' },
+    accounts: [ACCOUNT],
+    accounts_data: [{ uid: ACCOUNT, identification_hash: hash, iban: 'DK5000400440116243', owner: 'Lund VVS ApS', extra: { nested: HASH } }],
+  });
+
+  it('carries no piece of the key in a hash, and nothing else of accounts_data', async () => {
+    const answers: unknown[] = [];
+    for (const hash of [`${PIECE}.${PIECE}`, PIECE, `x.${PIECE.slice(0, 30)}`]) {
+      const gateway = gatewayWith(url =>
+        url.pathname === '/sessions'
+          ? json({ ...session(hash), accounts: [{ uid: ACCOUNT, identification_hash: hash, name: 'Konto' }] })
+          : json(session(hash)),
+      );
+      for (const attempt of [() => gateway.completeSession({ code: 'code-0123456789' }), () => gateway.sessionStatus({ sessionId: SESSION })]) {
+        try {
+          // completeSession gives the session id on purpose: the host stores it. Only the rest is checked.
+          const { sessionId: _own, ...rest } = (await attempt()) as { sessionId?: string };
+          answers.push(rest);
+        } catch (error) {
+          answers.push({ message: (error as Error).message, ...(error as object) });
+        }
+      }
+    }
+    expect(leaks(answers)).toEqual([]);
+    expect(JSON.stringify(answers)).not.toMatch(/Lund VVS|DK5000400440116243|nested/);
+  });
+
+  it('gives the hash to the consent helpers and keeps it out of the list_accounts answer', async () => {
+    const gateway = gatewayWith(url =>
+      url.pathname.endsWith('/details') ? json({ uid: ACCOUNT, name: 'Konto', identification_hash: HASH }) : json(session(HASH)),
+    );
+    expect((await gateway.sessionStatus({ sessionId: SESSION })).accounts).toEqual([{ id: ACCOUNT, identificationHash: HASH }]);
+    const listed = await gateway.callTool('list_accounts', {}, ctx);
+    expect(JSON.stringify(listed)).not.toContain('identificationHash');
+    expect(JSON.stringify(listed)).not.toContain(HASH);
+  });
+});

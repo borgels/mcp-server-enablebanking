@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.1 (2026-11-22)
+
+- Gateway: the consent helpers give each account's identification hash (`ConsentAccount.identificationHash`,
+  `SessionStatusResult.accounts`), the same for the account in every consent while the uid changes with each session,
+  so a host can recognise an account again on renewal. The hash follows Enable Banking's documented shape (base64
+  parts joined by a dot); anything else is dropped. The `list_accounts` answer does not carry it.
+
 ## 0.6.0 (2026-11-22)
 
 - Gateway: `failure: { httpStatus, requestId? }` on a `callTool` error result

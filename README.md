@@ -338,11 +338,13 @@ instead: a plain `Error` with an empty message and the stack `Error`.
   host's own unguessable, single-use value: keep it, and compare it with the
   `state` on the redirect before completing.
 - `completeSession({ code })`: exchanges the code from the redirect for
-  `{ sessionId, validUntil, bank, psuType, accounts: [{ id, name, maskedIban, currency }] }`.
+  `{ sessionId, validUntil, bank, psuType, accounts: [{ id, name, maskedIban, currency, identificationHash }] }`.
   Store `sessionId` and the ids of the accounts the company chose as its
-  credentials.
-- `sessionStatus({ sessionId })`: status, `validUntil` and account ids, for
-  renewal reminders.
+  credentials. The ids change with every new session; `identificationHash`
+  (Enable Banking's, or null) stays the same for the account, so use it to
+  recognise an account again when a consent is renewed.
+- `sessionStatus({ sessionId })`: status, `validUntil`, account ids and
+  `accounts: [{ id, identificationHash }]`, for renewal reminders.
 - `endSession({ sessionId })`: closes the session and ends the consent at the
   bank.
 

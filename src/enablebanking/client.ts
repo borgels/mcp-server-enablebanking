@@ -49,6 +49,8 @@ export interface SessionResource {
 export interface SessionStatus {
   status?: string;
   accounts?: string[];
+  /** Enable Banking's account uids with their identification hash, the same for the account across consents. */
+  accounts_data?: Array<{ uid?: string; identification_hash?: string | null }>;
   access?: { valid_until?: string };
   aspsp?: { name: string; country: string };
   psu_type?: string;
