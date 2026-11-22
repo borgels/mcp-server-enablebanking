@@ -172,6 +172,12 @@ export interface ConsentAccount {
   /** First four and last four characters, e.g. DK12…4567. */
   maskedIban: string | null;
   currency: string | null;
+  /**
+   * Enable Banking's identification hash of the account: the same for the same account in every consent, while the
+   * uid changes with each new session. What a host uses to recognise an account again (renewal, duplicates). Null when
+   * the bank gave none or it is not a plain token.
+   */
+  identificationHash: string | null;
 }
 
 export interface CompleteSessionResult {
@@ -188,6 +194,8 @@ export interface SessionStatusResult {
   status: string | null;
   validUntil: string | null;
   accountIds: string[];
+  /** The session's accounts with their identification hash (see ConsentAccount), where Enable Banking gave one. */
+  accounts: Array<{ id: string; identificationHash: string | null }>;
 }
 
 /** Error thrown by the consent helpers. Its message is redacted and carries no cause. */
@@ -810,6 +818,7 @@ function buildEnableBankingGateway(options: EnableBankingGatewayOptions) {
           status: typeof session?.status === 'string' && SESSION_STATUSES.has(session.status) ? session.status : null,
           validUntil: instant(session?.access?.valid_until),
           accountIds: [...sessionAccounts(session)],
+          accounts: sessionAccountHashes(session),
         };
       });
     },
@@ -924,6 +933,28 @@ function sessionAccounts(session: SessionStatus | undefined): Set<string> {
   return ids;
 }
 
+/** An identification hash from Enable Banking, or null when it is missing or not a plain token. */
+/** Enable Banking's identification hash of an account: an opaque printable token (base64 or hex). */
+const HASH_PATTERN = /^[A-Za-z0-9+/=_-]{8,128}$/;
+function identificationHash(value: unknown): string | null {
+  return typeof value === 'string' && HASH_PATTERN.test(value) ? value : null;
+}
+
+/** The session's accounts (uids from `accounts` and `accounts_data`) with the identification hash where given. */
+function sessionAccountHashes(session: SessionStatus | undefined): Array<{ id: string; identificationHash: string | null }> {
+  const hashes = new Map<string, string | null>();
+  const data = (session as { accounts_data?: unknown } | undefined)?.accounts_data;
+  if (Array.isArray(data)) {
+    for (const entry of data) {
+      const uid = (entry as { uid?: unknown } | null)?.uid;
+      if (typeof uid === 'string' && ID_PATTERN.test(uid)) {
+        hashes.set(uid, identificationHash((entry as { identification_hash?: unknown }).identification_hash));
+      }
+    }
+  }
+  return [...sessionAccounts(session)].filter(id => ID_PATTERN.test(id)).map(id => ({ id, identificationHash: hashes.get(id) ?? null }));
+}
+
 type ConsentCheck =
   | { ok: true; accounts: Set<string>; validUntil: string | null }
   | { ok: false; reason: string };
@@ -971,6 +1002,7 @@ function consentAccount(account: AccountResource & { uid: string }): ConsentAcco
     name: text(account.name) ?? text(account.product) ?? text(account.details),
     maskedIban: iban ? maskIban(iban) : null,
     currency: text(account.currency),
+    identificationHash: identificationHash(account.identification_hash),
   };
 }
 

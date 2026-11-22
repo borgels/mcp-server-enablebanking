@@ -549,8 +549,8 @@ describe('consent helpers', () => {
             psu_type: 'business',
             access: { valid_until: '2027-05-16T09:55:00+00:00' },
             accounts: [
-              { uid: ACCOUNT_A1, name: 'Driftskonto', currency: 'DKK', account_id: { iban: dkIban('54700001234567') } },
-              { uid: ACCOUNT_A2, currency: 'EUR', all_account_ids: [{ scheme_name: 'IBAN', identification: dkIban('54700007654321') }] },
+              { uid: ACCOUNT_A1, name: 'Driftskonto', currency: 'DKK', account_id: { iban: dkIban('54700001234567') }, identification_hash: 'aGFzaC1hMS1zdGFibGU=' },
+              { uid: ACCOUNT_A2, currency: 'EUR', all_account_ids: [{ scheme_name: 'IBAN', identification: dkIban('54700007654321') }], identification_hash: 'has space' },
               { name: 'no uid', currency: 'DKK' },
             ],
           });
@@ -613,8 +613,9 @@ describe('consent helpers', () => {
       bank: { name: 'Opdigtet Bank', country: 'DK' },
       psuType: 'business',
       accounts: [
-        { id: ACCOUNT_A1, name: 'Driftskonto', maskedIban: expect.stringMatching(/^DK\d\d…4567$/), currency: 'DKK' },
-        { id: ACCOUNT_A2, name: null, maskedIban: expect.stringMatching(/^DK\d\d…4321$/), currency: 'EUR' },
+        { id: ACCOUNT_A1, name: 'Driftskonto', maskedIban: expect.stringMatching(/^DK\d\d…4567$/), currency: 'DKK', identificationHash: 'aGFzaC1hMS1zdGFibGU=' },
+        // A hash that is not a plain token is dropped, not passed on.
+        { id: ACCOUNT_A2, name: null, maskedIban: expect.stringMatching(/^DK\d\d…4321$/), currency: 'EUR', identificationHash: null },
       ],
       accountsWithoutId: 1,
     });
@@ -649,7 +650,27 @@ describe('consent helpers', () => {
       status: 'AUTHORIZED',
       validUntil: '2027-05-01T00:00:00.000Z',
       accountIds: [ACCOUNT_A1, ACCOUNT_A2],
+      accounts: [
+        { id: ACCOUNT_A1, identificationHash: null },
+        { id: ACCOUNT_A2, identificationHash: null },
+      ],
     });
+    const withHashes = consentApi(call =>
+      call.method === 'GET' && call.url.pathname === `/sessions/${SESSION_A}`
+        ? json({
+            status: 'AUTHORIZED',
+            accounts: [ACCOUNT_A1, ACCOUNT_A2],
+            accounts_data: [
+              { uid: ACCOUNT_A1, identification_hash: 'aGFzaC1hMS1zdGFibGU=' },
+              { uid: ACCOUNT_A2, identification_hash: '<script>' },
+            ],
+          })
+        : undefined,
+    );
+    expect((await gateway(withHashes.fetchImpl).sessionStatus({ sessionId: SESSION_A })).accounts).toEqual([
+      { id: ACCOUNT_A1, identificationHash: 'aGFzaC1hMS1zdGFibGU=' },
+      { id: ACCOUNT_A2, identificationHash: null },
+    ]);
     await gw.endSession({ sessionId: SESSION_A });
     expect(calls.at(-1)).toMatchObject({ method: 'DELETE' });
     expect(calls.at(-1)!.url.pathname).toBe(`/sessions/${SESSION_A}`);
