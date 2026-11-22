@@ -934,8 +934,11 @@ function sessionAccounts(session: SessionStatus | undefined): Set<string> {
 }
 
 /** An identification hash from Enable Banking, or null when it is missing or not a plain token. */
-/** Enable Banking's identification hash of an account: an opaque printable token (base64 or hex). */
-const HASH_PATTERN = /^[A-Za-z0-9+/=_-]{8,128}$/;
+/**
+ * Enable Banking's identification hash of an account: opaque, in their documented examples two base64 parts joined by
+ * a dot (about 100 characters). Anything else than that alphabet, or over 256 characters, is dropped.
+ */
+const HASH_PATTERN = /^[A-Za-z0-9+/=_.-]{8,256}$/;
 function identificationHash(value: unknown): string | null {
   return typeof value === 'string' && HASH_PATTERN.test(value) ? value : null;
 }
@@ -1016,7 +1019,8 @@ async function listAccounts(
   const accounts = [];
   for (const id of shown) {
     const details = await client.getAccountDetails(id);
-    const view = consentAccount({ ...(details ?? {}), uid: id });
+    // The identification hash is for the host's consent page only; the tool's answer does not carry it.
+    const { identificationHash: _hash, ...view } = consentAccount({ ...(details ?? {}), uid: id });
     accounts.push({ ...view, product: text(details?.product) });
   }
   const structured = {
