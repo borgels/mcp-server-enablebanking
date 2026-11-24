@@ -276,4 +276,83 @@ describe('a gateway answer, checked after the call’s last await', () => {
     await gw.endSession({ sessionId: SESSION });
     refused(await gw.callTool('get_balances', { account: ACCOUNT_A }, context));
   });
+
+  describe('with the session statuses held and let go out of order', () => {
+    /** A fake Enable Banking that holds every session status until let go, answering as it stood when asked. */
+    function slow() {
+      const held: Array<{ respond: () => void; session: string }> = [];
+      let accounts = [ACCOUNT_A, ACCOUNT_B];
+      let validUntil = new Date(NOW + 60_000).toISOString();
+      const fetchImpl: typeof fetch = async (input, init) => {
+        const url = new URL(String(input));
+        const match = /^\/sessions\/([^/]+)$/.exec(url.pathname);
+        if (match) {
+          if ((init?.method ?? 'GET') === 'DELETE') return json({});
+          const answer = json({ status: 'AUTHORIZED', accounts: [...accounts], access: { valid_until: validUntil } });
+          return new Promise<Response>(resolve => held.push({ respond: () => resolve(answer), session: match[1]! }));
+        }
+        return json({ balances: [{ balance_type: 'ITAV', balance_amount: { currency: 'EUR', amount: '5.00' } }] });
+      };
+      const settle = async () => {
+        for (let i = 0; i < 12; i += 1) await new Promise<void>(resolve => setImmediate(resolve));
+      };
+      return {
+        fetchImpl,
+        held,
+        settle,
+        setAccounts: (next: string[]) => (accounts = next),
+        setValidUntil: (next: string) => (validUntil = next),
+      };
+    }
+
+    it('refuses a read whose own older status lists the account, when a newer status without it arrived first', async () => {
+      const fake = slow();
+      const gw = gateway(fake.fetchImpl);
+      const call = gw.callTool('get_balances', { account: ACCOUNT_A }, context);
+      await fake.settle();
+      const own = fake.held.shift()!;
+      // The person takes A out of the consent; the host's status check sees it first.
+      fake.setAccounts([ACCOUNT_B]);
+      const status = gw.sessionStatus({ sessionId: SESSION });
+      await fake.settle();
+      fake.held.shift()!.respond();
+      expect((await status).accountIds).toEqual([ACCOUNT_B]);
+      // Then the read's own status, asked earlier, still with A.
+      own.respond();
+      refused(await call);
+    });
+
+    it('refuses a read after an earlier validity date it learned, also when many other sessions came and went', async () => {
+      const fake = slow();
+      let clock = NOW;
+      const gw = createEnableBankingGateway({
+        applicationId: 'app-0000-test',
+        privateKey: PEM,
+        apiBaseUrl: 'https://eb.test',
+        fetchImpl: fake.fetchImpl,
+        now: () => clock,
+        endedSessionsKept: 1,
+      });
+      const call = gw.callTool('get_balances', { account: ACCOUNT_A }, context);
+      await fake.settle();
+      const own = fake.held.shift()!;
+      // Enable Banking now says the consent ends in one second; a status check learns it.
+      fake.setValidUntil(new Date(NOW + 1_000).toISOString());
+      const status = gw.sessionStatus({ sessionId: SESSION });
+      await fake.settle();
+      fake.held.shift()!.respond();
+      await status;
+      // Many other sessions are asked about: nothing the read depends on is kept with them.
+      for (let i = 0; i < 50; i += 1) {
+        const other = `cdcdcdcd-cdcd-4cdc-8cdc-${String(i).padStart(12, 'c').replace(/\d/g, d => 'cdef'[Number(d) % 4]!)}`;
+        const asked = gw.sessionStatus({ sessionId: other });
+        await fake.settle();
+        fake.held.shift()!.respond();
+        await asked;
+      }
+      clock = NOW + 2_000;
+      own.respond();
+      refused(await call);
+    });
+  });
 });

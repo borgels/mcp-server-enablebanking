@@ -110,6 +110,12 @@ export interface EnableBankingGatewayOptions {
    * 0 turns the budget off. Counted in the memory of this instance only.
    */
   unattendedFetchesPerDay?: number;
+  /**
+   * How many sessions ended through endSession this instance remembers, so that a call starting while (or just
+   * after) a session is ended is refused even if Enable Banking has not closed it yet. Default 10 000; an entry is
+   * never dropped while its endSession is under way. Calls under way do not depend on it (each holds its own watch).
+   */
+  endedSessionsKept?: number;
   /** Clock, for tests. */
   now?: () => number;
 }

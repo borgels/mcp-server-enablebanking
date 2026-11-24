@@ -16,7 +16,7 @@ import { enableBankingGatewayTools, type GatewayToolDefinition, type GatewayJson
 import { EnableBankingHttpError, ERROR_CODES } from './errors.js';
 import { failureInForm, failureMetadata } from './gateway/failure.js';
 import { FRAGMENT_LENGTH, GatewayRedactor } from './gateway/redact.js';
-import { Withdrawals, type CallWatch } from './gateway/withdrawals.js';
+import { DEFAULT_ENDED_SESSIONS_KEPT, Withdrawals, type CallWatch } from './gateway/withdrawals.js';
 import {
   bankReads,
   callCredentials,
@@ -370,8 +370,10 @@ function buildEnableBankingGateway(options: EnableBankingGatewayOptions) {
   const now = options.now ?? Date.now;
   // Where each issued page token continues; never leaves the instance.
   const pages = new PageTokens(now);
-  /** Consents ended and accounts lost, learned while calls run: an answer is returned only when nothing was learned against it. */
-  const withdrawals = new Withdrawals();
+  /** The watch of every call under way, and the sessions ended here: an answer leaves only when its own watch stands. */
+  const withdrawals = new Withdrawals(
+    boundedInt(options.endedSessionsKept, DEFAULT_ENDED_SESSIONS_KEPT, 1, 1_000_000, 'endedSessionsKept'),
+  );
   // Reads made with nobody present, per consent.
   const budget = new UnattendedBudget(
     boundedInt(options.unattendedFetchesPerDay, DEFAULT_UNATTENDED_FETCHES_PER_DAY, 0, 1_000, 'unattendedFetchesPerDay'),
@@ -499,18 +501,25 @@ function buildEnableBankingGateway(options: EnableBankingGatewayOptions) {
         }
       }
       let result: GatewayToolResult;
-      // Where the clock stood when the call began: what is learned after this against its consent counts against it.
-      const watch = sessionId === undefined ? undefined : withdrawals.begin(sessionId);
+      // The call's watch, registered on its session before anything is awaited: every fact learned about the session
+      // from now on, from any request, is put on it. Narrowed to the accounts the call names once it is read.
+      const accountIds = callCredentials(context)?.accountIds;
+      const watch = sessionId === undefined || !accountIds ? undefined : withdrawals.begin(sessionId, accountIds.keys());
       try {
-        result = await runCall(toolName, input ?? {}, context, presence, watch);
-      } catch (error) {
-        // The text is ours; the code says what went wrong without it. Anything unnamed is a failure at Enable Banking.
-        result = errorResult(callRedactor.message(error), failureMetadata(error), problemOf(error) ?? 'upstream_error');
-      }
-      // After the call's last await, and nothing awaited from here to the return: an answer read under a consent that
-      // was ended or ran out, or from an account that left it, while the call ran (at any await) does not leave.
-      if (watch && result.isError !== true && !withdrawals.stands(watch, now())) {
-        result = errorResult(WITHDRAWN_MEANWHILE, undefined, 'consent_not_active');
+        try {
+          result = await runCall(toolName, input ?? {}, context, presence, watch);
+        } catch (error) {
+          // The text is ours; the code says what went wrong without it. Anything unnamed is a failure at Enable Banking.
+          result = errorResult(callRedactor.message(error), failureMetadata(error), problemOf(error) ?? 'upstream_error');
+        }
+        // After the call's last await, and nothing awaited from here to the return: an answer read under a consent
+        // that was ended or ran out, or from an account that left it, while the call ran (at any await) does not leave.
+        // Only the call's own watch and the clock are read.
+        if (watch && result.isError !== true && !withdrawals.stands(watch, now())) {
+          result = errorResult(WITHDRAWN_MEANWHILE, undefined, 'consent_not_active');
+        }
+      } finally {
+        if (watch) withdrawals.done(watch);
       }
       // Every result, refusals and errors included, through the call's redactor, and then the sink check as the very
       // last step: a result that holds a piece of the key or the session id anywhere is withheld whole.
@@ -717,14 +726,16 @@ function buildEnableBankingGateway(options: EnableBankingGatewayOptions) {
       return helper([typeof sessionId === 'string' ? sessionId : undefined], async () => {
         if (typeof sessionId !== 'string' || !ID_PATTERN.test(sessionId)) throw new Error('endSession: sessionId is missing or malformed.');
         // Ended from the moment it is asked for: no answer read under it is returned by this instance any more, also
-        // one of a call already under way.
-        withdrawals.end(sessionId);
+        // one of a call already under way or one that starts while the session is being ended.
+        withdrawals.ending(sessionId);
         try {
           await client.deleteSession(sessionId);
         } catch (error) {
           const problem = problemOf(error);
           if (problem === 'consent_expired' || problem === 'consent_revoked' || problem === 'consent_not_active') return { alreadyEnded: true };
           throw error;
+        } finally {
+          withdrawals.endingDone(sessionId);
         }
         return { alreadyEnded: false };
       });
@@ -766,8 +777,8 @@ function buildEnableBankingGateway(options: EnableBankingGatewayOptions) {
     if (!credentials) return errorResult(NO_CREDENTIALS, undefined, 'no_consent');
     const named = [...(target.account === undefined ? [] : [target.account]), ...(target.accounts ?? [])];
     if (named.some(account => !credentials.accountIds.has(account))) return errorResult(NOT_ALLOWED, undefined, 'account_not_connected');
-    // The accounts the answer may come from: those named, else every account of the call.
-    if (watch) watch.accounts = new Set(named.length > 0 ? named : credentials.accountIds.keys());
+    // The accounts the answer may come from: those named, else every account of the call. Before any await.
+    if (watch && named.length > 0) watch.accounts = new Set(named);
     const learn = (problem: ProblemCode | undefined, account?: string) => withdrawals.failed(credentials.sessionId, problem, account, watch);
 
     // Who is behind the call, before anything is sent: a malformed answer is refused, never read as "nobody".
@@ -782,8 +793,7 @@ function buildEnableBankingGateway(options: EnableBankingGatewayOptions) {
     });
     // What the status says counts for every call under way: an ended consent, the accounts it still lists, and when
     // it runs out (checked again when the answer of this call is returned).
-    const until = withdrawals.status(credentials.sessionId, session, now(), sessionAccounts(session));
-    if (watch) watch.until = until;
+    withdrawals.status(credentials.sessionId, session, now(), sessionAccounts(session));
     const consent = consentState(session, now());
     if (!consent.ok) return errorResult(consent.reason, undefined, consent.code);
     // Accounts of the call the session no longer lists are not read by it: what this status says of them is not

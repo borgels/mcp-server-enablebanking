@@ -346,7 +346,7 @@ const gateway = createEnableBankingGateway({
   applicationId: '<application id>', // the JWT kid
   privateKey: pemText,                // or a KeyObject
   // apiBaseUrl, timeoutMs (default 30 s), maxResponseBytes (default 4 MB), fetchImpl
-  // unattendedFetchesPerDay (default 4)
+  // unattendedFetchesPerDay (default 4), endedSessionsKept (default 10 000)
 });
 
 const result = await gateway.callTool('get_balances', { account: accountId }, {
@@ -490,8 +490,9 @@ if (result.isError) {
   instance holds between calls is the page tokens (15 minutes; where to
   continue a listing, never bank data; the consent and the account are
   checked again on every page), the budget of unattended reads, and the
-  register of withdrawals (session ids, account ids, validity dates and a
-  counter, never bank data; see "Answers after a withdrawal").
+  sessions ended through `endSession` (session ids only; see "Answers after a
+  withdrawal"). While a call runs, it also has a watch on its session
+  (account ids and a validity date, never bank data), removed when it ends.
 - **Fixed error codes.** An error result has `errorCode`, one of
   `enableBankingProblemCodes` (see [Error codes](#error-codes)), and
   `retryAfterSeconds` where a wait is recommended. Errors thrown by the
@@ -629,34 +630,40 @@ instead: a plain `Error` with an empty message and the stack `Error`.
 
 Every call asks Enable Banking for the session first, so what the host passes
 and what the bank holds now decide the call. Calls also run side by side in
-one gateway instance, so the instance keeps, in memory and for this purpose
-only, what it learns about a session from any request it makes about it (the
-check at the start of every call, every read of an account, `sessionStatus`,
-`completeSession` and `endSession`): a session ended through `endSession`, a
-consent Enable Banking says is over (a status other than `AUTHORIZED`, a
-validity date that has passed, or a request failing with an ended consent),
-an account it says has left the consent (a status that no longer lists it, or
-a read failing with `ACCOUNT_DOES_NOT_EXIST`), and the earliest validity date
-it was given. After a call's last await, with nothing awaited before it
-returns, its answer is checked against that and against the clock at that
-moment: when the validity date has passed, or anything was learned since the
-call began against its consent or against an account its answer may come from
-(the account named, or every account of the call for `list_accounts` and a
-search over all accounts), the call is refused with `consent_not_active` ("Refused:
-the bank consent was ended, or an account left it, while this call was being
-answered; ...") and no data. What a search learns itself about an account
-it then skipped does not count against it.
+one gateway instance, so each call carries a watch on its session:
 
-What is kept per session does not grow with use: whether it was ended here,
-the counter of the last word against the consent and against each account,
-the accounts a status listed (an account a later status leaves out has left)
-and the earliest validity date. A status that says what is already known
-changes nothing, so a session that is checked thousands of times is not
-refused for it. Records of at most 10 000 sessions are kept, the least
-recently changed dropped first. Dropping a record that held only what was in
-order refuses nothing; dropping one that held a word against a consent, an
-account or an earlier validity date refuses every call under way at that
-moment, and no call that begins after it.
+- The watch is made and registered on the session at the call's start,
+  before anything is awaited, with the accounts the call depends on (the
+  account it names, or every account of the call for `list_accounts` and a
+  search over all accounts). It lives exactly as long as the call and is
+  never dropped for room.
+- Every fact the instance learns about a session, from any request about it
+  (the check at the start of every call, every read of an account,
+  `sessionStatus`, `completeSession`, `endSession`), is put on every live
+  watch on that session as it arrives: a status other than `AUTHORIZED` (an
+  unknown one included), a validity date that has passed, or a request
+  failing with an ended consent refuses the call; a status that does not
+  list an account the call depends on, or a read of it failing with
+  `ACCOUNT_DOES_NOT_EXIST`, marks the account missing; every validity date
+  is kept if it is the earliest so far.
+- Nothing on a watch is cleared: a status that arrives later, even one
+  asked earlier, never lifts what the watch already holds, so the order in
+  which answers arrive does not matter.
+- After the call's last await, with nothing awaited before it returns, its
+  answer is checked against its own watch and the clock at that moment,
+  and nothing else. When the watch says so, or its earliest validity date
+  has passed, the call is refused with `consent_not_active` ("Refused: the
+  bank consent was ended, or an account left it, while this call was being
+  answered; ...") and no data. What a call's own check found missing about
+  an account it then does not read does not count against it.
+
+A call that starts later asks Enable Banking itself. The one thing kept
+beyond a call is the list of sessions ended through `endSession`, so that a
+call starting while a session is being ended is refused even if its own
+check reached Enable Banking first. At most `endedSessionsKept` (default
+10 000) are kept, the oldest dropped first, and never one whose `endSession`
+is still under way. Only session ids, account ids and validity dates are
+kept, never bank data.
 
 What the gateway cannot know, the host must say: a host that stores new
 credentials for a company (a new session) without calling `endSession` on the

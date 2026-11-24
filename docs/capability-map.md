@@ -308,9 +308,10 @@ Every answer with bank data is checked once more after the tool's last await (th
 before it is returned, in the one response path all tools share (`Bank.release`, called by the tool wrapper); a
 tool whose answer was not made for that check is refused; the consent's validity date (stored, or an earlier one
 Enable Banking gave since) is checked against the clock at that moment. The gateway does the same per instance:
-what any request about a session learns (a call's own check and reads, `sessionStatus`, `completeSession`,
-`endSession`) is checked against every other call after its last await, with the earliest validity date against
-the clock (`src/gateway/withdrawals.ts`), so an answer of a call under way does not outlive it.
+each call registers a watch on its session before it awaits anything; what any request about a session learns (a
+call's own check and reads, `sessionStatus`, `completeSession`, `endSession`) is put on every live watch on it and
+never cleared, and the call's final check reads only its own watch and the clock (`src/gateway/withdrawals.ts`), so
+an answer of a call under way does not outlive it, whatever order the answers arrive in.
 The gateway refuses a whole search when the bank says, for any of its accounts, that the consent is over. The rule and every way it learns that a consent is
 over are in the README ("Reads after a consent ended") and in `test/standalone-authority.test.ts`.
 

@@ -1,83 +1,107 @@
-// The gateway's register of withdrawals on its own: a record that does not grow with use, and dropping records under
-// pressure that refuses only the calls under way, and only when what was dropped held a word against them.
+// The watches of calls under way, on their own: every fact about a session is put on every live watch on it, in
+// whatever order the answers arrive, and nothing on a watch is ever cleared. Made-up ids only.
 import { describe, expect, it } from 'vitest';
 import type { SessionStatus } from '../src/enablebanking/api.js';
-import { MAX_TRACKED_SESSIONS, Withdrawals } from '../src/gateway/withdrawals.js';
+import { Withdrawals } from '../src/gateway/withdrawals.js';
 
 const NOW = Date.parse('2026-11-24T10:00:00Z');
 const A = 'account-a';
 const B = 'account-b';
-const authorised = (accounts: string[], until = '2027-05-01T00:00:00Z'): SessionStatus =>
-  ({ status: 'AUTHORIZED', accounts, access: { valid_until: until } }) as SessionStatus;
+const status = (accounts: string[], until = '2027-05-01T00:00:00Z', state = 'AUTHORIZED'): [SessionStatus, ReadonlySet<string>] => [
+  { status: state, accounts, access: { valid_until: until } } as SessionStatus,
+  new Set(accounts),
+];
+const tell = (register: Withdrawals, session: string, [answer, listed]: [SessionStatus, ReadonlySet<string>], now = NOW) =>
+  register.status(session, answer, now, listed);
 
-/** A call as the gateway makes one: begun, its own session check recorded, its accounts named. */
-function call(register: Withdrawals, session: string, accounts: string[] = [A]) {
-  const watch = register.begin(session);
-  watch.until = register.status(session, authorised([A, B]), NOW, new Set([A, B]));
-  watch.accounts = new Set(accounts);
-  return watch;
-}
-
-describe('the register of withdrawals', () => {
-  it('stays the same size however often an unchanged session is checked, and lets every call through', () => {
+describe('the watch of a call under way', () => {
+  it('lets a call through when every answer is in order, and leaves nothing behind when it ends', () => {
     const register = new Withdrawals();
     for (let i = 0; i < 1_000; i += 1) {
-      const watch = call(register, 'session-1');
-      register.status('session-1', authorised([A, B]), NOW, new Set([A, B]));
-      expect(register.stands(watch, NOW), `call ${i + 1}`).toBe(true);
+      const watch = register.begin('s1', [A]);
+      tell(register, 's1', status([A, B]));
+      expect(register.stands(watch, NOW)).toBe(true);
+      register.done(watch);
     }
-    expect(register.size).toBe(1);
+    expect(register.size).toEqual({ live: 0, ended: 0 });
   });
 
-  it('refuses a call under way for its account, not for another, when a status leaves the account out', () => {
+  it('keeps an account missing when a later answer, arriving after, still lists it (the order does not matter)', () => {
     const register = new Withdrawals();
-    const onA = call(register, 'session-1', [A]);
-    const onB = call(register, 'session-1', [B]);
-    register.status('session-1', authorised([B]), NOW, new Set([B]));
-    expect(register.stands(onA, NOW)).toBe(false);
-    expect(register.stands(onB, NOW)).toBe(true);
-    // The account comes back: a call that begins now is let through.
-    register.status('session-1', authorised([A, B]), NOW, new Set([A, B]));
-    expect(register.stands(call(register, 'session-1', [A]), NOW)).toBe(true);
+    const watch = register.begin('s1', [A]);
+    // A newer status without A arrives first; the call's own, older status with A arrives after it.
+    tell(register, 's1', status([B]));
+    tell(register, 's1', status([A, B]));
+    expect(register.stands(watch, NOW)).toBe(false);
   });
 
-  it('refuses a call under way when its validity date, or an earlier one learned since, passes before it returns', () => {
+  it('marks an account missing for a call that has not had its first answer yet', () => {
     const register = new Withdrawals();
-    const watch = register.begin('session-1');
-    watch.until = register.status('session-1', authorised([A], new Date(NOW + 1_000).toISOString()), NOW, new Set([A]));
-    watch.accounts = new Set([A]);
+    const watch = register.begin('s1', [A]);
+    tell(register, 's1', status([B]));
+    expect(watch.missing.has(A)).toBe(true);
+    expect(register.stands(watch, NOW)).toBe(false);
+  });
+
+  it('refuses for a word against the consent, whichever comes later', () => {
+    for (const negative of [status([A], undefined, 'REVOKED'), status([A], undefined, 'SOMETHING_NEW'), status([A], '2026-11-24T09:00:00Z')]) {
+      const register = new Withdrawals();
+      const watch = register.begin('s1', [A]);
+      tell(register, 's1', negative);
+      tell(register, 's1', status([A]));
+      expect(register.stands(watch, NOW)).toBe(false);
+    }
+    const register = new Withdrawals();
+    const watch = register.begin('s1', [A]);
+    register.failed('s1', 'consent_revoked');
+    expect(register.stands(watch, NOW)).toBe(false);
+  });
+
+  it('keeps the earliest validity date it has seen, and checks it against the clock at the end', () => {
+    const register = new Withdrawals();
+    const watch = register.begin('s1', [A]);
+    tell(register, 's1', status([A], new Date(NOW + 1_000).toISOString()));
+    tell(register, 's1', status([A], new Date(NOW + 60_000).toISOString()));
     expect(register.stands(watch, NOW + 999)).toBe(true);
     expect(register.stands(watch, NOW + 1_000)).toBe(false);
-
-    const other = call(register, 'session-2');
-    register.status('session-2', authorised([A, B], new Date(NOW + 500).toISOString()), NOW, new Set([A, B]));
-    expect(register.stands(other, NOW + 400)).toBe(true);
-    expect(register.stands(other, NOW + 600)).toBe(false);
   });
 
-  it('drops records of sessions in order without refusing anything under way', () => {
+  it('counts a missing account only for the calls that depend on it, and not for the call that found it itself', () => {
     const register = new Withdrawals();
-    const watch = call(register, 'busy');
-    for (let i = 0; i <= MAX_TRACKED_SESSIONS; i += 1) register.status(`quiet-${i}`, authorised([A]), NOW, new Set([A]));
-    expect(register.size).toBe(MAX_TRACKED_SESSIONS);
-    expect(register.stands(watch, NOW)).toBe(true);
+    const onA = register.begin('s1', [A]);
+    const onB = register.begin('s1', [B]);
+    const search = register.begin('s1', [A, B]);
+    register.failed('s1', 'account_not_in_consent', A, search);
+    expect(register.stands(onA, NOW)).toBe(false);
+    expect(register.stands(onB, NOW)).toBe(true);
+    expect(register.stands(search, NOW)).toBe(true);
   });
 
-  it('refuses the calls under way, and only those, when a dropped record held a word against a consent', () => {
-    const register = new Withdrawals();
-    const underWay = call(register, 'busy');
-    register.failed('revoked', 'consent_revoked');
-    for (let i = 0; i < MAX_TRACKED_SESSIONS; i += 1) register.status(`quiet-${i}`, authorised([A]), NOW, new Set([A]));
-    // The revoked session's record was the oldest and is gone: what it said could concern a call under way.
-    expect(register.size).toBe(MAX_TRACKED_SESSIONS);
+  it('refuses calls under way and calls that start while a session is ended, and drops old ended sessions only when done', () => {
+    const register = new Withdrawals(2);
+    const underWay = register.begin('s1', [A]);
+    register.ending('s1');
     expect(register.stands(underWay, NOW)).toBe(false);
-    // A call that begins after the drop asks Enable Banking itself and is not refused for it.
-    expect(register.stands(call(register, 'busy'), NOW)).toBe(true);
+    expect(register.stands(register.begin('s1', [A]), NOW)).toBe(false);
+    // Three more sessions are ended; s1's endSession is still under way, so it is kept.
+    for (const id of ['s2', 's3', 's4']) {
+      register.ending(id);
+      register.endingDone(id);
+    }
+    expect(register.stands(register.begin('s1', [A]), NOW)).toBe(false);
+    register.endingDone('s1');
+    expect(register.size.ended).toBeLessThanOrEqual(2);
   });
 
-  it('keeps a session ended here ended for as long as its record is held', () => {
-    const register = new Withdrawals();
-    register.end('ended');
-    expect(register.stands(call(register, 'ended'), NOW)).toBe(false);
+  it('does not depend on anything but the call: other sessions do not touch its watch', () => {
+    const register = new Withdrawals(1);
+    const watch = register.begin('s1', [A]);
+    tell(register, 's1', status([A], new Date(NOW + 1_000).toISOString()));
+    for (let i = 0; i < 10_000; i += 1) {
+      register.ending(`other-${i}`);
+      register.endingDone(`other-${i}`);
+    }
+    expect(register.stands(watch, NOW + 2_000)).toBe(false);
+    expect(register.stands(watch, NOW + 500)).toBe(true);
   });
 });

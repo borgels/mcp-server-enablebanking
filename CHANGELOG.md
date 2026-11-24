@@ -112,8 +112,11 @@ Gateway (`mcp-server-enablebanking/gateway`), every change to the surface:
   depends on it, checked after the call's last await (refused with `consent_not_active`). After
   `endSession` the instance reads nothing more under that session. Every request about a session feeds this,
   `sessionStatus` and `completeSession` included, and the validity date Enable Banking gave is checked against the
-  clock when the answer is returned. The record of a session does not grow with use, and a host that replaces a
-  session without `endSession`, or passes fewer `accountIds`, does not stop calls already under way (README).
+  clock when the answer is returned. Each call holds a watch on its session, registered before it awaits
+  anything; every fact about the session is put on every live watch and never cleared, whatever order the answers
+  arrive in, and the final check reads only the call's own watch and the clock. Only the sessions ended here are
+  kept beyond a call (`endedSessionsKept`, default 10 000). A host that replaces a session without `endSession`, or
+  passes fewer `accountIds`, does not stop calls already under way (README).
 - `GatewayToolResult`: `errorCode` on every error result and `retryAfterSeconds` where a wait is recommended. The
   fixed error texts of 0.6.x are unchanged.
 - `list_accounts`: adds `source` (`consent`, `bank` or `mixed`), `consent` (status, `validUntil`, `expiresInDays`,

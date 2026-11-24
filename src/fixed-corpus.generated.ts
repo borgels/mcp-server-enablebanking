@@ -690,6 +690,7 @@ export const FIXED_CORPUS: readonly string[] = [
   "enablebanking_start_consent",
   "enablebanking_summarize_transactions",
   "endSession: sessionId is missing or malformed.",
+  "endedSessionsKept",
   "entities/decode",
   "error_description",
   "errors",

@@ -2,175 +2,150 @@ import type { SessionStatus } from '../enablebanking/api.js';
 import type { ProblemCode } from '../enablebanking/problems.js';
 
 /**
- * What one gateway instance has learned, while calls run, that can make an
- * answer of a call under way invalid:
- * - a session ended through endSession;
- * - a consent Enable Banking says is over: a session status other than
- *   AUTHORIZED, a validity date that has passed, or a request about the
- *   session or one of its accounts failing with an ended consent;
- * - an account that has left the consent: a session status that no longer
- *   lists an account an earlier status listed, or a read of it failing with
- *   ACCOUNT_DOES_NOT_EXIST;
- * - when the consent runs out: the earliest validity date any answer about the
- *   session gave.
- * Every request this instance makes about a session feeds it: the session
- * check at the start of every call, every read of an account, and the consent
- * helpers sessionStatus, completeSession and endSession.
+ * What can make the answer of a call under way invalid, kept on the call
+ * itself.
  *
- * Calls run side by side; each call notes where the clock stood when it began
- * (`begin`) and the validity date its own session check gave, and its answer
- * is returned only when, checked synchronously after the call's last await and
- * against the time of that check, nothing negative was learned since against
- * its consent or an account its answer may come from, and no known validity
- * date has passed (`stands`). What the call learned itself about an account it
- * then did not read (a search that skips it) does not count against it.
+ * Every call makes a watch at its start, synchronously, before anything is
+ * awaited, and registers it on its session id with the accounts it depends
+ * on. The watch lives exactly as long as the call (the call holds it and
+ * removes it when it ends) and is never dropped for room. Every fact this
+ * instance learns about a session, from any request about it, is pushed to
+ * every live watch on that session at the moment it arrives:
+ * - a status other than AUTHORIZED (an unknown one included), a validity date
+ *   that has passed, a request failing with an ended consent, endSession: the
+ *   watch is refused;
+ * - a status that does not list an account the watch depends on, or a read of
+ *   that account failing with ACCOUNT_DOES_NOT_EXIST: the account is marked
+ *   missing on the watch;
+ * - any validity date: the watch keeps the earliest it has seen.
+ * Nothing on a watch is ever cleared: a status that arrives later and says all
+ * is well does not lift a fact the watch already holds, whatever order the
+ * answers arrive in. The final check of a call (`stands`) is synchronous,
+ * after the call's last await, and reads only its own watch and the clock.
  *
- * The record of a session does not grow with use: a status that says the
- * same as before changes nothing. It holds, per session, whether it was ended
- * here, the counter of the last word against the consent, the counter of the
- * last word against each account, the accounts any status listed, and the
- * earliest validity date. Nothing of the bank's answers is kept here.
+ * A call that starts later asks Enable Banking itself, so nothing else is
+ * needed for it, with one exception: a session ended through endSession is
+ * kept in a bounded list, so that a call starting while (or after) the
+ * session is being ended is refused even when its own check reached Enable
+ * Banking before the end did. An entry is never dropped while its endSession
+ * is under way; at most `maxEnded` other entries are kept, the oldest dropped
+ * first (by then Enable Banking itself says the session is closed).
  *
- * At most MAX_TRACKED_SESSIONS sessions are held, the least recently changed
- * dropped first. Dropping a record that holds only what was in order loses
- * nothing a call depends on (each call has its own session check). Dropping
- * one that holds a word against the consent, an account or an earlier date
- * refuses every call that began before it was dropped; calls that begin
- * afterwards ask Enable Banking themselves.
+ * Nothing of the bank's answers is kept: only session ids, account ids and
+ * dates of validity, and only while a call that depends on them runs.
  */
-export const MAX_TRACKED_SESSIONS = 10_000;
-/** Accounts remembered per session; a session listing more counts as a word against its consent (fail closed). */
-const MAX_KNOWN_ACCOUNTS = 1_000;
+export const DEFAULT_ENDED_SESSIONS_KEPT = 10_000;
 
 /** What a request failing with these says: the consent itself is over. */
 const CONSENT_OVER: ReadonlySet<ProblemCode> = new Set<ProblemCode>(['consent_expired', 'consent_revoked', 'consent_not_active']);
 
-interface Learned {
-  /** Ended here by endSession: never read again in this instance. */
-  ended: boolean;
-  /** The counter of the last word against the whole consent; 0: none. */
-  consent: number;
-  /** The counter of the last word against each account. */
-  accounts: Map<string, number>;
-  /** Every account a status of the session listed: one a later status leaves out has left the consent. */
-  known: Set<string>;
-  /** The earliest validity date any answer about the session gave (ms), or NaN. */
-  until: number;
-  /** Whether an answer gave an earlier validity date than one before it: a word against the calls under way. */
-  lowered: boolean;
-}
-
-/** One call's view: when it began, which accounts its answer may come from, and what it learned itself. */
+/** One call's watch on its session. */
 export interface CallWatch {
   readonly session: string;
-  readonly at: number;
-  /** The accounts the answer may come from; undefined: every account of the session. */
-  accounts?: ReadonlySet<string>;
-  /** Accounts this call itself learned had left the consent (and so did not read). */
+  /** The accounts the answer may come from. Narrowed (never widened) once the call is read. */
+  accounts: ReadonlySet<string>;
+  /** A word against the consent arrived while the call ran (or the session was ended here). Never cleared. */
+  refused: boolean;
+  /** Accounts the call depends on that some answer said have left the consent. Never cleared. */
+  readonly missing: Set<string>;
+  /** Accounts the call's own session check found missing: it does not read them, so they do not count against it. */
   readonly own: Set<string>;
-  /** The validity date the call's own session check gave (ms), or NaN. */
+  /** The earliest validity date any answer about the session gave while the call ran (ms), or NaN. */
   until: number;
 }
 
 export class Withdrawals {
-  private clock = 0;
-  /** Calls that began before this were under way when a record with a word against it was dropped: refused. */
-  private floor = 0;
-  private readonly sessions = new Map<string, Learned>();
+  /** Live watches by session id. A watch is here from the call's start to its end, and only then. */
+  private readonly live = new Map<string, Set<CallWatch>>();
+  /** Sessions ended here, oldest first; the value is how many endSession calls for it are under way. */
+  private readonly ended = new Map<string, number>();
 
-  begin(session: string): CallWatch {
-    return { session, at: this.clock, own: new Set(), until: Number.NaN };
+  constructor(private readonly maxEnded = DEFAULT_ENDED_SESSIONS_KEPT) {}
+
+  /** A watch for a call that starts now. Call synchronously, before the call awaits anything; `done` it in a finally. */
+  begin(session: string, accounts: Iterable<string>): CallWatch {
+    const watch: CallWatch = { session, accounts: new Set(accounts), refused: this.ended.has(session), missing: new Set(), own: new Set(), until: Number.NaN };
+    let watches = this.live.get(session);
+    if (!watches) {
+      watches = new Set();
+      this.live.set(session, watches);
+    }
+    watches.add(watch);
+    return watch;
   }
 
-  /** The session was ended here: no answer read under it is returned any more by this instance. */
-  end(session: string): void {
-    const learned = this.entry(session);
-    learned.ended = true;
-    learned.consent = ++this.clock;
+  /** The call has ended: its watch is removed. */
+  done(watch: CallWatch): void {
+    const watches = this.live.get(watch.session);
+    if (!watches) return;
+    watches.delete(watch);
+    if (watches.size === 0) this.live.delete(watch.session);
+  }
+
+  /** endSession has started for the session: every call under way is refused, and every call that starts while it is kept. */
+  ending(session: string): void {
+    for (const watch of this.watches(session)) watch.refused = true;
+    this.ended.delete(session);
+    this.ended.set(session, (this.ended.get(session) ?? 0) + 1);
+  }
+
+  /** endSession has finished (or failed): its entry may now be dropped for room. */
+  endingDone(session: string): void {
+    const running = this.ended.get(session);
+    if (running !== undefined && running > 0) this.ended.set(session, running - 1);
+    // The oldest entries without an endSession under way go first.
+    for (const [id, under] of this.ended) {
+      if (this.ended.size <= this.maxEnded) break;
+      if (under === 0) this.ended.delete(id);
+    }
   }
 
   /**
-   * Acts on a failed request about a session: an ended consent is a word against it; a missing account (for a read
-   * of one account) a word against that account, which the call that learned it (`watch`) does not hold against itself.
+   * A request about the session failed: an ended consent refuses every call under way on it; a missing account (for
+   * a read of one account) marks it missing on every call under way that depends on it, except the one that asked
+   * (`watch`), which does not read it further.
    */
   failed(session: string, problem: ProblemCode | undefined, account?: string, watch?: CallWatch): void {
     if (problem === undefined) return;
     if (CONSENT_OVER.has(problem) || (problem === 'account_not_in_consent' && account === undefined)) {
-      this.entry(session).consent = ++this.clock;
+      for (const live of this.watches(session)) live.refused = true;
     } else if (problem === 'account_not_in_consent' && account !== undefined) {
-      this.entry(session).accounts.set(account, ++this.clock);
       watch?.own.add(account);
+      for (const live of this.watches(session)) if (live.accounts.has(account)) live.missing.add(account);
     }
   }
 
   /**
-   * Acts on a session status from Enable Banking, whoever asked: not AUTHORIZED, or a validity date that has passed
-   * (at `now`), is a word against the consent; an account an earlier status listed and this one does not has left;
-   * the earliest validity date is the latest moment any answer may be returned. A status that says what the record
-   * already holds changes nothing. Returns the status's validity date (ms), or NaN.
+   * A session status from Enable Banking, whoever asked, in whatever order it arrives: not AUTHORIZED, or a validity
+   * date that has passed at `now`, refuses every call under way on the session; an account a call depends on that it
+   * does not list is missing for that call; every call keeps the earliest validity date. Returns that date (ms) or NaN.
    */
   status(session: string, status: SessionStatus | undefined, now: number, listed: ReadonlySet<string>): number {
-    const learned = this.entry(session);
     const until = typeof status?.access?.valid_until === 'string' ? Date.parse(status.access.valid_until) : Number.NaN;
-    if (!Number.isNaN(until)) {
-      if (Number.isNaN(learned.until)) learned.until = until;
-      else if (until < learned.until) {
-        learned.until = until;
-        learned.lowered = true;
-      }
-    }
-    if (status?.status !== 'AUTHORIZED' || (!Number.isNaN(until) && until <= now)) {
-      learned.consent = ++this.clock;
-      return until;
-    }
-    for (const account of learned.known) if (!listed.has(account)) learned.accounts.set(account, ++this.clock);
-    for (const account of listed) {
-      if (learned.known.size >= MAX_KNOWN_ACCOUNTS && !learned.known.has(account)) {
-        learned.consent = ++this.clock;
-        break;
-      }
-      learned.known.add(account);
+    const over = status?.status !== 'AUTHORIZED' || (!Number.isNaN(until) && until <= now);
+    for (const watch of this.watches(session)) {
+      if (!Number.isNaN(until) && !(watch.until <= until)) watch.until = until;
+      if (over) watch.refused = true;
+      for (const account of watch.accounts) if (!listed.has(account)) watch.missing.add(account);
     }
     return until;
   }
 
-  /** Whether an answer of the call may be returned now. Synchronous: called after the call's last await, at `now`. */
+  /** Whether the call's answer may be returned now. Synchronous, after the call's last await: its own watch and the clock. */
   stands(watch: CallWatch, now: number): boolean {
-    if (watch.at < this.floor) return false;
-    if (watch.until <= now) return false;
-    const learned = this.sessions.get(watch.session);
-    if (!learned) return true;
-    if (learned.ended || learned.consent > watch.at || learned.until <= now) return false;
-    for (const [account, at] of learned.accounts) {
-      if (at <= watch.at || watch.own.has(account)) continue;
-      if (watch.accounts === undefined || watch.accounts.has(account)) return false;
-    }
+    if (watch.refused || watch.until <= now) return false;
+    for (const account of watch.missing) if (watch.accounts.has(account) && !watch.own.has(account)) return false;
     return true;
   }
 
-  /** How many sessions are on record (for tests). */
-  get size(): number {
-    return this.sessions.size;
+  /** Live watches and kept ended sessions (for tests). */
+  get size(): { live: number; ended: number } {
+    let live = 0;
+    for (const watches of this.live.values()) live += watches.size;
+    return { live, ended: this.ended.size };
   }
 
-  private entry(session: string): Learned {
-    let learned = this.sessions.get(session);
-    if (learned) {
-      // The most recently changed last, so the least recently changed is dropped first.
-      this.sessions.delete(session);
-    } else {
-      learned = { ended: false, consent: 0, accounts: new Map(), known: new Set(), until: Number.NaN, lowered: false };
-    }
-    this.sessions.set(session, learned);
-    while (this.sessions.size > MAX_TRACKED_SESSIONS) {
-      const [oldest, record] = this.sessions.entries().next().value as [string, Learned];
-      this.sessions.delete(oldest);
-      if (record.ended || record.consent > 0 || record.accounts.size > 0 || record.lowered) {
-        // A word against a call under way is lost: every call begun up to now is refused; calls begun later are not.
-        this.clock += 1;
-        this.floor = this.clock;
-      }
-    }
-    return learned;
+  private watches(session: string): Iterable<CallWatch> {
+    return this.live.get(session) ?? [];
   }
 }
