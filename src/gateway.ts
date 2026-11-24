@@ -508,8 +508,8 @@ function buildEnableBankingGateway(options: EnableBankingGatewayOptions) {
         result = errorResult(callRedactor.message(error), failureMetadata(error), problemOf(error) ?? 'upstream_error');
       }
       // After the call's last await, and nothing awaited from here to the return: an answer read under a consent that
-      // was ended, or from an account that left it, while the call ran (at any await) does not leave.
-      if (watch && result.isError !== true && !withdrawals.stands(watch)) {
+      // was ended or ran out, or from an account that left it, while the call ran (at any await) does not leave.
+      if (watch && result.isError !== true && !withdrawals.stands(watch, now())) {
         result = errorResult(WITHDRAWN_MEANWHILE, undefined, 'consent_not_active');
       }
       // Every result, refusals and errors included, through the call's redactor, and then the sink check as the very
@@ -651,6 +651,13 @@ function buildEnableBankingGateway(options: EnableBankingGatewayOptions) {
           throw released(refusal(SESSION_REFUSED, sessionId, keyContent), check, fallback);
         }
         const rawAccounts = Array.isArray(session?.accounts) ? session.accounts : [];
+        // Its validity date and accounts, for the calls that will run under it.
+        withdrawals.status(
+          sessionId,
+          { status: 'AUTHORIZED', access: session?.access, accounts: rawAccounts.map(account => account?.uid).filter((uid): uid is string => typeof uid === 'string') },
+          now(),
+          new Set(rawAccounts.map(account => account?.uid).filter((uid): uid is string => typeof uid === 'string')),
+        );
         const accounts: ConsentAccount[] = [];
         let accountsWithoutId = 0;
         for (const account of rawAccounts) {
@@ -678,7 +685,12 @@ function buildEnableBankingGateway(options: EnableBankingGatewayOptions) {
       const sessionId = input && typeof input === 'object' ? input.sessionId : undefined;
       return helper([typeof sessionId === 'string' ? sessionId : undefined], async () => {
         if (typeof sessionId !== 'string' || !ID_PATTERN.test(sessionId)) throw new Error('sessionStatus: sessionId is missing or malformed.');
-        const session = await client.getSession(sessionId);
+        // What Enable Banking says here counts for every call under way under the session, as on a call's own check.
+        const session = await client.getSession(sessionId).catch((error: unknown) => {
+          withdrawals.failed(sessionId, problemOf(error));
+          throw error;
+        });
+        withdrawals.status(sessionId, session, now(), sessionAccounts(session));
         return {
           status: typeof session?.status === 'string' && SESSION_STATUSES.has(session.status) ? session.status : null,
           validUntil: instant(session?.access?.valid_until),
@@ -756,7 +768,7 @@ function buildEnableBankingGateway(options: EnableBankingGatewayOptions) {
     if (named.some(account => !credentials.accountIds.has(account))) return errorResult(NOT_ALLOWED, undefined, 'account_not_connected');
     // The accounts the answer may come from: those named, else every account of the call.
     if (watch) watch.accounts = new Set(named.length > 0 ? named : credentials.accountIds.keys());
-    const learn = (problem: ProblemCode | undefined, account?: string) => withdrawals.learn(watch, problem, account);
+    const learn = (problem: ProblemCode | undefined, account?: string) => withdrawals.failed(credentials.sessionId, problem, account, watch);
 
     // Who is behind the call, before anything is sent: a malformed answer is refused, never read as "nobody".
     if (presence.kind === 'refused') return errorResult(presence.reason, undefined, 'presence_incomplete');
@@ -768,13 +780,14 @@ function buildEnableBankingGateway(options: EnableBankingGatewayOptions) {
       learn(problemOf(error));
       throw error;
     });
+    // What the status says counts for every call under way: an ended consent, the accounts it still lists, and when
+    // it runs out (checked again when the answer of this call is returned).
+    withdrawals.status(credentials.sessionId, session, now(), sessionAccounts(session));
     const consent = consentState(session, now());
-    if (!consent.ok) {
-      learn(consent.code);
-      return errorResult(consent.reason, undefined, consent.code);
-    }
-    // Accounts of the call the session no longer lists have left the consent: also for calls running beside this one.
-    withdrawals.left(watch, [...credentials.accountIds.keys()].filter(account => !consent.accounts.has(account)));
+    if (!consent.ok) return errorResult(consent.reason, undefined, consent.code);
+    // Accounts of the call the session no longer lists are not read by it: what this status says of them is not
+    // held against its own answer.
+    for (const account of credentials.accountIds.keys()) if (!consent.accounts.has(account)) watch?.own.add(account);
     if (named.some(account => !consent.accounts.has(account))) return errorResult(NOT_IN_CONSENT, undefined, 'account_not_in_consent');
 
     let start: PageState | undefined;

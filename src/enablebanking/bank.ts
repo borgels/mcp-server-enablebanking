@@ -165,6 +165,8 @@ export class Bank {
   private readonly lostConsents = new Map<string, ProblemCode>();
   /** Accounts (by the bank's uid) that have left their consent, with why. */
   private readonly lostAccounts = new Map<string, ProblemCode>();
+  /** The earliest validity date Enable Banking gave for each consent (by session id), when earlier than the stored one. */
+  private readonly deadlines = new Map<string, number>();
   /** The version of each consent's binding (by session id): raised by every withdrawal, refresh, replacement and revocation. */
   private readonly versions = new Map<string, number>();
   private readonly budget: UnattendedBudget;
@@ -255,6 +257,15 @@ export class Bank {
   /** Throws when this server has learned that the consent is over or that the account has left it. */
   private standing(link: LinkedAccount): void {
     const { account, session } = link;
+    // A validity date Enable Banking gave after the consent was stored, checked against the clock now.
+    const until = this.deadlines.get(session.sessionId);
+    if (until !== undefined && until <= this.now()) {
+      throw new ConsentError(
+        `The ${session.aspsp.name} consent for ${this.companyInfo().name} expired on ${new Date(until).toISOString().slice(0, 10)}. ` +
+          'An administrator must renew it with enablebanking_start_consent (the bank\u2019s own sign-in).',
+        'consent_expired',
+      );
+    }
     const lost = this.lostConsents.get(session.sessionId);
     if (lost) {
       throw new ConsentError(
@@ -870,6 +881,8 @@ export class Bank {
   private learn(session: StoredSession, status: SessionStatus | undefined, now: number, lift: boolean): ProblemCode | undefined {
     const state = typeof status?.status === 'string' ? status.status : undefined;
     const until = typeof status?.access?.valid_until === 'string' ? Date.parse(status.access.valid_until) : Number.NaN;
+    // The validity date counts from now on, at every check: the earliest one given is kept.
+    if (!Number.isNaN(until) && !((this.deadlines.get(session.sessionId) ?? Number.POSITIVE_INFINITY) <= until)) this.deadlines.set(session.sessionId, until);
     const problem = state !== 'AUTHORIZED' ? problemFromSessionStatus(state) : until <= now ? 'consent_expired' : undefined;
     if (problem) {
       this.withdraw(session, problem);

@@ -18,6 +18,9 @@ const json = (body: unknown, status = 200) => new Response(JSON.stringify(body),
 /** A fake Enable Banking whose reads of one account can be held until let go, and that can fail reads. */
 function bank() {
   let sessionAccounts = [ACCOUNT_A, ACCOUNT_B];
+  let sessionStatus = 'AUTHORIZED';
+  let validUntil = '2027-05-01T00:00:00Z';
+  let sessionFailure: string | undefined;
   const failing = new Map<string, string>();
   let holding: string | undefined;
   let reached: (() => void) | undefined;
@@ -26,7 +29,8 @@ function bank() {
     const url = new URL(String(input));
     if (/^\/sessions\/[^/]+$/.test(url.pathname)) {
       if ((init?.method ?? 'GET') === 'DELETE') return json({});
-      return json({ status: 'AUTHORIZED', accounts: sessionAccounts, access: { valid_until: '2027-05-01T00:00:00Z' } });
+      if (sessionFailure) return json({ error: sessionFailure }, 401);
+      return json({ status: sessionStatus, accounts: sessionAccounts, access: { valid_until: validUntil } });
     }
     const match = /^\/accounts\/([^/]+)\/(details|balances|transactions)(?:\/[^/]+)?$/.exec(url.pathname);
     if (!match) return json({ error: 'NOT_FOUND' }, 404);
@@ -69,11 +73,18 @@ function bank() {
     setSessionAccounts: (accounts: string[]) => {
       sessionAccounts = accounts;
     },
+    setSession: (status: string, until = validUntil) => {
+      sessionStatus = status;
+      validUntil = until;
+    },
+    failSession: (error: string) => {
+      sessionFailure = error;
+    },
   };
 }
 
-const gateway = (fetchImpl: typeof fetch) =>
-  createEnableBankingGateway({ applicationId: 'app-0000-test', privateKey: PEM, apiBaseUrl: 'https://eb.test', fetchImpl, now: () => NOW });
+const gateway = (fetchImpl: typeof fetch, now: () => number = () => NOW) =>
+  createEnableBankingGateway({ applicationId: 'app-0000-test', privateKey: PEM, apiBaseUrl: 'https://eb.test', fetchImpl, now });
 const context: GatewayCallContext = { credentials: { sessionId: SESSION, accountIds: [ACCOUNT_A, ACCOUNT_B] } };
 
 /** Every gateway tool, each reading account A (list_accounts and a search read both, A first). */
@@ -171,6 +182,75 @@ describe('a gateway answer, checked after the call’s last await', () => {
       { account: ACCOUNT_B, read: false },
     ]);
     expect(found.transactions.map(line => line.account)).toEqual([ACCOUNT_A]);
+  });
+
+  it.each([
+    ['REVOKED', (fake: ReturnType<typeof bank>) => fake.setSession('REVOKED')],
+    ['EXPIRED', (fake: ReturnType<typeof bank>) => fake.setSession('EXPIRED')],
+    ['CLOSED', (fake: ReturnType<typeof bank>) => fake.setSession('CLOSED')],
+    ['an unknown status', (fake: ReturnType<typeof bank>) => fake.setSession('SOMETHING_NEW')],
+    ['a validity date that has passed', (fake: ReturnType<typeof bank>) => fake.setSession('AUTHORIZED', '2026-11-24T09:00:00Z')],
+    ['REVOKED_SESSION as an error', (fake: ReturnType<typeof bank>) => fake.failSession('REVOKED_SESSION')],
+    ['EXPIRED_SESSION as an error', (fake: ReturnType<typeof bank>) => fake.failSession('EXPIRED_SESSION')],
+    ['the session no longer listing the account', (fake: ReturnType<typeof bank>) => fake.setSessionAccounts([ACCOUNT_B])],
+  ])('returns nothing when sessionStatus learns %s while the bank is read', async (_, change) => {
+    for (const [tool, input] of TOOLS) {
+      const fake = bank();
+      const gw = gateway(fake.fetchImpl);
+      const held = fake.hold(ACCOUNT_A);
+      const call = gw.callTool(tool, input as never, context);
+      await held;
+      change(fake);
+      // The host's renewal reminder asks for the session's status while the read is held.
+      await gw.sessionStatus({ sessionId: SESSION }).catch(() => undefined);
+      fake.letGo();
+      const result = await call;
+      if (tool === 'search_transactions' || tool === 'list_accounts') {
+        // A call that goes on to account B may be told by the bank itself; nothing of either account comes back.
+        expect(result.isError, tool).toBe(true);
+        expect(JSON.stringify(result), tool).not.toMatch(/Alpha|Beta|5\.00|10\.00/);
+      } else {
+        refused(result);
+      }
+    }
+  });
+
+  it('keeps an answer when sessionStatus finds the session in order', async () => {
+    const fake = bank();
+    const gw = gateway(fake.fetchImpl);
+    const held = fake.hold(ACCOUNT_A);
+    const call = gw.callTool('get_balances', { account: ACCOUNT_A }, context);
+    await held;
+    expect((await gw.sessionStatus({ sessionId: SESSION })).status).toBe('AUTHORIZED');
+    fake.letGo();
+    expect((await call).isError).toBeUndefined();
+  });
+
+  it.each(TOOLS)('%s returns nothing when the consent runs out while the bank is read (checked against the clock at return)', async (tool, input) => {
+    const fake = bank();
+    // Authorised, and valid for one more second when the call starts.
+    fake.setSession('AUTHORIZED', new Date(NOW + 1_000).toISOString());
+    let clock = NOW;
+    const gw = gateway(fake.fetchImpl, () => clock);
+    const held = fake.hold(ACCOUNT_A);
+    const call = gw.callTool(tool, input as never, context);
+    await held;
+    clock = NOW + 2_000;
+    fake.letGo();
+    refused(await call);
+  });
+
+  it('keeps an answer returned before the consent runs out', async () => {
+    const fake = bank();
+    fake.setSession('AUTHORIZED', new Date(NOW + 1_000).toISOString());
+    let clock = NOW;
+    const gw = gateway(fake.fetchImpl, () => clock);
+    const held = fake.hold(ACCOUNT_A);
+    const call = gw.callTool('get_balances', { account: ACCOUNT_A }, context);
+    await held;
+    clock = NOW + 999;
+    fake.letGo();
+    expect((await call).isError).toBeUndefined();
   });
 
   it('reads nothing back under a session ended here, even while Enable Banking still says it is authorised', async () => {

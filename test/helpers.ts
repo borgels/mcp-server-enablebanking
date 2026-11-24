@@ -57,6 +57,8 @@ export function fakeApi(overrides: Partial<Record<string, (call: FakeCall) => un
   const calls: FakeCall[] = [];
   const deleted: string[] = [];
   let sessionCounter = 0;
+  let sessionValidUntil = '2099-01-01T00:00:00Z';
+  let sessionStatus = 'AUTHORIZED';
   let sessionAccounts = [
     { uid: 'uid-aaa-drift', account_id: { iban: IBAN.aaaDrift }, name: 'Drift', currency: 'DKK' },
     { uid: 'uid-bbb-drift', account_id: { iban: IBAN.bbbDrift }, name: 'Beta drift', currency: 'DKK' },
@@ -90,7 +92,7 @@ export function fakeApi(overrides: Partial<Record<string, (call: FakeCall) => un
       deleted.push(url.pathname.split('/')[2]!);
       payload = {};
     } else if (route.startsWith('GET /sessions/')) {
-      payload = { status: 'AUTHORIZED', accounts: sessionAccounts.map(a => a.uid), access: { valid_until: '2099-01-01T00:00:00Z' } };
+      payload = { status: sessionStatus, accounts: sessionAccounts.map(a => a.uid), access: { valid_until: sessionValidUntil } };
     } else if (/^GET \/accounts\/[^/]+\/details$/.test(route)) {
       const uid = url.pathname.split('/')[2];
       payload = sessionAccounts.find(a => a.uid === uid);
@@ -118,6 +120,14 @@ export function fakeApi(overrides: Partial<Record<string, (call: FakeCall) => un
     fetch: fetchImpl,
     setSessionAccounts(accounts: typeof sessionAccounts) {
       sessionAccounts = accounts;
+    },
+    /** The validity date GET /sessions/{id} answers with. */
+    setSessionValidUntil(until: string) {
+      sessionValidUntil = until;
+    },
+    /** The status GET /sessions/{id} answers with. */
+    setSessionStatus(status: string) {
+      sessionStatus = status;
     },
   };
 }

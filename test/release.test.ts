@@ -59,8 +59,11 @@ function gate() {
   };
 }
 
-async function setup(accounts = BOTH) {
+async function setup(accounts = BOTH, options: { now?: () => number; validUntil?: string } = {}) {
   const api = fakeApi({
+    ...(options.validUntil
+      ? { 'POST /sessions': () => ({ session_id: 's1', accounts, access: { valid_until: options.validUntil } }) }
+      : {}),
     'GET /accounts/[^/]+/transactions/[^/]+': () => ({
       transaction_id: 'id-1',
       transaction_amount: { amount: '5.00', currency: 'DKK' },
@@ -69,7 +72,7 @@ async function setup(accounts = BOTH) {
     }),
   });
   api.setSessionAccounts(accounts);
-  const { bank } = makeBank({ api });
+  const { bank } = makeBank({ api, ...(options.now ? { now: options.now } : {}) });
   await bank.completeConsent({ user: 'anna@example.com', redirectUrl: (await linkConsent(bank, api)).redirect });
   const audit = gate();
   const server = new McpServer({ name: 'test', version: '1' });
@@ -165,6 +168,61 @@ describe('an answer with bank data, checked after the last await', () => {
     ]);
     expect(found.transactions.every((line: { account: string }) => line.account === 'skat')).toBe(true);
     expect(found.transactions.length).toBeGreaterThan(0);
+  });
+
+  it.each(DATA_TOOLS.filter(([tool]) => tool !== 'enablebanking_get_consent_status'))(
+    '%s returns nothing when the consent runs out while its final audit line is written (stored date, clock at return)',
+    async (tool, args) => {
+      let clock = Date.parse('2026-11-24T10:00:00Z');
+      const { audit, client } = await setup(BOTH, { now: () => clock, validUntil: '2026-11-24T10:00:01Z' });
+      const held = audit.holdNext();
+      const call = client.callTool({ name: tool, arguments: args });
+      await held;
+      clock += 2_000;
+      audit.open();
+      const result = await call;
+      const body = text(result);
+      expect(body).not.toMatch(/1234\.50|Leverand|Husleje|-250\.00/i);
+      if (tool === 'enablebanking_search_transactions') {
+        expect(JSON.parse(body).accounts.every((entry: { read: boolean; problem?: string }) => !entry.read && entry.problem === 'consent_expired')).toBe(true);
+      } else {
+        expect(body).toMatch(/errorCode: consent_expired/);
+      }
+    },
+  );
+
+  it.each([
+    ['REVOKED', (api: ReturnType<typeof fakeApi>) => api.setSessionStatus('REVOKED')],
+    ['EXPIRED', (api: ReturnType<typeof fakeApi>) => api.setSessionStatus('EXPIRED')],
+    ['a date that has passed', (api: ReturnType<typeof fakeApi>) => api.setSessionValidUntil('2000-01-01T00:00:00Z')],
+    ['no longer listing the account', (api: ReturnType<typeof fakeApi>) => api.setSessionAccounts([BOTH[1]!])],
+  ])('returns nothing read from an account when the consent status says %s while the final audit line is written', async (_, change) => {
+    const { api, audit, bank, client } = await setup();
+    const held = audit.holdNext();
+    const call = client.callTool({ name: 'enablebanking_get_balances', arguments: { account: 'drift' } });
+    await held;
+    change(api);
+    // The consent status is asked (what enablebanking_get_consent_status does) while the read waits on its audit line.
+    await bank.consentStatus();
+    audit.open();
+    const result = await call;
+    expect(result.isError).toBe(true);
+    expect(text(result)).not.toContain('1234.50');
+  });
+
+  it('holds a validity date Enable Banking gave later against an answer returned after it (clock at return)', async () => {
+    let clock = Date.parse('2026-11-24T10:00:00Z');
+    const { api, audit, client } = await setup(BOTH, { now: () => clock });
+    // The stored consent runs for years; Enable Banking now says it ends in one second.
+    api.setSessionValidUntil('2026-11-24T10:00:01Z');
+    const status = await client.callTool({ name: 'enablebanking_get_consent_status', arguments: {} });
+    expect(JSON.parse(text(status)).consents[0]).toMatchObject({ status: 'AUTHORIZED' });
+    const held = audit.holdNext();
+    const call = client.callTool({ name: 'enablebanking_get_balances', arguments: { account: 'drift' } });
+    await held;
+    clock += 2_000;
+    audit.open();
+    expect(text(await call)).toMatch(/errorCode: consent_expired/);
   });
 
   it('refuses an answer the bank did not make (fail closed): only the tools without bank data skip the check', () => {

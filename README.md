@@ -138,7 +138,9 @@ reads the accounts without signing in at the bank themselves, until the consent 
   its last await, the audit line included, and returns the answer with nothing awaited in between. That check is
   made in one place, the response path every tool goes through, so a tool cannot skip it: an answer the bank code
   did not mark for it is withheld. A consent revoked, or an account withdrawn, while the audit line is written
-  stops the answer (a search shows the account as not read, with why). The server learns it from:
+  stops the answer (a search shows the account as not read, with why), and so does the consent running out by then:
+  the stored validity date, and an earlier one Enable Banking gave since, are checked against the clock at that
+  moment. The server learns it from:
   - a read at the bank that fails with an ended consent or a missing account, from any tool;
   - `enablebanking_get_consent_status`: an error for the session, a status other than `AUTHORIZED`, a date that
     has passed, an account the session no longer lists;
@@ -484,10 +486,12 @@ if (result.isError) {
   moment, the `accountIds` given with the call, and who is present. There is
   no answer cache, so nothing read earlier can be returned after a consent
   ended, after an account left the session, after the host took an account
-  off the list, or to a caller with other accounts. The only state the
-  gateway instance holds between calls is the page tokens (15 minutes; where
-  to continue a listing, never bank data; the consent and the account are
-  checked again on every page) and the budget of unattended reads.
+  off the list, or to a caller with other accounts. The state the gateway
+  instance holds between calls is the page tokens (15 minutes; where to
+  continue a listing, never bank data; the consent and the account are
+  checked again on every page), the budget of unattended reads, and the
+  register of withdrawals (session ids, account ids, validity dates and a
+  counter, never bank data; see "Answers after a withdrawal").
 - **Fixed error codes.** An error result has `errorCode`, one of
   `enableBankingProblemCodes` (see [Error codes](#error-codes)), and
   `retryAfterSeconds` where a wait is recommended. Errors thrown by the
@@ -626,15 +630,19 @@ instead: a plain `Error` with an empty message and the stack `Error`.
 Every call asks Enable Banking for the session first, so what the host passes
 and what the bank holds now decide the call. Calls also run side by side in
 one gateway instance, so the instance keeps, in memory and for this purpose
-only, what calls learn while they run: a session ended through `endSession`,
-a consent Enable Banking says is over (the session's status, or a read that
-fails with an ended consent), and an account it says has left the consent (the
-session no longer lists it, or a read fails with `ACCOUNT_DOES_NOT_EXIST`).
-After a call's last await, with nothing awaited before it returns, its answer
-is checked against that: when anything was learned since the call began
-against its consent, or against an account its answer may come from (the
-account named, or every account of the call for `list_accounts` and a search
-over all accounts), the call is refused with `consent_not_active` ("Refused:
+only, what it learns about a session from any request it makes about it (the
+check at the start of every call, every read of an account, `sessionStatus`,
+`completeSession` and `endSession`): a session ended through `endSession`, a
+consent Enable Banking says is over (a status other than `AUTHORIZED`, a
+validity date that has passed, or a request failing with an ended consent),
+an account it says has left the consent (a status that no longer lists it, or
+a read failing with `ACCOUNT_DOES_NOT_EXIST`), and the earliest validity date
+it was given. After a call's last await, with nothing awaited before it
+returns, its answer is checked against that and against the clock at that
+moment: when the validity date has passed, or anything was learned since the
+call began against its consent or against an account its answer may come from
+(the account named, or every account of the call for `list_accounts` and a
+search over all accounts), the call is refused with `consent_not_active` ("Refused:
 the bank consent was ended, or an account left it, while this call was being
 answered; ...") and no data. What a search learns itself about an account
 it then skipped does not count against it. Only session ids, account ids and a
