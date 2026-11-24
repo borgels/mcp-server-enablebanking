@@ -432,6 +432,7 @@ describe('the details of the person present, written another way', () => {
     return upper ? code.toUpperCase() : code;
   };
   const percentAll = (value: string, upper: boolean) => [...value].map(char => `%${hex(char, upper)}`).join('');
+  const BACKSLASH = String.fromCharCode(92);
   const lowerHex = (value: string) => encodeURIComponent(value).replace(/%[0-9A-F]{2}/g, escape => escape.toLowerCase());
   const SPELLINGS: Array<[string, (value: string) => string]> = [
     ['percent-encoded with upper-case hex', value => encodeURIComponent(value)],
@@ -448,7 +449,8 @@ describe('the details of the person present, written another way', () => {
     ['with JSON unicode escapes', value => [...value].map(char => `\\u00${hex(char, false)}`).join('')],
     ['with JSON unicode escapes for the punctuation only', value => value.replace(/[^A-Za-z0-9]/g, char => `\\u00${hex(char, true)}`)],
     ['with JavaScript hex escapes', value => value.replace(/[^A-Za-z0-9]/g, char => `\\x${hex(char, false)}`)],
-    ['with escaped slashes', value => value.replace(/\//g, '\\/')],
+    // Not an escaping of anything: one of the spellings a bank's JSON may come in, each slash with a backslash before it.
+    ['with a backslash before each slash', value => value.split('/').join(`${BACKSLASH}/`)],
     ['inside JSON inside JSON', value => JSON.stringify(JSON.stringify(value).slice(1, -1)).slice(1, -1)],
     ['with decimal HTML entities', value => value.replace(/[^A-Za-z0-9]/g, char => `&#${char.charCodeAt(0)};`)],
     ['with hexadecimal HTML entities', value => value.replace(/[^A-Za-z0-9]/g, char => `&#x${hex(char, true)};`)],
