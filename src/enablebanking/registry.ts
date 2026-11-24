@@ -24,7 +24,8 @@ const accountSchema = z.object({
   id: z.string().trim().regex(/^[a-z0-9][a-z0-9-]{0,39}$/, 'lowercase letters, digits and dashes').optional(),
   name: z.string().trim().min(1),
   bank: z.string().trim().min(1).optional(),
-  currency: z.string().trim().regex(/^[A-Z]{3}$/).default('DKK'),
+  /** ISO 4217. Left out: the currency the bank reports is shown instead; none is assumed. */
+  currency: z.string().trim().regex(/^[A-Z]{3}$/).optional(),
   /** The e-conomic ledger account the bank account is booked on, for reference. */
   ledgerAccount: z.number().int().positive().optional(),
 });
@@ -45,7 +46,7 @@ export interface RegisteredAccount {
   id: string;
   name: string;
   bank?: string;
-  currency: string;
+  currency?: string;
   ledgerAccount?: number;
 }
 

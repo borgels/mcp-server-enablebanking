@@ -3,92 +3,38 @@ import { readFileSync } from 'node:fs';
 import { EnableBankingHttpError, redactPath } from '../errors.js';
 import { discardBody, isRedirect, readErrorBody } from '../upstream-http.js';
 import { encodePathParam } from '../path-params.js';
+import type {
+  AccountIdentification,
+  AccountResource,
+  ApplicationResource,
+  Aspsp,
+  BalanceResource,
+  FetchStrategy,
+  SessionResource,
+  SessionStatus,
+  TransactionResource,
+} from './api.js';
 
-// Enable Banking, account information (AIS) only. The application is not
-// registered for payment initiation and this client has no method that could
-// move money.
+// Enable Banking, account information (AIS) only. This client has no method
+// that could move money.
 //
 // Every call is authenticated by the APPLICATION: a short-lived RS256 JWT
 // signed with its private key (kid = application id). Access to a company's
-// accounts additionally needs a CONSENT — a session a human creates with MitID
-// at the bank, valid for a limited time (often at most 180 days).
+// accounts additionally needs a CONSENT: a session a person creates at the
+// bank with the bank's own sign-in, valid for a limited time (often at most
+// 180 days).
 
-export interface Aspsp {
-  name: string;
-  country: string;
-  bic?: string;
-  psu_types?: string[];
-  maximum_consent_validity?: number;
-  beta?: boolean;
-  sandbox?: unknown;
-}
-
-export interface AccountResource {
-  uid?: string;
-  account_id?: { iban?: string | null; other?: unknown } | null;
-  all_account_ids?: Array<{ identification?: string; scheme_name?: string }> | null;
-  account_servicer?: { bic_fi?: string | null; name?: string | null } | null;
-  name?: string | null;
-  details?: string | null;
-  usage?: string | null;
-  cash_account_type?: string | null;
-  product?: string | null;
-  currency?: string | null;
-  identification_hash?: string | null;
-  credit_limit?: { currency?: string; amount?: string } | null;
-}
-
-export interface SessionResource {
-  session_id: string;
-  accounts?: AccountResource[];
-  aspsp?: { name: string; country: string };
-  psu_type?: string;
-  access?: { valid_until?: string };
-}
-
-export interface SessionStatus {
-  status?: string;
-  accounts?: string[];
-  /** Enable Banking's account uids with their identification hash, the same for the account across consents. */
-  accounts_data?: Array<{ uid?: string; identification_hash?: string | null }>;
-  access?: { valid_until?: string };
-  aspsp?: { name: string; country: string };
-  psu_type?: string;
-}
-
-export interface Amount {
-  currency?: string;
-  amount?: string;
-}
-
-export interface BalanceResource {
-  name?: string | null;
-  balance_amount?: Amount;
-  balance_type?: string | null;
-  last_change_date_time?: string | null;
-  reference_date?: string | null;
-}
-
-export interface TransactionResource {
-  entry_reference?: string | null;
-  transaction_id?: string | null;
-  transaction_amount?: Amount;
-  credit_debit_indicator?: 'CRDT' | 'DBIT' | string;
-  status?: string;
-  booking_date?: string | null;
-  value_date?: string | null;
-  transaction_date?: string | null;
-  creditor?: { name?: string | null } | null;
-  debtor?: { name?: string | null } | null;
-  creditor_account?: { iban?: string | null } | null;
-  debtor_account?: { iban?: string | null } | null;
-  remittance_information?: string[] | null;
-  reference_number?: string | null;
-  bank_transaction_code?: { description?: string | null; code?: string | null; sub_code?: string | null } | null;
-  balance_after_transaction?: Amount | null;
-  merchant_category_code?: string | null;
-  note?: string | null;
-}
+export type {
+  AccountResource,
+  Amount,
+  ApplicationResource,
+  Aspsp,
+  BalanceResource,
+  FetchStrategy,
+  SessionResource,
+  SessionStatus,
+  TransactionResource,
+} from './api.js';
 
 export interface ClientOptions {
   applicationId: string;
@@ -98,7 +44,27 @@ export interface ClientOptions {
   fetch?: typeof fetch;
 }
 
-const MAX_PAGES = 50;
+/** `Psu-*` request headers of a person present (src/enablebanking/psu.ts). Left out: a background fetch. */
+export type PresenceHeaders = Readonly<Record<string, string>>;
+
+/** One page of transactions as the bank returned it. */
+export interface TransactionsPage {
+  transactions: TransactionResource[];
+  /** Set when the bank has more; an empty page can still carry one. */
+  continuationKey?: string;
+}
+
+export interface TransactionsQuery {
+  dateFrom?: string;
+  dateTo?: string;
+  status?: 'BOOK' | 'PDNG';
+  /** `longest`: as far back as the bank gives, up to today; `dateTo` is then not sent. */
+  strategy?: FetchStrategy;
+  continuationKey?: string;
+}
+
+/** The most pages one listing follows. A bank's page holds what the bank decides, often 10 to several hundred lines. */
+export const MAX_PAGES = 50;
 
 function b64url(input: Buffer | string): string {
   return Buffer.from(input).toString('base64url');
@@ -130,10 +96,12 @@ export class EnableBankingClient {
     return `${input}.${b64url(createSign('RSA-SHA256').update(input).sign(this.key))}`;
   }
 
-  private async request<T>(method: 'GET' | 'POST' | 'DELETE', path: string, body?: unknown): Promise<T> {
+  private async request<T>(method: 'GET' | 'POST' | 'DELETE', path: string, body?: unknown, presence?: PresenceHeaders): Promise<T> {
     const response = await this.fetchImpl(`${this.baseUrl}${path}`, {
       method,
       headers: {
+        // The person's headers first, so none of them can replace one of ours.
+        ...(presence ?? {}),
         Authorization: `Bearer ${this.jwt()}`,
         Accept: 'application/json',
         ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
@@ -165,18 +133,21 @@ export class EnableBankingClient {
     return payload as T;
   }
 
-  getApplication(): Promise<Record<string, unknown>> {
+  /** The application as Enable Banking sees it: environment, whether it is active, countries and services. */
+  getApplication(): Promise<ApplicationResource> {
     return this.request('GET', '/application');
   }
 
-  async listAspsps(country: string, psuType?: 'business' | 'personal'): Promise<Aspsp[]> {
-    const params = new URLSearchParams({ country });
+  /** Banks offering account information. Without a country: every country the application covers. */
+  async listAspsps(country?: string, psuType?: 'business' | 'personal'): Promise<Aspsp[]> {
+    const params = new URLSearchParams({ service: 'AIS' });
+    if (country) params.set('country', country);
     if (psuType) params.set('psu_type', psuType);
-    const body = await this.request<{ aspsps?: Aspsp[] }>('GET', `/aspsps?${params}`);
-    return body.aspsps ?? [];
+    const body = await this.request<{ aspsps?: Aspsp[] } | undefined>('GET', `/aspsps?${params}`);
+    return Array.isArray(body?.aspsps) ? body.aspsps : [];
   }
 
-  /** Start a consent; returns the bank's MitID URL for a human to open. */
+  /** Start a consent; returns the address of the bank's sign-in for a person to open. */
   async startAuthorization(input: {
     aspsp: { name: string; country: string };
     psuType: 'business' | 'personal';
@@ -184,13 +155,28 @@ export class EnableBankingClient {
     redirectUrl: string;
     state: string;
     language?: string;
+    /** One of the bank's auth_methods, when it offers several. */
+    authMethod?: string;
+    /** Ask for these accounts only; what a bank does without it differs per bank. */
+    accounts?: AccountIdentification[];
+    balances?: boolean;
+    transactions?: boolean;
+    /** False: never ask the person for the extra approval some banks need for history older than 90 days. */
+    extendedHistory?: boolean;
   }): Promise<{ url: string; authorization_id?: string }> {
     return this.request('POST', '/auth', {
-      access: { valid_until: input.validUntil },
+      access: {
+        valid_until: input.validUntil,
+        ...(input.accounts && input.accounts.length > 0 ? { accounts: input.accounts } : {}),
+        ...(input.balances === undefined ? {} : { balances: input.balances }),
+        ...(input.transactions === undefined ? {} : { transactions: input.transactions }),
+        ...(input.extendedHistory === undefined ? {} : { transactions_extended_history: input.extendedHistory }),
+      },
       aspsp: input.aspsp,
       state: input.state,
       redirect_url: input.redirectUrl,
       psu_type: input.psuType,
+      ...(input.authMethod ? { auth_method: input.authMethod } : {}),
       ...(input.language ? { language: input.language } : {}),
     });
   }
@@ -200,6 +186,7 @@ export class EnableBankingClient {
     return this.request('POST', '/sessions', { code });
   }
 
+  /** The session as Enable Banking holds it. Not a read at the bank. */
   getSession(sessionId: string): Promise<SessionStatus> {
     return this.request('GET', `/sessions/${encodePathParam(sessionId, 'sessionId')}`);
   }
@@ -209,36 +196,68 @@ export class EnableBankingClient {
     await this.request('DELETE', `/sessions/${encodePathParam(sessionId, 'sessionId')}`);
   }
 
-  getAccountDetails(uid: string): Promise<AccountResource> {
-    return this.request('GET', `/accounts/${encodePathParam(uid, 'uid')}/details`);
+  getAccountDetails(uid: string, presence?: PresenceHeaders): Promise<AccountResource> {
+    return this.request('GET', `/accounts/${encodePathParam(uid, 'uid')}/details`, undefined, presence);
   }
 
-  async getBalances(uid: string): Promise<BalanceResource[]> {
-    const body = await this.request<{ balances?: BalanceResource[] }>('GET', `/accounts/${encodePathParam(uid, 'uid')}/balances`);
-    return body.balances ?? [];
+  async getBalances(uid: string, presence?: PresenceHeaders): Promise<BalanceResource[]> {
+    const body = await this.request<{ balances?: BalanceResource[] } | undefined>(
+      'GET',
+      `/accounts/${encodePathParam(uid, 'uid')}/balances`,
+      undefined,
+      presence,
+    );
+    return Array.isArray(body?.balances) ? body.balances : [];
   }
 
-  /** All pages of transactions in a window. `truncated` is true when the page cap was hit. */
+  /** One page. Every parameter but the continuation key must be the same on each page of a listing. */
+  async getTransactionsPage(uid: string, query: TransactionsQuery, presence?: PresenceHeaders): Promise<TransactionsPage> {
+    const params = new URLSearchParams();
+    if (query.dateFrom) params.set('date_from', query.dateFrom);
+    if (query.dateTo && query.strategy !== 'longest') params.set('date_to', query.dateTo);
+    if (query.status) params.set('transaction_status', query.status);
+    if (query.strategy === 'longest') params.set('strategy', 'longest');
+    if (query.continuationKey) params.set('continuation_key', query.continuationKey);
+    const qs = [...params.keys()].length > 0 ? `?${params}` : '';
+    const body = await this.request<{ transactions?: TransactionResource[]; continuation_key?: string | null } | undefined>(
+      'GET',
+      `/accounts/${encodePathParam(uid, 'uid')}/transactions${qs}`,
+      undefined,
+      presence,
+    );
+    const continuationKey = typeof body?.continuation_key === 'string' && body.continuation_key ? body.continuation_key : undefined;
+    return { transactions: Array.isArray(body?.transactions) ? body.transactions : [], ...(continuationKey ? { continuationKey } : {}) };
+  }
+
+  /**
+   * Every page of a listing, up to MAX_PAGES. An empty page with a
+   * continuation key is followed like any other. `truncated` is true when
+   * the bank still had more after the last page read.
+   */
   async listTransactions(
     uid: string,
-    query: { dateFrom: string; dateTo?: string; status?: 'BOOK' | 'PDNG' },
-  ): Promise<{ transactions: TransactionResource[]; truncated: boolean }> {
+    query: Omit<TransactionsQuery, 'continuationKey'>,
+    presence?: PresenceHeaders,
+  ): Promise<{ transactions: TransactionResource[]; truncated: boolean; pages: number }> {
     const transactions: TransactionResource[] = [];
     let continuation: string | undefined;
-    for (let page = 0; page < MAX_PAGES; page++) {
-      const params = new URLSearchParams({ date_from: query.dateFrom });
-      if (query.dateTo) params.set('date_to', query.dateTo);
-      if (query.status) params.set('transaction_status', query.status);
-      if (continuation) params.set('continuation_key', continuation);
-      const body = await this.request<{ transactions?: TransactionResource[]; continuation_key?: string | null }>(
-        'GET',
-        `/accounts/${encodePathParam(uid, 'uid')}/transactions?${params}`,
-      );
-      transactions.push(...(body.transactions ?? []));
-      continuation = body.continuation_key ?? undefined;
-      if (!continuation) return { transactions, truncated: false };
+    for (let page = 1; page <= MAX_PAGES; page++) {
+      const result = await this.getTransactionsPage(uid, { ...query, ...(continuation ? { continuationKey: continuation } : {}) }, presence);
+      transactions.push(...result.transactions);
+      continuation = result.continuationKey;
+      if (!continuation) return { transactions, truncated: false, pages: page };
     }
-    return { transactions, truncated: true };
+    return { transactions, truncated: true, pages: MAX_PAGES };
+  }
+
+  /** The bank's further details of one transaction, by the `transaction_id` of a listing. */
+  async getTransaction(uid: string, transactionId: string, presence?: PresenceHeaders): Promise<TransactionResource> {
+    return this.request(
+      'GET',
+      `/accounts/${encodePathParam(uid, 'uid')}/transactions/${encodePathParam(transactionId, 'transaction')}`,
+      undefined,
+      presence,
+    );
   }
 }
 

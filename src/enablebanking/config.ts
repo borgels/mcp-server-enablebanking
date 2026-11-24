@@ -28,6 +28,11 @@ export interface EnableBankingConfig {
   consentAdmins: string[];
   trustForwardedUser: boolean;
   cacheSeconds: number;
+  /**
+   * Reads at the bank allowed per consent in 24 hours; over it a read is refused here instead of sent. 0 (default):
+   * no budget is kept, and the bank's own limit decides.
+   */
+  unattendedFetchesPerDay: number;
   apiBaseUrl: string;
   timeoutMs: number;
   auditLog?: string;
@@ -59,6 +64,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): EnableBankingC
       .filter(Boolean),
     trustForwardedUser: env.ENABLEBANKING_TRUST_FORWARDED_USER === 'true',
     cacheSeconds: clampInt('ENABLEBANKING_CACHE_SECONDS', env.ENABLEBANKING_CACHE_SECONDS, 300, 0, 86_400),
+    unattendedFetchesPerDay: clampInt('ENABLEBANKING_UNATTENDED_FETCHES_PER_DAY', env.ENABLEBANKING_UNATTENDED_FETCHES_PER_DAY, 0, 0, 1_000),
     apiBaseUrl,
     timeoutMs: clampInt('ENABLEBANKING_TIMEOUT_MS', env.ENABLEBANKING_TIMEOUT_MS, 30_000, 1_000, 120_000),
     auditLog: env.ENABLEBANKING_AUDIT_LOG?.trim() || undefined,

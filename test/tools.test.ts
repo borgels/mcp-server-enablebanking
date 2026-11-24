@@ -26,9 +26,13 @@ describe('tool surface', () => {
     expect(names).toEqual([
       'enablebanking_get_account_details',
       'enablebanking_get_balances',
+      'enablebanking_get_consent_status',
+      'enablebanking_get_transaction_details',
       'enablebanking_list_accounts',
       'enablebanking_list_transactions',
       'enablebanking_search_capabilities',
+      'enablebanking_search_transactions',
+      'enablebanking_summarize_transactions',
     ]);
     expect(names.some(name => /pay|transfer/.test(name))).toBe(false);
   });
@@ -38,7 +42,7 @@ describe('tool surface', () => {
     const client = await connect({ consentEnabled: true, consentAdmins: ['anna@example.com'], auditLog }, 'carl@example.org');
     const names = (await client.listTools()).tools.map(t => t.name);
     expect(names).toContain('enablebanking_start_consent');
-    const result = await client.callTool({ name: 'enablebanking_start_consent', arguments: { bank: 'Danske Bank' } });
+    const result = await client.callTool({ name: 'enablebanking_start_consent', arguments: { bank: 'Danske Bank', country: 'DK' } });
     expect(result.isError).toBe(true);
     expect(JSON.stringify(result.content)).toContain('may not manage bank consents');
     const lines = readFileSync(auditLog, 'utf8').trim().split('\n').map(line => JSON.parse(line));
@@ -53,5 +57,7 @@ describe('tool surface', () => {
     expect(body.accounts.map((a: { id: string; status: string }) => `${a.id}:${a.status}`)).toEqual(['drift:no_consent', 'skat:no_consent']);
     const balances = await client.callTool({ name: 'enablebanking_get_balances', arguments: { account: 'drift' } });
     expect(balances.isError).toBe(true);
+    // The fixed code of the problem is on its own line after the text.
+    expect((balances.content as Array<{ text: string }>)[0]!.text).toMatch(/\nerrorCode: no_consent$/);
   });
 });

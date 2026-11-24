@@ -140,6 +140,7 @@ export function makeBank(options: {
   dataDir?: string;
   now?: () => number;
   cacheSeconds?: number;
+  unattendedFetchesPerDay?: number;
 } = {}) {
   const api = options.api ?? fakeApi();
   const company = options.company ?? 'aaa';
@@ -151,12 +152,13 @@ export function makeBank(options: {
     store: new SessionStore(company, dataDir, MASTER_KEY),
     redirectUrl: 'https://consent.example.com/bank-consent',
     cacheSeconds: options.cacheSeconds ?? 300,
+    unattendedFetchesPerDay: options.unattendedFetchesPerDay,
     now: options.now,
   });
   return { bank, api, dataDir };
 }
 
-/** Run the MitID round: start, then build the redirect the bank would send back. */
+/** Run the sign-in round at the bank: start, then build the redirect the bank would send back. */
 export async function linkConsent(bank: Bank, api: ReturnType<typeof fakeApi>, user = 'anna@example.com') {
   const started = await bank.startConsent({ user, bank: 'Danske Bank', country: 'DK', psuType: 'business', validDays: 365 });
   const auth = [...api.calls].reverse().find(call => call.method === 'POST' && call.path === '/auth')!;

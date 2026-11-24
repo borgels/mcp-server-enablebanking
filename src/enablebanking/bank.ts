@@ -1,7 +1,22 @@
 import { randomBytes } from 'node:crypto';
-import { EnableBankingHttpError } from '../errors.js';
-import type { AccountResource, EnableBankingClient } from './client.js';
-import { balanceView, isoDate, summarize, transactionView, type TransactionView } from './format.js';
+import { EnableBankingHttpError, formatUnknownError } from '../errors.js';
+import { budgetRefusal, UnattendedBudget } from './budget.js';
+import type { AccountResource, Aspsp, EnableBankingClient, TransactionResource } from './client.js';
+import { parseDecimal } from './decimal.js';
+import {
+  accountDetailsView,
+  balanceView,
+  isoDate,
+  isPending,
+  matchesLine,
+  newestFirst,
+  summarize,
+  summarizeByCounterparty,
+  transactionView,
+  type LineFilter,
+  type TransactionView,
+} from './format.js';
+import { problemOf, ProblemError, type ProblemCode } from './problems.js';
 import { maskIban, normalizeIban, type AccountRegistry, type Company, type RegisteredAccount } from './registry.js';
 import type { BoundAccount, ConsentState, ExcludedAccount, SessionStore, StoredSession } from './store.js';
 
@@ -17,7 +32,27 @@ export interface BankOptions {
   /** The redirect lands on this server, which completes the consent itself. */
   consentCallback?: boolean;
   cacheSeconds?: number;
+  /**
+   * Reads at the bank allowed per consent in 24 hours. Every read of this server is one nobody is present for, as
+   * the bank sees it. Default 0: no budget is kept here, and the bank's own limit decides.
+   */
+  unattendedFetchesPerDay?: number;
   now?: () => number;
+}
+
+/** What the transaction tools take: a period and what to look for in it. */
+export interface TransactionQuery {
+  from?: string;
+  to?: string;
+  status?: 'booked' | 'pending' | 'all';
+  /** `longest`: as far back as the bank gives, up to today. `to` cannot be given with it. */
+  strategy?: 'default' | 'longest';
+  search?: string;
+  direction?: 'in' | 'out';
+  minAmount?: number | string;
+  maxAmount?: number | string;
+  limit?: number;
+  offset?: number;
 }
 
 export interface LinkedAccount {
@@ -40,10 +75,31 @@ export interface BindingReport {
 }
 
 export class ConsentError extends Error {
-  constructor(message: string) {
+  /** Our own fixed code for what went wrong (src/enablebanking/problems.ts). */
+  readonly problem: ProblemCode;
+  constructor(message: string, problem: ProblemCode = 'no_consent') {
     super(message);
     this.name = 'ConsentError';
+    this.problem = problem;
   }
+}
+
+const DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+
+function checkDate(value: string, name: string): string {
+  const parsed = DATE_PATTERN.test(value) ? new Date(`${value}T00:00:00Z`) : undefined;
+  if (!parsed || Number.isNaN(parsed.getTime()) || isoDate(parsed) !== value) {
+    throw new ProblemError('invalid_period', `${name} must be a date, YYYY-MM-DD.`);
+  }
+  return value;
+}
+
+/** A filter amount as an exact decimal. A number is taken as written in decimal notation. */
+function filterAmount(value: number | string | undefined, name: string) {
+  if (value === undefined) return undefined;
+  const amount = parseDecimal(typeof value === 'number' ? String(value) : value.trim());
+  if (!amount || amount.units < 0n) throw new ProblemError('invalid_input', `${name} must be a decimal with a dot and no sign, such as 1000 or 99.50.`);
+  return amount;
 }
 
 /**
@@ -56,8 +112,9 @@ export class Bank {
   private readonly client: EnableBankingClient;
   private readonly registry: AccountRegistry;
   private readonly store: SessionStore;
-  private readonly cache = new Map<string, { expires: number; value: unknown }>();
+  private readonly cache = new Map<string, { expires: number; fetchedAt: string; value: unknown }>();
   private readonly cacheMs: number;
+  private readonly budget: UnattendedBudget;
   private readonly now: () => number;
 
   constructor(private readonly options: BankOptions) {
@@ -67,6 +124,7 @@ export class Bank {
     this.store = options.store;
     this.cacheMs = (options.cacheSeconds ?? 300) * 1000;
     this.now = options.now ?? Date.now;
+    this.budget = new UnattendedBudget(options.unattendedFetchesPerDay ?? 0, this.now);
     // Fail at startup, not on the first call, if the instance is pinned to a
     // company the registry does not know.
     this.registry.company(this.company);
@@ -92,7 +150,8 @@ export class Bank {
           iban: account.iban,
           name: account.name,
           bank: account.bank ?? session?.aspsp.name ?? null,
-          currency: account.currency,
+          // The registry's currency, else what the bank said when the consent was bound. Never assumed.
+          currency: account.currency ?? session?.accounts.find(bound => bound.iban === account.iban)?.currency ?? null,
           ledgerAccount: account.ledgerAccount ?? null,
           status: !session ? 'no_consent' : expiresInDays !== null && expiresInDays < 0 ? 'consent_expired' : 'linked',
           consentValidUntil: session?.validUntil ?? null,
@@ -120,12 +179,14 @@ export class Bank {
       throw new ConsentError(
         `${account.name} (${maskIban(account.iban)}) is registered for ${this.companyInfo().name} but no bank consent covers it yet. ` +
           'An administrator must link it with enablebanking_start_consent.',
+        'no_consent',
       );
     }
     if (Date.parse(session.validUntil) <= this.now()) {
       throw new ConsentError(
         `The ${session.aspsp.name} consent for ${this.companyInfo().name} expired on ${session.validUntil.slice(0, 10)}. ` +
-          'An administrator must renew it with enablebanking_start_consent (MitID).',
+          'An administrator must renew it with enablebanking_start_consent (the bank\u2019s own sign-in).',
+        'consent_expired',
       );
     }
     const bound = session.accounts.find(candidate => candidate.iban === account.iban)!;
@@ -134,97 +195,221 @@ export class Bank {
 
   async balances(reference: string) {
     const link = this.linked(reference);
-    const rows = await this.cached(`balances:${link.uid}`, () => this.call(link, () => this.client.getBalances(link.uid)));
-    return { account: accountHeader(link), balances: rows.map(balanceView) };
+    const read = await this.cached(`balances:${link.uid}`, () => this.call(link, () => this.client.getBalances(link.uid)));
+    return { account: accountHeader(link), fetchedAt: read.fetchedAt, balances: read.value.map(balanceView) };
   }
 
   async details(reference: string) {
     const link = this.linked(reference);
-    const raw = await this.cached(`details:${link.uid}`, () => this.call(link, () => this.client.getAccountDetails(link.uid)));
+    const read = await this.cached(`details:${link.uid}`, () => this.call(link, () => this.client.getAccountDetails(link.uid)));
     // Belt and braces: the bank must still say this uid is the registered IBAN.
-    const iban = ibanOf(raw);
+    const iban = ibanOf(read.value);
     if (iban && iban !== link.account.iban) {
-      throw new ConsentError('the bank returned a different account than the one registered; refusing to show it');
+      throw new ConsentError('the bank returned a different account than the one registered; refusing to show it', 'account_not_connected');
     }
-    return {
-      account: accountHeader(link),
-      bank: {
-        name: raw.name ?? null,
-        product: raw.product ?? null,
-        currency: raw.currency ?? null,
-        cashAccountType: raw.cash_account_type ?? null,
-        usage: raw.usage ?? null,
-        servicer: raw.account_servicer?.name ?? raw.account_servicer?.bic_fi ?? null,
-        creditLimit: raw.credit_limit ?? null,
-      },
-    };
+    return { account: accountHeader(link), fetchedAt: read.fetchedAt, details: accountDetailsView(read.value) };
   }
 
-  async transactions(
-    reference: string,
-    query: {
-      from?: string;
-      to?: string;
-      status?: 'booked' | 'pending' | 'all';
-      search?: string;
-      direction?: 'in' | 'out';
-      minAmount?: number;
-      maxAmount?: number;
-      limit?: number;
-    },
-  ) {
-    const link = this.linked(reference);
-    const to = query.to ?? isoDate(new Date(this.now()));
-    const from = query.from ?? isoDate(new Date(Date.parse(to) - 30 * DAY_MS));
-    if (from > to) throw new Error(`from (${from}) is after to (${to})`);
+  /** The period and status of a query, checked. */
+  private period(query: TransactionQuery) {
     const status = query.status ?? 'booked';
-    const fetched = await this.cached(`tx:${link.uid}:${from}:${to}:${status}`, () =>
+    const strategy = query.strategy ?? 'default';
+    const today = isoDate(new Date(this.now()));
+    if (strategy === 'longest') {
+      // The API ignores an end date with this strategy; one that is given would promise a period that is not read.
+      if (query.to) throw new ProblemError('invalid_period', 'to cannot be given with strategy longest: the bank reads up to today.');
+      const from = query.from ? checkDate(query.from, 'from') : undefined;
+      return { from, to: undefined, status, strategy };
+    }
+    const to = checkDate(query.to ?? today, 'to');
+    const from = checkDate(query.from ?? isoDate(new Date(Date.parse(to) - 30 * DAY_MS)), 'from');
+    if (from > to) throw new ProblemError('invalid_period', `from (${from}) is after to (${to})`);
+    return { from, to, status, strategy };
+  }
+
+  /** Every line of a period as the bank gave it, read once and kept for the cache time. */
+  private async lines(link: LinkedAccount, period: ReturnType<Bank['period']>) {
+    const read = await this.cached(`tx:${link.uid}:${period.from ?? ''}:${period.to ?? ''}:${period.status}:${period.strategy}`, () =>
       this.call(link, () =>
         this.client.listTransactions(link.uid, {
-          dateFrom: from,
-          dateTo: to,
-          status: status === 'booked' ? 'BOOK' : status === 'pending' ? 'PDNG' : undefined,
+          ...(period.from ? { dateFrom: period.from } : {}),
+          ...(period.to ? { dateTo: period.to } : {}),
+          ...(period.status === 'booked' ? { status: 'BOOK' as const } : period.status === 'pending' ? { status: 'PDNG' as const } : {}),
+          ...(period.strategy === 'longest' ? { strategy: 'longest' as const } : {}),
         }),
       ),
     );
-    const search = query.search?.trim().toLowerCase();
-    let rows: TransactionView[] = fetched.transactions.map(transactionView);
+    // A line without a status, returned for a request that asked for one status, is taken to have it.
+    const assumed = period.status === 'booked' ? 'BOOK' : period.status === 'pending' ? 'PDNG' : undefined;
+    let rows: TransactionView[] = read.value.transactions.map((row: TransactionResource) => transactionView(row, assumed));
     // Some banks ignore transaction_status; filter here too.
-    if (status === 'booked') rows = rows.filter(row => row.status === 'BOOK');
-    if (status === 'pending') rows = rows.filter(row => row.status !== 'BOOK');
-    if (query.direction) rows = rows.filter(row => row.direction === query.direction);
-    if (search) {
-      rows = rows.filter(row =>
-        [row.counterparty, row.text, row.reference, row.counterpartyIban].some(value => value?.toLowerCase().includes(search)),
-      );
-    }
-    if (query.minAmount !== undefined) rows = rows.filter(row => Math.abs(Number(row.amount)) >= query.minAmount!);
-    if (query.maxAmount !== undefined) rows = rows.filter(row => Math.abs(Number(row.amount)) <= query.maxAmount!);
-    rows.sort((a, b) => (b.bookingDate ?? b.valueDate ?? '').localeCompare(a.bookingDate ?? a.valueDate ?? ''));
+    if (period.status === 'booked') rows = rows.filter(row => row.status === 'BOOK');
+    if (period.status === 'pending') rows = rows.filter(row => isPending(row.status));
+    rows.sort(newestFirst);
+    // complete is false when the bank still had more after the last page this server follows.
+    return { rows, complete: !read.value.truncated, fetchedAt: read.fetchedAt };
+  }
+
+  private filter(query: TransactionQuery): LineFilter {
+    const search = query.search?.trim();
+    const minAmount = filterAmount(query.minAmount, 'minAmount');
+    const maxAmount = filterAmount(query.maxAmount, 'maxAmount');
+    return {
+      ...(search ? { search } : {}),
+      ...(query.direction ? { direction: query.direction } : {}),
+      ...(minAmount ? { minAmount } : {}),
+      ...(maxAmount ? { maxAmount } : {}),
+    };
+  }
+
+  async transactions(reference: string, query: TransactionQuery) {
+    const link = this.linked(reference);
+    const period = this.period(query);
+    const filter = this.filter(query);
+    const { rows: all, complete, fetchedAt } = await this.lines(link, period);
+    const rows = all.filter(row => matchesLine(row, filter));
     const limit = query.limit ?? 200;
+    const offset = query.offset ?? 0;
+    const shown = rows.slice(offset, offset + limit);
     return {
       account: accountHeader(link),
-      period: { from, to, status },
+      period: { from: period.from ?? null, to: period.to ?? null, status: period.status, ...(period.strategy === 'longest' ? { strategy: period.strategy } : {}) },
+      fetchedAt,
+      // The totals cover every matching line of the period that was read, not only the lines shown.
       totals: summarize(rows),
       count: rows.length,
-      returned: Math.min(limit, rows.length),
-      truncated: fetched.truncated || rows.length > limit,
-      transactions: rows.slice(0, limit),
+      offset,
+      returned: shown.length,
+      // False: the bank had more lines for the period than this server reads in one go; count and totals then cover
+      // only the lines read. Ask for a shorter period.
+      complete,
+      // True when lines are missing from this answer: more matching lines than shown, or an incomplete read.
+      truncated: !complete || rows.length > offset + shown.length,
+      ...(rows.length > offset + shown.length ? { nextOffset: offset + shown.length } : {}),
+      transactions: shown,
     };
+  }
+
+  /** What more the bank has on one line, by the detailsId of a listing. */
+  async transactionDetails(reference: string, transaction: string) {
+    const link = this.linked(reference);
+    const raw = await this.call(link, () => this.client.getTransaction(link.uid, transaction));
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      throw new ProblemError('transaction_not_found', 'The bank has no further details for that transaction.');
+    }
+    return { account: accountHeader(link), fetchedAt: new Date(this.now()).toISOString(), transaction: transactionView(raw) };
+  }
+
+  /** Totals per counterparty and currency: computed here from the bank's lines and nothing else. */
+  async summary(reference: string, query: TransactionQuery & { top?: number }) {
+    const link = this.linked(reference);
+    const period = this.period({ ...query, strategy: 'default' });
+    const { rows, complete, fetchedAt } = await this.lines(link, period);
+    const groups = summarizeByCounterparty(rows);
+    const top = query.top ?? 50;
+    return {
+      account: accountHeader(link),
+      period: { from: period.from ?? null, to: period.to ?? null, status: period.status },
+      fetchedAt,
+      derived: true,
+      complete,
+      lines: rows.length,
+      totals: summarize(rows),
+      counterparties: groups.slice(0, top),
+      ...(groups.length > top ? { counterpartiesNotShown: groups.length - top } : {}),
+    };
+  }
+
+  /** Lines that match a text or an amount across this company's accounts: computed here from the bank's lines. */
+  async search(query: TransactionQuery & { accounts?: string[] }) {
+    const period = this.period({ ...query, strategy: 'default' });
+    const filter = this.filter(query);
+    if (!filter.search && !filter.direction && !filter.minAmount && !filter.maxAmount) {
+      throw new ProblemError('invalid_input', 'Give at least one of search, minAmount, maxAmount and direction.');
+    }
+    const company = this.companyInfo();
+    // Named accounts are resolved against this company's registry first: an unknown one stops the search.
+    const wanted = query.accounts?.length
+      ? [...new Map(query.accounts.map(reference => this.registry.resolve(this.company, reference)).map(account => [account.id, account])).values()]
+      : company.accounts;
+    const accounts: Array<{ account: string; read: boolean; lines?: number; matches?: number; complete?: boolean; problem?: ProblemCode; reason?: string }> = [];
+    const matches: Array<TransactionView & { account: string }> = [];
+    let fetchedAt: string | undefined;
+    for (const account of wanted) {
+      try {
+        const link = this.linked(account.id);
+        const read = await this.lines(link, period);
+        const found = read.rows.filter(row => matchesLine(row, filter));
+        for (const row of found) matches.push({ account: account.id, ...row });
+        accounts.push({ account: account.id, read: true, lines: read.rows.length, matches: found.length, complete: read.complete });
+        if (!fetchedAt || read.fetchedAt < fetchedAt) fetchedAt = read.fetchedAt;
+      } catch (error) {
+        accounts.push({ account: account.id, read: false, problem: problemOf(error) ?? 'upstream_error', reason: formatUnknownError(error) });
+      }
+    }
+    matches.sort(newestFirst);
+    const limit = query.limit ?? 100;
+    const shown = matches.slice(0, limit);
+    return {
+      period: { from: period.from ?? null, to: period.to ?? null, status: period.status },
+      ...(fetchedAt ? { fetchedAt } : {}),
+      derived: true,
+      // True only when every account was read to the end of the period.
+      complete: accounts.every(entry => entry.read && entry.complete),
+      accounts,
+      count: matches.length,
+      returned: shown.length,
+      truncated: matches.length > shown.length,
+      totals: summarize(shown),
+      transactions: shown,
+    };
+  }
+
+  /** Each stored consent as Enable Banking holds it now. Not a read at the bank. */
+  async consentStatus() {
+    const company = this.companyInfo();
+    const now = this.now();
+    const consents = [];
+    for (const session of this.store.sessions()) {
+      const base = {
+        consent: session.key,
+        bank: session.aspsp.name,
+        country: session.aspsp.country,
+        psuType: session.psuType,
+        accounts: company.accounts.filter(account => session.accounts.some(bound => bound.iban === account.iban)).map(account => account.id),
+      };
+      try {
+        const status = await this.client.getSession(session.sessionId);
+        const covered = new Set(Array.isArray(status.accounts) ? status.accounts : []);
+        const validUntil = typeof status.access?.valid_until === 'string' ? status.access.valid_until : session.validUntil;
+        const until = Date.parse(validUntil);
+        consents.push({
+          ...base,
+          status: typeof status.status === 'string' ? status.status : null,
+          validUntil,
+          expiresInDays: Number.isNaN(until) ? null : Math.floor((until - now) / DAY_MS),
+          authorizedAt: typeof status.authorized === 'string' ? status.authorized : null,
+          // Registered accounts the stored consent bound that Enable Banking no longer lists in the session.
+          noLongerCovered: company.accounts
+            .filter(account => session.accounts.some(bound => bound.iban === account.iban && !covered.has(bound.uid)))
+            .map(account => account.id),
+          access: {
+            balances: typeof status.access?.balances === 'boolean' ? status.access.balances : null,
+            transactions: typeof status.access?.transactions === 'boolean' ? status.access.transactions : null,
+          },
+        });
+      } catch (error) {
+        consents.push({ ...base, status: null, validUntil: session.validUntil, problem: problemOf(error) ?? 'upstream_error', reason: formatUnknownError(error) });
+      }
+    }
+    return { company: company.name, checkedAt: new Date(now).toISOString(), consents };
   }
 
   // ---------------------------------------------------------------- consent
 
-  async listBanks(country: string, psuType?: 'business' | 'personal') {
-    const banks = await this.client.listAspsps(country.toUpperCase(), psuType);
-    return banks.map(bank => ({
-      name: bank.name,
-      country: bank.country,
-      bic: bank.bic ?? null,
-      psuTypes: bank.psu_types ?? [],
-      maxConsentDays: bank.maximum_consent_validity ? Math.floor(bank.maximum_consent_validity / 86_400) : null,
-      beta: bank.beta ?? false,
-    }));
+  async listBanks(country?: string, psuType?: 'business' | 'personal') {
+    const banks = await this.client.listAspsps(country ? country.toUpperCase() : undefined, psuType);
+    return banks.map(bankSummary);
   }
 
   async startConsent(input: {
@@ -234,6 +419,10 @@ export class Bank {
     psuType: 'business' | 'personal';
     validDays: number;
     language?: string;
+    /** One of the bank's authMethods (by name), when it offers several. */
+    authMethod?: string;
+    /** False: never ask the person for the extra approval some banks need for history older than 90 days. */
+    extendedHistory?: boolean;
   }) {
     if (!this.options.redirectUrl) throw new ConsentError('ENABLEBANKING_REDIRECT_URL is not configured on this server');
     const country = input.country.toUpperCase();
@@ -244,6 +433,14 @@ export class Bank {
     }
     if (bank.psu_types && !bank.psu_types.includes(input.psuType)) {
       throw new ConsentError(`${bank.name} does not offer ${input.psuType} consents (it offers ${bank.psu_types.join(', ')})`);
+    }
+    const methods = (bank.auth_methods ?? []).filter(method => !method.psu_type || method.psu_type === input.psuType);
+    if (input.authMethod && !methods.some(method => method.name === input.authMethod)) {
+      throw new ConsentError(
+        `${bank.name} offers no sign-in method named "${input.authMethod}" to ${input.psuType} customers` +
+          (methods.length > 0 ? ` (it offers ${methods.map(method => method.name).join(', ')})` : ''),
+        'invalid_input',
+      );
     }
     const maxDays = bank.maximum_consent_validity ? Math.floor(bank.maximum_consent_validity / 86_400) : input.validDays;
     const validDays = Math.min(input.validDays, maxDays);
@@ -265,6 +462,8 @@ export class Bank {
       redirectUrl: this.options.redirectUrl,
       state,
       language: input.language,
+      ...(input.authMethod ? { authMethod: input.authMethod } : {}),
+      ...(input.extendedHistory === undefined ? {} : { extendedHistory: input.extendedHistory }),
     });
     const company = this.companyInfo();
     return {
@@ -275,11 +474,11 @@ export class Bank {
       url: auth.url,
       expiresAt: new Date(expiresAt).toISOString(),
       next: this.options.consentCallback
-        ? `Open the URL and approve with MitID as someone authorised for ${company.name} (CVR ${company.cvr}) within 30 minutes. ` +
+        ? `Open the URL and sign in at the bank as someone authorised for ${company.name} (CVR ${company.cvr}) within 30 minutes. ` +
           'The bank then returns to a confirmation page that completes the consent and lists the accounts bound; nothing ' +
           'needs to be copied. Afterwards enablebanking_list_accounts shows the result. Only accounts registered to ' +
           `${company.name} in the account registry become readable; everything else in the consent is discarded.`
-        : `Open the URL and approve with MitID as someone authorised for ${company.name} (CVR ${company.cvr}). ` +
+        : `Open the URL and sign in at the bank as someone authorised for ${company.name} (CVR ${company.cvr}). ` +
           `You land on ${this.options.redirectUrl}; copy the WHOLE address from the browser and pass it to ` +
           'enablebanking_complete_consent within 30 minutes. Only accounts registered to ' +
           `${company.name} in the account registry become readable; everything else in the consent is discarded.`,
@@ -306,7 +505,7 @@ export class Bank {
     try {
       url = new URL(redirectUrl.trim());
     } catch {
-      throw new ConsentError('pass the full address you landed on after MitID (it contains ?code=…&state=…)');
+      throw new ConsentError('pass the full address you landed on after the bank\u2019s sign-in (it contains ?code=…&state=…)', 'invalid_input');
     }
     const bankError = url.searchParams.get('error');
     if (bankError) {
@@ -361,7 +560,7 @@ export class Bank {
   /**
    * Re-read the accounts behind an existing consent and bind them against the
    * registry as it is NOW — after an admin registered an account the consent
-   * already covered, no new MitID round is needed.
+   * already covered, no new sign-in at the bank is needed.
    */
   async refreshConsent(consent: string): Promise<BindingReport> {
     const session = this.store.sessions().find(candidate => candidate.key === consent);
@@ -446,6 +645,9 @@ export class Bank {
   }
 
   private async call<T>(link: LinkedAccount, fn: () => Promise<T>): Promise<T> {
+    // Counted before anything is sent: a read over the day's budget is refused here, not at the bank.
+    const decision = this.budget.take(link.session.sessionId);
+    if (!decision.ok) throw new ProblemError('unattended_limit', budgetRefusal(decision));
     try {
       return await fn();
     } catch (error) {
@@ -453,8 +655,11 @@ export class Bank {
         throw new ConsentError(
           `${link.session.aspsp.name} refused the consent for ${this.companyInfo().name} (${error.message}). ` +
             'It may have been revoked at the bank or expired; an administrator must renew it with enablebanking_start_consent.',
+          error.problem,
         );
       }
+      // The bank says its limit is reached: no further read for this consent until the pause is over.
+      if (problemOf(error) === 'rate_limited') this.budget.block(link.session.sessionId);
       throw error;
     }
   }
@@ -464,14 +669,39 @@ export class Bank {
    * holder is not present for (PSD2: as few as 4 per account per day), so the
    * same question asked twice in a conversation must not cost two bank calls.
    */
-  private async cached<T>(key: string, load: () => Promise<T>): Promise<T> {
-    if (this.cacheMs <= 0) return load();
-    const hit = this.cache.get(key);
-    if (hit && hit.expires > this.now()) return hit.value as T;
+  private async cached<T>(key: string, load: () => Promise<T>): Promise<{ value: T; fetchedAt: string }> {
+    const hit = this.cacheMs > 0 ? this.cache.get(key) : undefined;
+    if (hit && hit.expires > this.now()) return { value: hit.value as T, fetchedAt: hit.fetchedAt };
     const value = await load();
-    this.cache.set(key, { expires: this.now() + this.cacheMs, value });
-    return value;
+    // When the bank was read: an answer from the cache says how old it is.
+    const fetchedAt = new Date(this.now()).toISOString();
+    if (this.cacheMs > 0) this.cache.set(key, { expires: this.now() + this.cacheMs, fetchedAt, value });
+    return { value, fetchedAt };
   }
+}
+
+/** A bank as the bank list shows it. Sandbox test users of the raw answer are not passed on. */
+function bankSummary(bank: Aspsp) {
+  const seconds = typeof bank.maximum_consent_validity === 'number' && bank.maximum_consent_validity > 0 ? bank.maximum_consent_validity : null;
+  return {
+    name: bank.name,
+    country: bank.country,
+    bic: bank.bic ?? null,
+    psuTypes: bank.psu_types ?? [],
+    maxConsentDays: seconds === null ? null : Math.floor(seconds / 86_400),
+    // A new integration; usable as any other.
+    beta: bank.beta ?? false,
+    group: bank.group?.name ?? null,
+    authMethods: (bank.auth_methods ?? []).map(method => ({
+      name: method.name ?? null,
+      title: method.title ?? null,
+      psuType: method.psu_type ?? null,
+      approach: method.approach ?? null,
+    })),
+    // Headers a bank requires before it counts a read as one a person asked for. This server sends none: it does
+    // not see the person's browser, so every read here counts as a background read at the bank.
+    requiredPsuHeaders: bank.required_psu_headers ?? [],
+  };
 }
 
 export function sessionKey(aspsp: { name: string; country: string }, psuType: string): string {

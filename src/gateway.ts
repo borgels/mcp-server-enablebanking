@@ -1,27 +1,60 @@
-import { createPrivateKey, randomBytes, type KeyObject } from 'node:crypto';
-import type { AccountResource, SessionStatus, TransactionResource } from './enablebanking/client.js';
-import { balanceView, isoDate, summarize, transactionView, type TransactionView } from './enablebanking/format.js';
-import { maskIban, normalizeIban } from './enablebanking/registry.js';
+import { createPrivateKey, type KeyObject } from 'node:crypto';
+import type { AccountIdentification, AccountResource, Aspsp, AuthMethod } from './enablebanking/api.js';
+import { budgetRefusal, DEFAULT_UNATTENDED_FETCHES_PER_DAY, UnattendedBudget } from './enablebanking/budget.js';
+import { isProblemCode, problemOf, PROBLEM_CODES, type ProblemCode } from './enablebanking/problems.js';
+import { PSU_HEADER_NAMES, PSU_REFUSED, psuHeaders } from './enablebanking/psu.js';
+import { isValidIban, normalizeIban } from './enablebanking/registry.js';
 import {
   DEFAULT_API_BASE_URL,
   DEFAULT_MAX_RESPONSE_BYTES,
   DEFAULT_TIMEOUT_MS,
   GatewayClient,
   ID_PATTERN,
+  type PresenceHeaders,
 } from './gateway/client.js';
-import {
-  DEFAULT_RANGE_DAYS,
-  MAX_RANGE_DAYS,
-  SPEC_BY_NAME,
-  enableBankingGatewayTools,
-  type EnableBankingExposure,
-  type GatewayToolDefinition,
-  type GatewayJsonObject,
-  type GatewayJsonValue,
-} from './gateway/catalog.js';
+import { enableBankingGatewayTools, type GatewayToolDefinition, type GatewayJsonObject, type GatewayJsonValue } from './gateway/catalog.js';
 import { EnableBankingHttpError, ERROR_CODES } from './errors.js';
-import { failureInForm, failureMetadata, type FailureMetadata } from './gateway/failure.js';
+import { failureInForm, failureMetadata } from './gateway/failure.js';
 import { FRAGMENT_LENGTH, GatewayRedactor } from './gateway/redact.js';
+import {
+  AnswerCache,
+  bankReads,
+  callCredentials,
+  consentAccount,
+  consentState,
+  errorResult,
+  instant,
+  NO_CREDENTIALS,
+  NOT_ALLOWED,
+  NOT_IN_CONSENT,
+  PAGE_TOKEN_MISMATCH,
+  PAGE_TOKEN_UNKNOWN,
+  PageTokens,
+  parseCall,
+  PRESENCE_CONTRADICTION,
+  runTool,
+  SESSION_STATUSES,
+  sessionAccess,
+  sessionAccountHashes,
+  sessionAccounts,
+  sessionBank,
+  type PageState,
+} from './gateway/tools.js';
+import type {
+  CompleteSessionResult,
+  ConsentAccount,
+  EnableBankingApplicationStatus,
+  EnableBankingAuthMethod,
+  EnableBankingBank,
+  EnableBankingGatewayOptions,
+  EnableBankingReadTargetResolution,
+  EndSessionResult,
+  GatewayCallContext,
+  GatewayToolResult,
+  SessionStatusResult,
+  StartAuthorizationInput,
+  StartAuthorizationResult,
+} from './gateway/types.js';
 import { fixedOutputs, INPUT_REFUSED, RESULT_WITHHELD, SESSION_REFUSED, withheldResult } from './fallbacks.js';
 import { admitsKey, KEY_REFUSED, keyRefusedText, leaksSecret, sealedError, type LeakMatcher } from './key-admission.js';
 
@@ -37,11 +70,15 @@ import { admitsKey, KEY_REFUSED, keyRefusedText, leaksSecret, sealedError, type 
  * - Each call carries the company's `sessionId` and `accountIds`: the accounts
  *   the company consented to and the host stored. An account outside that list
  *   is refused before any request; the bank session must also still contain it.
- * - Read-only: accounts, balances, transactions. There is no payment tool,
- *   method or endpoint anywhere in this surface.
+ * - Each call can say who is behind it: a person present (`psu`), or nobody
+ *   (`unattended`). That decides whether the bank counts the read against its
+ *   limit on background reads, and whether the gateway's own daily budget applies.
+ * - Read-only: accounts, balances, transactions, and summaries and searches
+ *   computed from them. There is no tool, method or endpoint that can move
+ *   money anywhere in this surface.
  * - The consent helpers (listBanks, startAuthorization, completeSession,
- *   sessionStatus, endSession) are plain functions for the host's own consent
- *   page; they are not tools and an AI client cannot reach them.
+ *   sessionStatus, endSession, application) are plain functions for the host's
+ *   own consent page; they are not tools and an AI client cannot reach them.
  */
 
 export {
@@ -61,256 +98,61 @@ export {
   type GatewayUpstreamOperation,
 } from './gateway/catalog.js';
 
-/**
- * Metadata about a failed call, on an error result whose cause is known: the HTTP status Enable Banking answered with,
- * and its own request id when a response header gives one as a UUID or hex id. For a host that counts failures
- * without reading their text. Never the response body, the error code or message, or the input.
- */
-export type GatewayFailure = FailureMetadata;
+export type {
+  CompleteSessionResult,
+  ConsentAccount,
+  EnableBankingAccountSelection,
+  EnableBankingApplicationStatus,
+  EnableBankingAuthMethod,
+  EnableBankingBank,
+  EnableBankingGatewayCredentials,
+  EnableBankingGatewayOptions,
+  EnableBankingKnownAccount,
+  EnableBankingProblemCode,
+  EnableBankingPsu,
+  EnableBankingReadTarget,
+  EnableBankingReadTargetResolution,
+  EndSessionResult,
+  GatewayCallContext,
+  GatewayFailure,
+  GatewayToolResult,
+  SessionStatusResult,
+  StartAuthorizationInput,
+  StartAuthorizationResult,
+} from './gateway/types.js';
 
-export interface GatewayToolResult {
-  content: Array<{ type: 'text'; text: string }>;
-  structuredContent?: GatewayJsonValue;
-  isError?: boolean;
-  /** On an error result from Enable Banking's API only: its HTTP status and request id (see GatewayFailure). */
-  failure?: GatewayFailure;
-}
+/** Every value `errorCode` (on a result) and `problem` (on a consent helper's error) can have. Frozen. */
+export const enableBankingProblemCodes: readonly ProblemCode[] = Object.freeze([...PROBLEM_CODES]);
 
-/** One company's consent, passed with each call. */
-export interface EnableBankingGatewayCredentials {
-  /** The Enable Banking session id from completeSession. */
-  sessionId: string;
-  /**
-   * The accounts (Enable Banking account uids) this company has consented to
-   * and the host has stored. Only these can be read; matched exactly.
-   */
-  accountIds: readonly string[];
-}
-
-/**
- * Per-call context. `caller` and `requestId` have the same shape as the other
- * servers' gateways; they are not sent to Enable Banking or stored.
- * `credentials` is required for every tool call; there is no fallback.
- */
-export interface GatewayCallContext {
-  caller?: string;
-  requestId?: string;
-  credentials?: EnableBankingGatewayCredentials;
-}
-
-export interface EnableBankingGatewayOptions {
-  /** The Enable Banking application id (the JWT `kid`). */
-  applicationId: string;
-  /** The application's RS256 private key: PEM text or a KeyObject. */
-  privateKey: string | KeyObject;
-  /** Default https://api.enablebanking.com. An https origin (http only on loopback, for tests). */
-  apiBaseUrl?: string;
-  fetchImpl?: typeof fetch;
-  /** Per-request time limit. Default 30 seconds; 1-120 seconds. */
-  timeoutMs?: number;
-  /** Largest successful response body accepted. Default 4 MB. */
-  maxResponseBytes?: number;
-  /** Clock, for tests. */
-  now?: () => number;
-}
-
-/** What a tool call will read, resolved before anything is sent. */
-export interface EnableBankingReadTarget {
-  readonly tool: string;
-  readonly exposure: EnableBankingExposure;
-  readonly account?: string;
-  readonly from?: string;
-  readonly to?: string;
-  readonly status?: 'booked' | 'pending' | 'all';
-  /** True when the call continues a previous page. */
-  readonly continued?: boolean;
-}
-
-export type EnableBankingReadTargetResolution =
-  | { readonly ok: true; readonly target: EnableBankingReadTarget }
-  | { readonly ok: false; readonly reason: string };
-
-/** A bank (ASPSP) a company can connect. */
-export interface EnableBankingBank {
-  name: string;
-  country: string;
-  bic: string | null;
-  psuTypes: string[];
-  /** The longest consent the bank gives, in days (rounded down). Null when the bank does not say. */
-  maximumConsentDays: number | null;
-  beta: boolean;
-}
-
-export interface StartAuthorizationInput {
-  /** Exact bank name from listBanks. */
-  bank: string;
-  /** ISO 3166 two-letter code. Default DK. */
-  country?: string;
-  /** Default business. */
-  psuType?: 'business' | 'personal';
-  /** Registered with the application at Enable Banking. https. */
-  redirectUrl: string;
-  /** The host's own unguessable, single-use value; it comes back on the redirect. 16-512 of A-Z a-z 0-9 . _ ~ - */
-  state: string;
-  /** End of the consent. Default: the bank's maximum (less five minutes). Refused beyond it. */
-  validUntil?: string | Date;
-  /** Language of the bank's pages, e.g. "da". */
-  language?: string;
-}
-
-export interface StartAuthorizationResult {
-  /** The bank's page; send the person there. */
-  url: string;
-  validUntil: string;
-  maximumConsentDays: number;
-}
-
-export interface ConsentAccount {
-  /** Enable Banking account uid: what goes into credentials.accountIds. */
-  id: string;
-  name: string | null;
-  /** First four and last four characters, e.g. DK12…4567. */
-  maskedIban: string | null;
-  currency: string | null;
-  /**
-   * Enable Banking's identification hash of the account: the same for the same account in every consent, while the
-   * uid changes with each new session. What a host uses to recognise an account again (renewal, duplicates). Null when
-   * the bank gave none or it is not a plain token.
-   */
-  identificationHash: string | null;
-}
-
-export interface CompleteSessionResult {
-  sessionId: string;
-  validUntil: string | null;
-  bank: { name: string; country: string } | null;
-  psuType: string | null;
-  accounts: ConsentAccount[];
-  /** Accounts in the session without a uid (cannot be read). */
-  accountsWithoutId: number;
-}
-
-export interface SessionStatusResult {
-  status: string | null;
-  validUntil: string | null;
-  accountIds: string[];
-  /** The session's accounts with their identification hash (see ConsentAccount), where Enable Banking gave one. */
-  accounts: Array<{ id: string; identificationHash: string | null }>;
-}
+/** The request header each field of a call's `psu` is sent as. Frozen. */
+export const enableBankingPsuHeaders: Readonly<Record<string, string>> = PSU_HEADER_NAMES;
 
 /** Error thrown by the consent helpers. Its message is redacted and carries no cause. */
 export class EnableBankingGatewayError extends Error {
   readonly status?: number;
+  /** Enable Banking's documented error code, when its answer named one. */
   readonly code?: string;
-  constructor(message: string, details: { status?: number; code?: string } = {}) {
+  /** Our own fixed code for what went wrong (see enableBankingProblemCodes), when it is known. */
+  readonly problem?: ProblemCode;
+  constructor(message: string, details: { status?: number; code?: string; problem?: ProblemCode } = {}) {
     super(message);
     this.name = 'EnableBankingGatewayError';
     if (details.status !== undefined) this.status = details.status;
     if (details.code !== undefined) this.code = details.code;
+    if (details.problem !== undefined) this.problem = details.problem;
   }
 }
 
-const DAY_MS = 86_400_000;
-const MAX_PAGES_PER_CALL = 5;
-const MAX_ROWS_PER_CALL = 1_000;
-const MAX_ACCOUNT_IDS = 100;
-const MAX_LIST_ACCOUNTS = 25;
+const MAX_CACHE_SECONDS = 600;
+const MAX_SELECTED_ACCOUNTS = 50;
 const DEFAULT_MAXIMUM_CONSENT_SECONDS = 90 * 86_400;
 const STATE_PATTERN = /^[A-Za-z0-9._~-]{16,512}$/;
 const CODE_PATTERN = /^[A-Za-z0-9._~+/=-]{1,2048}$/;
 const COUNTRY_PATTERN = /^[A-Z]{2}$/;
 const LANGUAGE_PATTERN = /^[a-z]{2}$/;
-const DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
-/** Enable Banking's documented session statuses (API reference, SessionStatus). */
-const SESSION_STATUSES: ReadonlySet<string> = new Set([
-  'AUTHORIZED',
-  'CANCELLED',
-  'CLOSED',
-  'EXPIRED',
-  'INVALID',
-  'PENDING_AUTHORIZATION',
-  'RETURNED_FROM_BANK',
-  'REVOKED',
-]);
-
-const NOT_ALLOWED = 'Refused: that account is not one of the accounts this company has connected.';
-const NO_CREDENTIALS =
-  'Refused: no Enable Banking consent was given with the call (credentials.sessionId and credentials.accountIds are required).';
-
-// ------------------------------------------------------------------ input
-
-function refuse(reason: string): EnableBankingReadTargetResolution {
-  return { ok: false, reason };
-}
-
-function isValidDate(value: string): boolean {
-  if (!DATE_PATTERN.test(value)) return false;
-  const parsed = new Date(`${value}T00:00:00Z`);
-  return !Number.isNaN(parsed.getTime()) && isoDate(parsed) === value;
-}
-
-/**
- * Page tokens are opaque: 32 random bytes (base64url, 43 characters) that
- * name, in the memory of the gateway instance that issued them, where the
- * next page starts (Enable Banking's continuation key of the page to fetch,
- * empty for the first page, and how many rows of it were already returned)
- * and what it belongs to (session, account, period and status). Nothing of
- * that is in the token. A token is accepted only by the instance that issued
- * it, for PAGE_TOKEN_TTL_MS; at most MAX_PAGE_TOKENS are kept, the oldest
- * dropped first.
- */
-interface PageState {
-  k: string;
-  o: number;
-  session: string;
-  a: string;
-  f: string;
-  t: string;
-  s: string;
-  expires: number;
-}
-
-const PAGE_TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/;
-const PAGE_TOKEN_TTL_MS = 15 * 60_000;
-const MAX_PAGE_TOKENS = 10_000;
-/** Longest continuation key kept for a page token; a longer one ends the listing as incomplete. */
-const MAX_CONTINUATION_KEY_LENGTH = 2048;
-/** Rows of one bank page a token may skip (banks with very large pages). */
-const MAX_PAGE_OFFSET = 100_000;
-const PAGE_TOKEN_UNKNOWN = 'pageToken was not issued here, or it has expired; start again without it.';
-const PAGE_TOKEN_MISMATCH = 'pageToken does not belong to this account and period; start again without it.';
-
-class PageTokens {
-  private readonly entries = new Map<string, PageState>();
-
-  constructor(private readonly now: () => number) {}
-
-  issue(state: Omit<PageState, 'expires'>): string {
-    this.prune();
-    while (this.entries.size >= MAX_PAGE_TOKENS) {
-      const oldest = this.entries.keys().next().value;
-      if (oldest === undefined) break;
-      this.entries.delete(oldest);
-    }
-    const id = randomBytes(32).toString('base64url');
-    this.entries.set(id, { ...state, expires: this.now() + PAGE_TOKEN_TTL_MS });
-    return id;
-  }
-
-  find(id: string): PageState | undefined {
-    this.prune();
-    return this.entries.get(id);
-  }
-
-  /** Entries are kept in the order they were issued, so the expired ones come first. */
-  private prune(): void {
-    const now = this.now();
-    for (const [id, entry] of this.entries) {
-      if (entry.expires > now) break;
-      this.entries.delete(id);
-    }
-  }
-}
+/** An auth method name, an authorisation id and an identifier scheme: plain tokens only. */
+const TOKEN_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
+const IDENTIFICATION_PATTERN = /^[A-Za-z0-9 ._:/-]{1,64}$/;
 
 /**
  * Resolves what a tool call will read, with the same checks callTool applies
@@ -323,57 +165,23 @@ export function resolveEnableBankingReadTarget(
   input: GatewayJsonObject = {},
   now: number = Date.now(),
 ): EnableBankingReadTargetResolution {
-  const spec = typeof toolName === 'string' ? SPEC_BY_NAME.get(toolName) : undefined;
-  // The name and the field names are the host's input: not repeated, so nothing it carries is echoed.
-  if (!spec) return refuse('Unsupported Enable Banking gateway tool.');
-  if (input === null || typeof input !== 'object' || Array.isArray(input)) return refuse('Input must be an object.');
-  const properties = (spec.inputSchema.properties ?? {}) as GatewayJsonObject;
-  const unknown = Object.keys(input).filter(key => !Object.hasOwn(properties, key));
-  if (unknown.length > 0) {
-    return refuse(`Unknown input field(s) for ${spec.name}: ${unknown.length}.`);
-  }
-
-  if (spec.name === 'list_accounts') return { ok: true, target: { tool: spec.name, exposure: spec.exposure } };
-
-  const account = input.account;
-  if (typeof account !== 'string' || !ID_PATTERN.test(account)) return refuse(NOT_ALLOWED);
-  if (spec.name === 'get_balances') return { ok: true, target: { tool: spec.name, exposure: spec.exposure, account } };
-
-  // list_transactions
-  for (const key of ['from', 'to', 'status', 'pageToken'] as const) {
-    if (input[key] !== undefined && input[key] !== null && typeof input[key] !== 'string') return refuse(`${key} must be a string.`);
-  }
-  const status = (input.status ?? 'booked') as string;
-  if (status !== 'booked' && status !== 'pending' && status !== 'all') return refuse('status must be booked, pending or all.');
-  const today = isoDate(new Date(now));
-  const to = (input.to as string | null | undefined) ?? today;
-  if (!isValidDate(to)) return refuse('to must be a date, YYYY-MM-DD.');
-  // The default period is DEFAULT_RANGE_DAYS days including `to`.
-  const from = (input.from as string | null | undefined) ?? isoDate(new Date(Date.parse(to) - (DEFAULT_RANGE_DAYS - 1) * DAY_MS));
-  if (!isValidDate(from)) return refuse('from must be a date, YYYY-MM-DD.');
-  if (from > to) return refuse(`from (${from}) is after to (${to}).`);
-  if (to > isoDate(new Date(now + DAY_MS))) return refuse('to cannot be in the future.');
-  if ((Date.parse(to) - Date.parse(from)) / DAY_MS + 1 > MAX_RANGE_DAYS) {
-    return refuse(`The period is longer than ${MAX_RANGE_DAYS} days; ask for a shorter one.`);
-  }
-  const pageToken = input.pageToken as string | null | undefined;
-  // Only the form is checked here: what a token stands for is known only to the instance that issued it (callTool).
-  if (pageToken && !PAGE_TOKEN_PATTERN.test(pageToken)) return refuse(PAGE_TOKEN_UNKNOWN);
-  return {
-    ok: true,
-    target: { tool: spec.name, exposure: spec.exposure, account, from, to, status, ...(pageToken ? { continued: true } : {}) },
-  };
+  const resolution = parseCall(toolName, input, now);
+  return resolution.ok ? { ok: true, target: resolution.target } : { ok: false, reason: resolution.reason, code: resolution.code };
 }
 
-/** The call's consent, or undefined when it is missing, empty or malformed. No fallback. */
-function callCredentials(context: GatewayCallContext | undefined): { sessionId: string; accountIds: ReadonlySet<string> } | undefined {
-  const credentials = context?.credentials as unknown;
-  if (!credentials || typeof credentials !== 'object') return undefined;
-  const { sessionId, accountIds } = credentials as { sessionId?: unknown; accountIds?: unknown };
-  if (typeof sessionId !== 'string' || !ID_PATTERN.test(sessionId)) return undefined;
-  if (!Array.isArray(accountIds) || accountIds.length === 0 || accountIds.length > MAX_ACCOUNT_IDS) return undefined;
-  if (!accountIds.every(id => typeof id === 'string' && ID_PATTERN.test(id))) return undefined;
-  return { sessionId, accountIds: new Set(accountIds as string[]) };
+/** Who is behind a call: a person (their headers), nobody, or not said. */
+type Presence = { kind: 'present'; headers: PresenceHeaders } | { kind: 'unattended' } | { kind: 'unspecified' };
+
+function callPresence(context: GatewayCallContext | undefined): Presence | { kind: 'refused'; reason: string } {
+  const psu = (context as { psu?: unknown } | undefined)?.psu;
+  const unattended = (context as { unattended?: unknown } | undefined)?.unattended;
+  if (unattended !== undefined && typeof unattended !== 'boolean') return { kind: 'refused', reason: PSU_REFUSED };
+  if (psu !== undefined && psu !== null) {
+    if (unattended === true) return { kind: 'refused', reason: PRESENCE_CONTRADICTION };
+    const parsed = psuHeaders(psu);
+    return parsed.ok ? { kind: 'present', headers: parsed.headers } : { kind: 'refused', reason: PSU_REFUSED };
+  }
+  return unattended === true ? { kind: 'unattended' } : { kind: 'unspecified' };
 }
 
 // ------------------------------------------------------------------ factory
@@ -560,6 +368,13 @@ function buildEnableBankingGateway(options: EnableBankingGatewayOptions) {
   const now = options.now ?? Date.now;
   // Where each issued page token continues; never leaves the instance.
   const pages = new PageTokens(now);
+  // Finished answers, only when the host asked for it (default: nothing is kept).
+  const cache = new AnswerCache(boundedInt(options.cacheSeconds, 0, 0, MAX_CACHE_SECONDS, 'cacheSeconds') * 1000, now);
+  // Reads made with nobody present, per consent.
+  const budget = new UnattendedBudget(
+    boundedInt(options.unattendedFetchesPerDay, DEFAULT_UNATTENDED_FETCHES_PER_DAY, 0, 1_000, 'unattendedFetchesPerDay'),
+    now,
+  );
   const client = new GatewayClient({
     applicationId,
     key,
@@ -665,9 +480,10 @@ function buildEnableBankingGateway(options: EnableBankingGatewayOptions) {
       }
       let result: GatewayToolResult;
       try {
-        result = await runCall(toolName, input ?? {}, context, callRedactor);
+        result = await runCall(toolName, input ?? {}, context);
       } catch (error) {
-        result = errorResult(callRedactor.message(error), failureMetadata(error));
+        // The text is ours; the code says what went wrong without it. Anything unnamed is a failure at Enable Banking.
+        result = errorResult(callRedactor.message(error), failureMetadata(error), problemOf(error) ?? 'upstream_error');
       }
       // Every result, refusals and errors included, through the call's redactor, and then the sink check as the very
       // last step: a result that holds a piece of the key or the session id anywhere is withheld whole.
@@ -675,23 +491,16 @@ function buildEnableBankingGateway(options: EnableBankingGatewayOptions) {
       return leaksSecret(final, callRedactor) ? withheldResult() : final;
     },
 
-    /** Banks (ASPSPs) offering account information in a country. */
+    /**
+     * Banks (ASPSPs) offering account information. Without a country: every country the application covers.
+     * Without a PSU type: banks for business and for personal customers.
+     */
     listBanks(input: { country?: string; psuType?: 'business' | 'personal' } = {}): Promise<EnableBankingBank[]> {
       return helper([], async () => {
-        const country = checkCountry(input.country);
-        const psuType = checkPsuType(input.psuType);
+        const country = input.country === undefined ? undefined : checkCountry(input.country);
+        const psuType = input.psuType === undefined ? undefined : checkPsuType(input.psuType);
         const banks = await client.listAspsps(country, psuType);
-        return banks
-          .filter(bank => typeof bank?.name === 'string' && typeof bank.country === 'string')
-          .map(bank => ({
-            name: bank.name,
-            country: bank.country,
-            bic: typeof bank.bic === 'string' ? bank.bic : null,
-            psuTypes: Array.isArray(bank.psu_types) ? bank.psu_types.filter(value => typeof value === 'string') : [],
-            maximumConsentDays:
-              typeof bank.maximum_consent_validity === 'number' ? Math.floor(bank.maximum_consent_validity / 86_400) : null,
-            beta: bank.beta === true,
-          }));
+        return banks.filter(bank => typeof bank?.name === 'string' && typeof bank.country === 'string').map(bankView);
       });
     },
 
@@ -703,6 +512,7 @@ function buildEnableBankingGateway(options: EnableBankingGatewayOptions) {
     startAuthorization(input: StartAuthorizationInput): Promise<StartAuthorizationResult> {
       return helper([input?.state], async () => {
         if (!input || typeof input !== 'object') throw new Error('startAuthorization: input is required.');
+        if (input.country === undefined) throw new Error('startAuthorization: country is required (the two-letter country code of the bank).');
         const country = checkCountry(input.country);
         const psuType = checkPsuType(input.psuType);
         const bankName = typeof input.bank === 'string' ? input.bank.trim() : '';
@@ -714,9 +524,23 @@ function buildEnableBankingGateway(options: EnableBankingGatewayOptions) {
         if (input.language !== undefined && (typeof input.language !== 'string' || !LANGUAGE_PATTERN.test(input.language))) {
           throw new Error('startAuthorization: language must be two lower-case letters.');
         }
+        for (const flag of ['balances', 'transactions', 'extendedHistory'] as const) {
+          if (input[flag] !== undefined && typeof input[flag] !== 'boolean') throw new Error(`startAuthorization: ${flag} must be true or false.`);
+        }
+        const accounts = checkAccountSelection(input.accounts);
 
         const bank = await bankByName(country, psuType, bankName);
         if (!bank) throw new Error(`startAuthorization: no bank named that offers account information to ${psuType} customers in ${country}.`);
+        let authMethod: string | undefined;
+        if (input.authMethod !== undefined) {
+          const offered = (Array.isArray(bank.auth_methods) ? bank.auth_methods : []).filter(
+            method => typeof method?.name === 'string' && (method.psu_type === undefined || method.psu_type === null || method.psu_type === psuType),
+          );
+          authMethod = offered.find(method => method.name === input.authMethod)?.name ?? undefined;
+          if (!authMethod || !TOKEN_PATTERN.test(authMethod)) {
+            throw new Error(`startAuthorization: the bank offers no such authMethod to ${psuType} customers (see listBanks).`);
+          }
+        }
         const maximumSeconds =
           typeof bank.maximum_consent_validity === 'number' && bank.maximum_consent_validity > 0
             ? bank.maximum_consent_validity
@@ -736,11 +560,18 @@ function buildEnableBankingGateway(options: EnableBankingGatewayOptions) {
         const validUntilIso = new Date(validUntil).toISOString();
 
         const answer = await client.startAuthorization({
-          access: { valid_until: validUntilIso },
+          access: {
+            valid_until: validUntilIso,
+            ...(accounts ? { accounts } : {}),
+            ...(input.balances === undefined ? {} : { balances: input.balances }),
+            ...(input.transactions === undefined ? {} : { transactions: input.transactions }),
+            ...(input.extendedHistory === undefined ? {} : { transactions_extended_history: input.extendedHistory }),
+          },
           aspsp: { name: bank.name, country: bank.country },
           state: input.state,
           redirect_url: redirectUrl,
           psu_type: psuType,
+          ...(authMethod ? { auth_method: authMethod } : {}),
           ...(input.language ? { language: input.language } : {}),
         });
         const url = typeof answer?.url === 'string' ? answer.url : '';
@@ -751,7 +582,13 @@ function buildEnableBankingGateway(options: EnableBankingGatewayOptions) {
           parsed = undefined;
         }
         if (!parsed || parsed.protocol !== 'https:') throw new Error('startAuthorization: Enable Banking did not return an https address for the bank.');
-        return { url: parsed.toString(), validUntil: validUntilIso, maximumConsentDays: Math.floor(maximumSeconds / 86_400) };
+        const authorizationId = answer?.authorization_id;
+        return {
+          url: parsed.toString(),
+          validUntil: validUntilIso,
+          maximumConsentDays: Math.floor(maximumSeconds / 86_400),
+          authorizationId: typeof authorizationId === 'string' && TOKEN_PATTERN.test(authorizationId) ? authorizationId : null,
+        };
       });
     },
 
@@ -759,6 +596,8 @@ function buildEnableBankingGateway(options: EnableBankingGatewayOptions) {
      * Exchanges the `code` from the redirect for a session. The host checks
      * the returned `state` itself before calling this. The result's sessionId
      * and account ids are what the host stores as the company's credentials.
+     * A consent that covers no readable account comes back as a result with
+     * `outcome: 'no_accounts'`, not as an error.
      */
     completeSession(input: { code: string }): Promise<CompleteSessionResult> {
       const code = input && typeof input === 'object' ? input.code : undefined;
@@ -796,19 +635,18 @@ function buildEnableBankingGateway(options: EnableBankingGatewayOptions) {
         }
         return {
           sessionId,
+          outcome: accounts.length > 0 ? ('connected' as const) : ('no_accounts' as const),
           validUntil: instant(session?.access?.valid_until),
-          bank:
-            session?.aspsp && typeof session.aspsp.name === 'string' && typeof session.aspsp.country === 'string'
-              ? { name: session.aspsp.name, country: session.aspsp.country }
-              : null,
+          bank: sessionBank(session),
           psuType: typeof session?.psu_type === 'string' ? session.psu_type : null,
           accounts,
           accountsWithoutId,
+          access: sessionAccess(session),
         };
       });
     },
 
-    /** The state of a session at Enable Banking (for renewal reminders). */
+    /** The state of a session at Enable Banking (for renewal reminders). Not a read at the bank. */
     sessionStatus(input: { sessionId: string }): Promise<SessionStatusResult> {
       const sessionId = input && typeof input === 'object' ? input.sessionId : undefined;
       return helper([typeof sessionId === 'string' ? sessionId : undefined], async () => {
@@ -819,60 +657,156 @@ function buildEnableBankingGateway(options: EnableBankingGatewayOptions) {
           validUntil: instant(session?.access?.valid_until),
           accountIds: [...sessionAccounts(session)],
           accounts: sessionAccountHashes(session),
+          bank: sessionBank(session),
+          psuType: session?.psu_type === 'business' || session?.psu_type === 'personal' ? session.psu_type : null,
+          createdAt: instant(session?.created),
+          authorizedAt: instant(session?.authorized),
+          closedAt: instant(session?.closed),
+          access: sessionAccess(session),
         };
       });
     },
 
-    /** Closes a session at Enable Banking, which ends the consent at the bank. */
-    endSession(input: { sessionId: string }): Promise<void> {
+    /**
+     * Closes a session at Enable Banking, which ends the consent at the bank: for when a company removes the
+     * connection, renews it (end the old session once the new one is stored) or is closed. A session that Enable
+     * Banking says is already closed, expired, revoked or unknown counts as ended (`alreadyEnded: true`); any
+     * other failure is thrown, and the session may then still be open.
+     */
+    endSession(input: { sessionId: string }): Promise<EndSessionResult> {
       const sessionId = input && typeof input === 'object' ? input.sessionId : undefined;
       return helper([typeof sessionId === 'string' ? sessionId : undefined], async () => {
         if (typeof sessionId !== 'string' || !ID_PATTERN.test(sessionId)) throw new Error('endSession: sessionId is missing or malformed.');
-        await client.deleteSession(sessionId);
+        cache.dropConsent(AnswerCache.consentKey(sessionId));
+        try {
+          await client.deleteSession(sessionId);
+        } catch (error) {
+          const problem = problemOf(error);
+          if (problem === 'consent_expired' || problem === 'consent_revoked' || problem === 'consent_not_active') return { alreadyEnded: true };
+          throw error;
+        }
+        return { alreadyEnded: false };
+      });
+    },
+
+    /**
+     * The application as Enable Banking sees it: environment, whether it is active, countries and services. For a
+     * host's own health check. An application refused here (errors with `problem: 'application_refused'`) is refused
+     * for every company, whatever their consents.
+     */
+    application(): Promise<EnableBankingApplicationStatus> {
+      return helper([], async () => {
+        const application = await client.getApplication();
+        const strings = (value: unknown, pattern: RegExp): string[] =>
+          Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === 'string' && pattern.test(entry)) : [];
+        return {
+          environment: application?.environment === 'PRODUCTION' || application?.environment === 'SANDBOX' ? application.environment : null,
+          active: typeof application?.active === 'boolean' ? application.active : null,
+          countries: strings(application?.countries, COUNTRY_PATTERN),
+          services: strings(application?.services, /^[A-Z]{2,8}$/),
+          redirectUrls: strings(application?.redirect_urls, /^https?:\/\/[\x21-\x7E]{1,2000}$/),
+        };
       });
     },
   };
 
-  async function runCall(
-    toolName: string,
-    input: GatewayJsonObject,
-    context: GatewayCallContext | undefined,
-    callRedactor: GatewayRedactor,
-  ): Promise<GatewayToolResult> {
-    const resolution = resolveEnableBankingReadTarget(toolName, input, now());
-    if (!resolution.ok) return errorResult(resolution.reason);
-    const target = resolution.target;
+  async function runCall(toolName: string, input: GatewayJsonObject, context: GatewayCallContext | undefined): Promise<GatewayToolResult> {
+    const resolution = parseCall(toolName, input, now());
+    if (!resolution.ok) return errorResult(resolution.reason, undefined, resolution.code);
+    const { target, call } = resolution;
 
     const credentials = callCredentials(context);
-    if (!credentials) return errorResult(NO_CREDENTIALS);
-    if (target.account !== undefined && !credentials.accountIds.has(target.account)) return errorResult(NOT_ALLOWED);
+    if (!credentials) return errorResult(NO_CREDENTIALS, undefined, 'no_consent');
+    const named = [...(target.account === undefined ? [] : [target.account]), ...(target.accounts ?? [])];
+    if (named.some(account => !credentials.accountIds.has(account))) return errorResult(NOT_ALLOWED, undefined, 'account_not_connected');
 
-    // The bank session must still be authorised and still contain the account.
+    // Who is behind the call, before anything is sent: a malformed answer is refused, never read as "nobody".
+    const presence = callPresence(context);
+    if (presence.kind === 'refused') return errorResult(presence.reason, undefined, 'presence_incomplete');
+
+    // The bank session must still be authorised and still contain the account. Asked of Enable Banking on every call,
+    // cached answers included; it is not a read at the bank.
+    const consentKey = AnswerCache.consentKey(credentials.sessionId);
     const session = await client.getSession(credentials.sessionId);
     const consent = consentState(session, now());
-    if (!consent.ok) return errorResult(consent.reason);
-    if (target.account !== undefined && !consent.accounts.has(target.account)) {
-      return errorResult('Refused: the bank consent no longer covers that account. It must be connected again.');
+    if (!consent.ok) {
+      cache.dropConsent(consentKey);
+      return errorResult(consent.reason, undefined, consent.code);
     }
+    if (named.some(account => !consent.accounts.has(account))) return errorResult(NOT_IN_CONSENT, undefined, 'account_not_in_consent');
 
-    switch (target.tool) {
-      case 'list_accounts':
-        return listAccounts(client, credentials.accountIds, consent);
-      case 'get_balances':
-        return getBalances(client, target.account!);
-      default: {
-        const bound = { session: credentials.sessionId, a: target.account!, f: target.from!, t: target.to!, s: target.status ?? 'booked' };
-        let start: PageState | undefined;
-        if (target.continued) {
-          start = pages.find(input.pageToken as string);
-          if (!start) return errorResult(PAGE_TOKEN_UNKNOWN);
-          if (start.session !== bound.session || start.a !== bound.a || start.f !== bound.f || start.t !== bound.t || start.s !== bound.s) {
-            return errorResult(PAGE_TOKEN_MISMATCH);
-          }
+    let start: PageState | undefined;
+    if (call.tool === 'list_transactions') {
+      const bound = {
+        session: credentials.sessionId,
+        a: call.account,
+        f: call.period.from ?? '',
+        t: call.period.to ?? '',
+        s: call.period.status,
+        g: call.period.strategy,
+      };
+      if (call.pageToken) {
+        start = pages.find(call.pageToken);
+        if (!start) return errorResult(PAGE_TOKEN_UNKNOWN, undefined, 'page_token_invalid');
+        if (
+          start.session !== bound.session ||
+          start.a !== bound.a ||
+          start.f !== bound.f ||
+          start.t !== bound.t ||
+          start.s !== bound.s ||
+          start.g !== bound.g
+        ) {
+          return errorResult(PAGE_TOKEN_MISMATCH, undefined, 'page_token_invalid');
         }
-        return listTransactions(client, target, start, next => pages.issue({ ...next, ...bound }));
       }
     }
+    const period = call.tool === 'list_transactions' ? call.period : undefined;
+    const issuePageToken = (next: { k: string; o: number }) =>
+      pages.issue({
+        ...next,
+        session: credentials.sessionId,
+        a: call.tool === 'list_transactions' ? call.account : '',
+        f: period?.from ?? '',
+        t: period?.to ?? '',
+        s: period?.status ?? '',
+        g: period?.strategy ?? '',
+      });
+
+    // The same question again, within the seconds the host allows: answered from memory, with no read at the bank.
+    const cacheKey =
+      cache.enabled && !start
+        ? cache.key(consentKey, [toolName, input, [...credentials.accountIds].sort(), [...credentials.known.values()]])
+        : undefined;
+    if (cacheKey) {
+      const kept = cache.get(cacheKey);
+      if (kept) return kept;
+    }
+
+    // Nobody present: the read is taken from the day's budget for this consent, or refused before anything is sent.
+    const reads = bankReads(call, credentials, consent);
+    if (presence.kind === 'unattended' && reads > 0) {
+      const decision = budget.take(credentials.sessionId, reads);
+      if (!decision.ok) return errorResult(budgetRefusal(decision), undefined, 'unattended_limit');
+    }
+
+    let result: GatewayToolResult;
+    try {
+      result = await runTool(
+        { client, now, issuePageToken, ...(presence.kind === 'present' ? { presence: presence.headers } : {}) },
+        call,
+        credentials,
+        consent,
+        start ? { k: start.k, o: start.o } : undefined,
+      );
+    } catch (error) {
+      const problem = problemOf(error);
+      // The bank says its limit is reached: no further background read for this consent until the pause is over.
+      if (problem === 'rate_limited' && presence.kind !== 'present') budget.block(credentials.sessionId);
+      if (problem === 'consent_expired' || problem === 'consent_revoked' || problem === 'consent_not_active') cache.dropConsent(consentKey);
+      throw error;
+    }
+    if (cacheKey) cache.set(cacheKey, consentKey, result);
+    return result;
   }
 }
 
@@ -882,7 +816,7 @@ export type EnableBankingGateway = ReturnType<typeof createEnableBankingGateway>
 // ------------------------------------------------------------------ helpers
 
 function checkCountry(value: unknown): string {
-  const country = value === undefined ? 'DK' : typeof value === 'string' ? value.trim().toUpperCase() : '';
+  const country = typeof value === 'string' ? value.trim().toUpperCase() : '';
   if (!COUNTRY_PATTERN.test(country)) throw new Error('country must be a two-letter country code.');
   return country;
 }
@@ -907,210 +841,88 @@ function checkRedirectUrl(value: unknown): string {
   return url.toString();
 }
 
+/** The accounts to ask a bank for, as the API takes them, or undefined when none were named. */
+function checkAccountSelection(value: unknown): AccountIdentification[] | undefined {
+  if (value === undefined) return undefined;
+  const refused = () =>
+    new Error(`startAuthorization: accounts must be 1 to ${MAX_SELECTED_ACCOUNTS} entries of { iban } or { scheme, identification }.`);
+  if (!Array.isArray(value) || value.length === 0 || value.length > MAX_SELECTED_ACCOUNTS) throw refused();
+  return value.map((entry: unknown): AccountIdentification => {
+    if (!entry || typeof entry !== 'object') throw refused();
+    const { iban, scheme, identification } = entry as { iban?: unknown; scheme?: unknown; identification?: unknown };
+    if (typeof iban === 'string' && scheme === undefined && identification === undefined) {
+      const normalised = normalizeIban(iban);
+      if (!isValidIban(normalised)) throw new Error('startAuthorization: an iban in accounts is not a valid IBAN.');
+      return { iban: normalised };
+    }
+    if (iban === undefined && typeof scheme === 'string' && typeof identification === 'string' && /^[A-Z]{2,8}$/.test(scheme) && IDENTIFICATION_PATTERN.test(identification)) {
+      return { other: { scheme_name: scheme, identification } };
+    }
+    throw refused();
+  });
+}
+
+function plain(value: unknown, max = 200): string | null {
+  const trimmed = typeof value === 'string' ? value.trim() : '';
+  return trimmed && trimmed.length <= max ? trimmed : null;
+}
+
+function authMethodView(method: AuthMethod): EnableBankingAuthMethod | undefined {
+  const name = plain(method?.name);
+  if (!name) return undefined;
+  const credentials = Array.isArray(method.credentials) ? method.credentials : [];
+  return {
+    name,
+    title: plain(method.title),
+    psuType: method.psu_type === 'business' || method.psu_type === 'personal' ? method.psu_type : null,
+    approach: method.approach === 'REDIRECT' || method.approach === 'DECOUPLED' || method.approach === 'EMBEDDED' ? method.approach : null,
+    hidden: method.hidden_method === true,
+    // What is asked for, never a value: a host's page can tell the person what the bank will want.
+    credentials: credentials.flatMap(credential => {
+      const credentialName = plain(credential?.name);
+      return credentialName ? [{ name: credentialName, title: plain(credential.title), required: credential.required === true }] : [];
+    }),
+  };
+}
+
+/** A bank as listBanks returns it. The sandbox test users and the payment types of the raw answer are not passed on. */
+function bankView(bank: Aspsp): EnableBankingBank {
+  const seconds = typeof bank.maximum_consent_validity === 'number' && bank.maximum_consent_validity > 0 ? bank.maximum_consent_validity : null;
+  const logo = plain(bank.logo, 2000);
+  const known = new Set(Object.values(PSU_HEADER_NAMES).map(name => name.toLowerCase()));
+  return {
+    name: bank.name,
+    country: bank.country,
+    bic: typeof bank.bic === 'string' ? bank.bic : null,
+    psuTypes: Array.isArray(bank.psu_types) ? bank.psu_types.filter(value => typeof value === 'string') : [],
+    maximumConsentDays: seconds === null ? null : Math.floor(seconds / 86_400),
+    maximumConsentSeconds: seconds,
+    beta: bank.beta === true,
+    sandbox: bank.sandbox !== undefined && bank.sandbox !== null && bank.sandbox !== false,
+    group: plain(bank.group?.name),
+    logoUrl: logo && /^https:\/\//.test(logo) ? logo : null,
+    authMethods: (Array.isArray(bank.auth_methods) ? bank.auth_methods : []).flatMap(method => authMethodView(method) ?? []),
+    // Only header names the API documents: anything else in the list is not passed on.
+    requiredPsuHeaders: (Array.isArray(bank.required_psu_headers) ? bank.required_psu_headers : []).filter(
+      (header): header is string => typeof header === 'string' && known.has(header.toLowerCase()),
+    ),
+  };
+}
+
 /** Status and code of our own HTTP error only; the code is one of Enable Banking's documented codes. */
-function httpDetails(error: unknown): { status?: number; code?: string } {
-  if (!(error instanceof EnableBankingHttpError)) return {};
-  return { status: error.status, ...(error.code !== undefined && ERROR_CODES.has(error.code) ? { code: error.code } : {}) };
-}
-
-/** A date and time from Enable Banking as ISO 8601 in UTC, or null when it is not one. Nothing else of it is kept. */
-function instant(value: unknown): string | null {
-  if (typeof value !== 'string' || value.length > 64) return null;
-  const ms = Date.parse(value);
-  return Number.isNaN(ms) ? null : new Date(ms).toISOString();
-}
-
-function sessionAccounts(session: SessionStatus | undefined): Set<string> {
-  const ids = new Set<string>();
-  for (const id of Array.isArray(session?.accounts) ? session.accounts : []) if (typeof id === 'string') ids.add(id);
-  const data = (session as { accounts_data?: unknown } | undefined)?.accounts_data;
-  if (Array.isArray(data)) {
-    for (const entry of data) {
-      const uid = (entry as { uid?: unknown } | null)?.uid;
-      if (typeof uid === 'string') ids.add(uid);
-    }
-  }
-  return ids;
-}
-
-/** An identification hash from Enable Banking, or null when it is missing or not a plain token. */
-/**
- * Enable Banking's identification hash of an account: opaque, in their documented examples two base64 parts joined by
- * a dot (about 100 characters). Anything else than that alphabet, or over 256 characters, is dropped.
- */
-const HASH_PATTERN = /^[A-Za-z0-9+/=_.-]{8,256}$/;
-function identificationHash(value: unknown): string | null {
-  return typeof value === 'string' && HASH_PATTERN.test(value) ? value : null;
-}
-
-/** The session's accounts (uids from `accounts` and `accounts_data`) with the identification hash where given. */
-function sessionAccountHashes(session: SessionStatus | undefined): Array<{ id: string; identificationHash: string | null }> {
-  const hashes = new Map<string, string | null>();
-  const data = (session as { accounts_data?: unknown } | undefined)?.accounts_data;
-  if (Array.isArray(data)) {
-    for (const entry of data) {
-      const uid = (entry as { uid?: unknown } | null)?.uid;
-      if (typeof uid === 'string' && ID_PATTERN.test(uid)) {
-        hashes.set(uid, identificationHash((entry as { identification_hash?: unknown }).identification_hash));
-      }
-    }
-  }
-  return [...sessionAccounts(session)].filter(id => ID_PATTERN.test(id)).map(id => ({ id, identificationHash: hashes.get(id) ?? null }));
-}
-
-type ConsentCheck =
-  | { ok: true; accounts: Set<string>; validUntil: string | null }
-  | { ok: false; reason: string };
-
-function consentState(session: SessionStatus | undefined, now: number): ConsentCheck {
-  const status = typeof session?.status === 'string' ? session.status : undefined;
-  if (status !== 'AUTHORIZED') {
-    // Only a documented status is named; anything else from Enable Banking is not repeated.
-    return {
-      ok: false,
-      reason: `The bank consent is not active${status && SESSION_STATUSES.has(status) ? ` (${status})` : ''}. It must be renewed.`,
-    };
-  }
-  const validUntil = instant(session?.access?.valid_until);
-  if (validUntil && Date.parse(validUntil) <= now) {
-    return { ok: false, reason: `The bank consent expired on ${validUntil.slice(0, 10)}. It must be renewed.` };
-  }
-  return { ok: true, accounts: sessionAccounts(session), validUntil };
-}
-
-function ibanOf(account: AccountResource): string | null {
-  const direct = account.account_id?.iban;
-  if (typeof direct === 'string' && direct) return normalizeIban(direct);
-  const other = Array.isArray(account.all_account_ids)
-    ? account.all_account_ids.find(id => id?.scheme_name === 'IBAN' && typeof id.identification === 'string')
-    : undefined;
-  return other?.identification ? normalizeIban(other.identification) : null;
+function httpDetails(error: unknown): { status?: number; code?: string; problem?: ProblemCode } {
+  const problem = problemOf(error);
+  if (!(error instanceof EnableBankingHttpError)) return problem ? { problem } : {};
+  return {
+    status: error.status,
+    ...(error.code !== undefined && ERROR_CODES.has(error.code) ? { code: error.code } : {}),
+    ...(problem ? { problem } : {}),
+  };
 }
 
 /** The content of a PEM key, without armour and whitespace: what the redactor holds pieces of. */
 function pemContent(pem: string): string {
   return pem.replace(/-----(BEGIN|END) [A-Z ]*-----/g, '').replace(/\s+/g, '');
-}
-
-function text(value: unknown): string | null {
-  // Over 200 characters is dropped, not cut: nothing is shortened before the result is redacted.
-  const trimmed = typeof value === 'string' ? value.trim() : '';
-  return trimmed && trimmed.length <= 200 ? trimmed : null;
-}
-
-function consentAccount(account: AccountResource & { uid: string }): ConsentAccount {
-  const iban = ibanOf(account);
-  return {
-    id: account.uid,
-    name: text(account.name) ?? text(account.product) ?? text(account.details),
-    maskedIban: iban ? maskIban(iban) : null,
-    currency: text(account.currency),
-    identificationHash: identificationHash(account.identification_hash),
-  };
-}
-
-async function listAccounts(
-  client: GatewayClient,
-  allowed: ReadonlySet<string>,
-  consent: { accounts: Set<string>; validUntil: string | null },
-): Promise<GatewayToolResult> {
-  const readable = [...allowed].filter(id => consent.accounts.has(id));
-  const shown = readable.slice(0, MAX_LIST_ACCOUNTS);
-  const accounts = [];
-  for (const id of shown) {
-    const details = await client.getAccountDetails(id);
-    // The identification hash is for the host's consent page only; the tool's answer does not carry it.
-    const { identificationHash: _hash, ...view } = consentAccount({ ...(details ?? {}), uid: id });
-    accounts.push({ ...view, product: text(details?.product) });
-  }
-  const structured = {
-    consentValidUntil: consent.validUntil,
-    accounts,
-    ...(readable.length > shown.length ? { notShown: readable.length - shown.length } : {}),
-    ...(allowed.size > readable.length ? { noLongerInConsent: allowed.size - readable.length } : {}),
-  };
-  const untilMs = consent.validUntil ? Date.parse(consent.validUntil) : Number.NaN;
-  const until = Number.isNaN(untilMs) ? '' : `; the consent runs until ${isoDate(new Date(untilMs))}`;
-  return jsonResult(`${accounts.length} bank account(s)${until}.`, structured);
-}
-
-async function getBalances(client: GatewayClient, account: string): Promise<GatewayToolResult> {
-  const balances = (await client.getBalances(account)).map(balanceView);
-  return jsonResult(`${balances.length} balance(s) for the account.`, { account, balances });
-}
-
-async function listTransactions(
-  client: GatewayClient,
-  target: { account?: string; from?: string; to?: string; status?: 'booked' | 'pending' | 'all' },
-  start: { k: string; o: number } | undefined,
-  issue: (next: { k: string; o: number }) => string,
-): Promise<GatewayToolResult> {
-  const account = target.account!;
-  const from = target.from!;
-  const to = target.to!;
-  const status = target.status ?? 'booked';
-  const raw: TransactionResource[] = [];
-  // The page to fetch next (undefined: the first page) and how many of its rows to skip.
-  let continuation: string | undefined = start?.k || undefined;
-  let skip = start?.o ?? 0;
-  let next: { k: string; o: number } | undefined;
-  for (let page = 0; page < MAX_PAGES_PER_CALL; page++) {
-    const fetchedWith = continuation;
-    const result = await client.getTransactionsPage(account, {
-      dateFrom: from,
-      dateTo: to,
-      ...(status === 'booked' ? { status: 'BOOK' as const } : status === 'pending' ? { status: 'PDNG' as const } : {}),
-      ...(fetchedWith ? { continuationKey: fetchedWith } : {}),
-    });
-    const rows = result.transactions.slice(skip);
-    const room = MAX_ROWS_PER_CALL - raw.length;
-    if (rows.length > room) {
-      // Cut the page: the next call fetches the same page again and skips what was returned.
-      raw.push(...rows.slice(0, room));
-      next = { k: fetchedWith ?? '', o: skip + room };
-      break;
-    }
-    raw.push(...rows);
-    skip = 0;
-    continuation = result.continuationKey;
-    if (!continuation) break;
-    if (raw.length >= MAX_ROWS_PER_CALL || page === MAX_PAGES_PER_CALL - 1) {
-      next = { k: continuation, o: 0 };
-      break;
-    }
-  }
-  let incomplete = false;
-  if (next && (next.k.length > MAX_CONTINUATION_KEY_LENGTH || next.o > MAX_PAGE_OFFSET)) {
-    // The bank's page key is too long to keep (or a single page too large): the listing ends here, incomplete.
-    next = undefined;
-    incomplete = true;
-  }
-  let rows: TransactionView[] = raw.map(transactionView);
-  // Some banks ignore transaction_status; filter here too.
-  if (status === 'booked') rows = rows.filter(row => row.status === 'BOOK');
-  if (status === 'pending') rows = rows.filter(row => row.status !== 'BOOK');
-  rows.sort((a, b) => (b.bookingDate ?? b.valueDate ?? '').localeCompare(a.bookingDate ?? a.valueDate ?? ''));
-  // An opaque id; the continuation key and the account stay in the instance.
-  const nextPageToken = next ? issue(next) : undefined;
-  const structured = {
-    account,
-    from,
-    to,
-    status,
-    count: rows.length,
-    totals: summarize(rows),
-    transactions: rows,
-    ...(nextPageToken ? { nextPageToken } : {}),
-    // The bank said there is more, but where to continue cannot be handed on: ask for a shorter period.
-    ...(incomplete ? { incomplete: true } : {}),
-  };
-  const more = nextPageToken ? ' More lines follow: pass nextPageToken as pageToken.' : '';
-  return jsonResult(`${rows.length} transaction(s) from ${from} to ${to}.${more}`, structured);
-}
-
-/** The data as it came; callTool redacts it and only then copies it as JSON. */
-function jsonResult(text: string, structuredContent: unknown): GatewayToolResult {
-  return { content: [{ type: 'text', text }], structuredContent: (structuredContent ?? null) as GatewayJsonValue };
 }
 
 /**
@@ -1121,9 +933,14 @@ function jsonResult(text: string, structuredContent: unknown): GatewayToolResult
 function redactResult(result: GatewayToolResult, redactor: GatewayRedactor): GatewayToolResult {
   // The failure metadata in form or dropped: a status of 100-599 and a request id that is still one after redaction.
   const failure = failureInForm(result.isError, redactor.redactDeep(result.failure));
+  // Our own fixed code, or nothing: never a text.
+  const errorCode = result.isError && isProblemCode(result.errorCode) ? result.errorCode : undefined;
+  const retryAfter = result.retryAfterSeconds;
   return {
     ...(result.isError ? { isError: true } : {}),
     ...(failure ? { failure } : {}),
+    ...(errorCode ? { errorCode } : {}),
+    ...(result.isError && typeof retryAfter === 'number' && Number.isSafeInteger(retryAfter) && retryAfter > 0 ? { retryAfterSeconds: retryAfter } : {}),
     content: result.content.map(part => ({ type: 'text' as const, text: redactor.redactValues(redactor.redactValues(part.text)) })),
     // Redacted first, as data and depth-limited, and only then copied as JSON. The outer pass is the final one, over
     // the assembled data with its depth placeholders.
@@ -1135,8 +952,4 @@ function redactResult(result: GatewayToolResult, redactor: GatewayRedactor): Gat
           ) as GatewayJsonValue,
         }),
   };
-}
-
-function errorResult(text: string, failure?: GatewayFailure): GatewayToolResult {
-  return { isError: true, content: [{ type: 'text', text }], ...(failure ? { failure } : {}) };
 }
