@@ -70,7 +70,9 @@ Standalone server:
   arrives, also when the consent changed while it was on its way. A search checks every account again after its
   last read and drops what an account gave when its consent or the account was withdrawn meanwhile; the consent
   status tool shows a consent that changed while its answer was on its way as changed. `enablebanking_list_accounts`
-  has a new account status for it: `consent_ended`.
+  has a new account status for it: `consent_ended`. Every answer with bank data is checked once more after the
+  tool's last await (the audit line included), with nothing awaited before it is returned, in the one response
+  path every tool goes through; an answer not made for that check is withheld.
 - `enablebanking_refresh_consent` refuses a consent that is no longer authorised instead of binding to it.
 - A search stops at the first account the bank's rate limit refuses.
 - The account registry no longer assumes DKK for an account without a currency.
@@ -90,16 +92,24 @@ Gateway (`mcp-server-enablebanking/gateway`), every change to the surface:
 - A malformed `psu` or `unattended` (also `null`, and a value with a line break or another control character) is
   refused with `presence_incomplete`, never read as "nobody is present".
 - The values of `psu` are removed from the finished result of the call, so a bank that repeats them does not hand
-  them on: `ipAddress` and `geoLocation` always, where they stand whole, however they are encoded, escaped (escaped
-  whitespace such as `\t` and `&nbsp;` included) or spelled (a location also with any trailing zeros, a decimal
-  comma, a minus sign, or whitespace instead of the comma, matched as whole numbers so that amounts, dates and
-  account numbers are left alone, also as they were sent); the other fields best
-  effort, from 8 characters. The README says exactly what is promised ("Who is present"). The redaction of every
+  them on: `ipAddress` and `geoLocation` always, where they stand whole, however they are encoded or escaped
+  (percent-encoding as UTF-8, JSON and JavaScript escapes, every HTML character reference of the HTML5 table, up to
+  three layers in any mix), written (NFKC, digits of any script, any Unicode whitespace, separator or zero-width
+  character between the numbers) or spelled (a location also with any trailing zeros, a decimal comma, a minus sign
+  or dash, matched as whole numbers so that amounts, dates and account numbers are left alone, also as they were
+  sent); the other fields best effort, from 8 characters. A location needs decimals in both numbers; a position in
+  whole degrees (`55,12`) is refused and never looked for, so the amount `55,12 kr.` stays. HTML references are
+  decoded by the `entities` package (7.0.1, pinned, no dependencies of its own), the first runtime dependency
+  besides the MCP SDK and zod. The README says exactly what is promised ("Who is present"). The redaction of every
   value the gateway holds (session id, key, authorization code) now reads a text decoded before comparing, so a
   percent-encoding in lower case, a double encoding or an HTML entity no longer hides a value.
 - The pause after a bank's rate limit also holds for the next page of a listing (`pageToken`).
 - `search_transactions` is refused as a whole when the bank says, for any of its accounts, that the consent is over:
   nothing read under it before is returned. An account that has left the consent is refused alone.
+- Calls side by side in one instance: a session ended with `endSession`, a consent Enable Banking says is over and
+  an account it says has left the consent, learned by any call, stop the answer of every call under way that
+  depends on it, checked after the call's last await (refused with `consent_not_active`). After
+  `endSession` the instance reads nothing more under that session.
 - `GatewayToolResult`: `errorCode` on every error result and `retryAfterSeconds` where a wait is recommended. The
   fixed error texts of 0.6.x are unchanged.
 - `list_accounts`: adds `source` (`consent`, `bank` or `mixed`), `consent` (status, `validUntil`, `expiresInDays`,

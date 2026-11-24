@@ -132,7 +132,13 @@ reads the accounts without signing in at the bank themselves, until the consent 
   or a refresh that was on its way when a withdrawal was learned does not lift it or bind anything, and the consent
   status tool shows such a consent as changed (`problem`, no `status`). A word against a consent or an account in
   any answer (ended, expired, an account no longer listed) is acted on whenever that answer arrives, also when the
-  consent changed while it was on its way. The server learns it from:
+  consent changed while it was on its way. "At the moment the answer is returned" is meant literally: every tool
+  that answers with bank data (balances, account details, transactions, one transaction's details, the summary,
+  the search, and the consent status) checks the consent and every account its answer comes from once more after
+  its last await, the audit line included, and returns the answer with nothing awaited in between. That check is
+  made in one place, the response path every tool goes through, so a tool cannot skip it: an answer the bank code
+  did not mark for it is withheld. A consent revoked, or an account withdrawn, while the audit line is written
+  stops the answer (a search shows the account as not read, with why). The server learns it from:
   - a read at the bank that fails with an ended consent or a missing account, from any tool;
   - `enablebanking_get_consent_status`: an error for the session, a status other than `AUTHORIZED`, a date that
     has passed, an account the session no longer lists;
@@ -413,27 +419,47 @@ if (result.isError) {
     - `ipAddress` and `geoLocation`: always removed, from every text and
       every key of the result, wherever the value stands whole: not inside a
       longer number or word (`155.0,12.0` and `55.0,12.01` do not hold the
-      location `55.0,12.0`, `192.0.2.105` does not hold `192.0.2.10`). Also
-      when it is percent-encoded (upper- or lower-case hex, any characters,
-      `+` for a space, and `%uXXXX`), escaped as in JSON or JavaScript (`\uXXXX`,
-      `\u{X}`, `\xXX`, `\t`, `\n`, `\r`, `\f`, `\v`, `\b`, `\"`, `\/`, `\\`) or
-      as in HTML (numeric references, and the named ones for whitespace and
-      ASCII punctuation, such as `&Tab;`, `&nbsp;`, `&comma;`, `&period;`,
-      `&semi;`, `&colon;`), or any of these inside another up to three
-      layers. Also in another spelling that says
+      location `55.0,12.0`, `192.0.2.105` does not hold `192.0.2.10`). A text
+      is searched as it is and as it reads with up to three layers of
+      encoding undone, each layer any mix of: percent-encoding as UTF-8
+      (upper- or lower-case hex, so `%2C` and `%C2%A0` alike, `+` for a
+      space, and `%uXXXX`); JSON and JavaScript escapes (`\uXXXX`, `\u{X}`,
+      `\xXX`, legacy octal such as `\040`, `\t`, `\n`, `\r`, `\f`, `\v`,
+      `\b`, `\"`, `\/`, `\\`); and HTML character references: every numeric
+      one, decimal or hex, with or without the semicolon, and every named
+      one of the HTML5 table (`&emsp;`, `&ThinSpace;`, `&nbsp` without its
+      semicolon, `&comma;` and the rest), decoded as a browser decodes text
+      by the `entities` package. Each of those readings is also read
+      normalised: NFKC (fullwidth and other compatibility characters become
+      what they stand for), digits of any script as ASCII digits, any dash
+      as a minus, and `·`, `٫`, `。`, `،`, `、`, `‚` and `؛` as a point, comma or
+      semicolon; and without the characters that are not seen (format
+      characters such as zero-width ones, the soft hyphen and direction
+      marks, and combining marks). Any Unicode whitespace or separator
+      (`\s`, `\p{Z}`), U+0085, U+180E, the zero-width characters
+      U+200B–U+200D, U+2060 and U+FEFF, and the characters drawn blank
+      (U+115F, U+1160, U+3164, U+FFA0, U+2800) separate as a space does.
+      Also in another spelling that says
       the same: an IPv6 address in upper case, written out in full or
       shortened differently, an IPv4 address as an IPv4-mapped IPv6 address.
       A location also as any two numbers equal to its latitude and longitude:
       with any number of trailing zeros, with a decimal point or a decimal
-      comma, a minus written as `-` or as the minus sign `−`, and with a
-      comma, a semicolon or whitespace (a space, a tab, a line break, or one
-      of those encoded or escaped, such as `%20`, `&#32;`, `\t` or `&nbsp;`)
-      between them. Numbers
-      are matched whole, so a coordinate inside a longer number, an amount
+      comma, a minus written as `-`, the minus sign `−` or another dash, and
+      with a comma, a semicolon or separators between them. Numbers are
+      matched whole, so a coordinate inside a longer number, an amount
       (`1.055,12 kr.`, `1055,12 DKK`), a date or an account number is left
       as it is; two whole numbers (`55 12`, `55,12`) are never taken as a
-      location. Not removed: a location rounded, with its numbers in the
-      other order, in degrees and minutes, or split over several fields.
+      location. The location as it was sent is found the same way, with the
+      same whole-number boundaries, not by a separate plain-text match. A
+      location is "latitude,longitude" with a decimal point and at least one
+      decimal in both numbers (`55.6761,12.5683`); a position in whole
+      degrees such as `55,12` is refused with `presence_incomplete`, and the
+      redactor does not take it either: it says no more than an area of
+      about 100 km and is written exactly as a Danish amount, so `55,12 kr.`
+      in a bank line stays as it is. Not removed: a location rounded, with
+      its numbers in the other order, in degrees and minutes, with letters
+      or other signs (`/`, `|`) between its numbers, or split over several
+      fields.
     - The other fields (`userAgent`, `referer` and the `accept` fields):
       best effort. A value of 8 characters or more is removed where it
       stands whole, in the same encodings and with any whitespace between
@@ -586,11 +612,34 @@ instead: a plain `Error` with an empty message and the stack `Error`.
   when Enable Banking says the session was already expired, closed, revoked
   or unknown, so removing an account, renewing a consent and closing a
   company can all call it without special cases. Any other failure throws:
-  the session may still be open.
+  the session may still be open. From the moment it is called, the gateway
+  instance returns nothing more read under the session, also not the answer
+  of a call that was already under way (refused with `consent_not_active`);
+  see "Answers after a withdrawal".
 - `application()`: `{ environment, active, countries, services, redirectUrls }`
   as Enable Banking holds the application, for a health check. The API has no
   field that says "restricted mode"; see
   [docs/capability-map.md](docs/capability-map.md#application-restricted-production-mode).
+
+#### Answers after a withdrawal
+
+Every call asks Enable Banking for the session first, so what the host passes
+and what the bank holds now decide the call. Calls also run side by side in
+one gateway instance, so the instance keeps, in memory and for this purpose
+only, what calls learn while they run: a session ended through `endSession`,
+a consent Enable Banking says is over (the session's status, or a read that
+fails with an ended consent), and an account it says has left the consent (the
+session no longer lists it, or a read fails with `ACCOUNT_DOES_NOT_EXIST`).
+After a call's last await, with nothing awaited before it returns, its answer
+is checked against that: when anything was learned since the call began
+against its consent, or against an account its answer may come from (the
+account named, or every account of the call for `list_accounts` and a search
+over all accounts), the call is refused with `consent_not_active` ("Refused:
+the bank consent was ended, or an account left it, while this call was being
+answered; ...") and no data. What a search learns itself about an account
+it then skipped does not count against it. Only session ids, account ids and a
+counter are kept, for at most 10 000 sessions; when an older entry has to be
+dropped, every call under way is refused rather than trusted.
 
 Enable Banking API reference: <https://enablebanking.com/docs/api/reference/>.
 

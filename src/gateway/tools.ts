@@ -73,6 +73,8 @@ export const NOT_ALLOWED = 'Refused: that account is not one of the accounts thi
 export const NO_CREDENTIALS =
   'Refused: no Enable Banking consent was given with the call (credentials.sessionId and credentials.accountIds are required).';
 export const NOT_IN_CONSENT = 'Refused: the bank consent no longer covers that account. It must be connected again.';
+export const WITHDRAWN_MEANWHILE =
+  'Refused: the bank consent was ended, or an account left it, while this call was being answered; nothing read under it is returned. Ask again.';
 export const PAGE_TOKEN_UNKNOWN = 'pageToken was not issued here, or it has expired; start again without it.';
 export const PAGE_TOKEN_MISMATCH = 'pageToken does not belong to this account and period; start again without it.';
 export const PRESENCE_CONTRADICTION =

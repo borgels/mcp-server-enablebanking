@@ -2,7 +2,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod/v4';
 import { formatUnknownError } from '../errors.js';
 import { problemOf, problemRetryAfterSeconds } from '../enablebanking/problems.js';
-import { writeAuditEvent } from '../enablebanking/audit.js';
+import { writeAuditEvent, type AuditEvent } from '../enablebanking/audit.js';
 import type { Bank } from '../enablebanking/bank.js';
 import {
   CAPABILITIES,
@@ -19,7 +19,25 @@ export interface ToolOptions {
   /** Empty = the gateway's access group alone decides. */
   consentAdmins: string[];
   auditLog?: string;
+  /** Writes one audit line. Default: appended to auditLog. (Tests pass their own to hold a call at its audit line.) */
+  audit?: (event: AuditEvent) => Promise<void>;
 }
+
+/**
+ * The tools whose answer holds no bank data: what this server knows itself (its tools, the registry and stored
+ * consents) and the consent administration. Every other tool's answer is released through Bank.release, checked
+ * against the consent and its accounts after the last await, or not returned at all: a tool added later is checked
+ * unless it is named here.
+ */
+const WITHOUT_BANK_DATA: ReadonlySet<string> = new Set([
+  'enablebanking_search_capabilities',
+  'enablebanking_list_accounts',
+  'enablebanking_list_banks',
+  'enablebanking_start_consent',
+  'enablebanking_complete_consent',
+  'enablebanking_refresh_consent',
+  'enablebanking_revoke_consent',
+]);
 
 const date = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'YYYY-MM-DD');
 const status = z
@@ -46,6 +64,13 @@ export function registerTools(server: McpServer, bank: Bank, options: ToolOption
     CAPABILITIES.filter(capability => capability.kind === 'read' || options.consentEnabled).map(capability => capability.id),
   );
 
+  const audit = options.audit ?? ((event: AuditEvent) => writeAuditEvent(options.auditLog, event));
+
+  /**
+   * The one way a tool answers: audited before and after, and an answer with bank data released by the bank only
+   * after the last await, synchronously, right before it is returned. A consent revoked or an account withdrawn
+   * while the audit line was written (or at any other await) is seen there, and the answer does not leave.
+   */
   const audited = async <T>(tool: string, input: Record<string, unknown>, call: () => Promise<T>) => {
     const base = {
       company: bank.company,
@@ -57,17 +82,18 @@ export function registerTools(server: McpServer, bank: Bank, options: ToolOption
     const isConsent = CAPABILITIES.find(capability => capability.id === tool)?.kind === 'consent';
     if (isConsent && options.consentAdmins.length > 0 && !options.consentAdmins.includes(options.actingAs.toLowerCase())) {
       const reason = `${options.actingAs} may not manage bank consents for ${bank.companyInfo().name}`;
-      await writeAuditEvent(options.auditLog, { ...base, action: 'denied', reason });
+      await audit({ ...base, action: 'denied', reason });
       return errorResult(reason);
     }
-    await writeAuditEvent(options.auditLog, { ...base, action: 'start' });
+    await audit({ ...base, action: 'start' });
     try {
       const result = await call();
-      await writeAuditEvent(options.auditLog, { ...base, action: 'finish' });
-      return jsonResult(result);
+      await audit({ ...base, action: 'finish' });
+      // After the last await, and nothing awaited between this check and the return.
+      return jsonResult(WITHOUT_BANK_DATA.has(tool) ? result : bank.release(result));
     } catch (error) {
       const message = formatUnknownError(error);
-      await writeAuditEvent(options.auditLog, { ...base, action: 'error', error: message });
+      await audit({ ...base, action: 'error', error: message });
       // The fixed code of the problem, and the wait Enable Banking recommends where it names one.
       const code = problemOf(error);
       return errorResult(message, code, problemRetryAfterSeconds(code));

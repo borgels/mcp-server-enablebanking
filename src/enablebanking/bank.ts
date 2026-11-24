@@ -127,6 +127,15 @@ function filterAmount(value: number | string | undefined, name: string) {
  * for every account in it once the last read is done, and what an account gave
  * is dropped from it when its consent or the account was withdrawn meanwhile.
  *
+ * "At the moment the answer is returned" is meant literally: every answer
+ * with bank data is made by `held`, and the tool layer calls `release` on it
+ * after its own last await (the audit line), synchronously before the answer
+ * leaves. `release` checks the consent and every account the answer comes
+ * from again and puts the answer together anew from what still stands, so
+ * no await anywhere between the bank's answer and the caller can let an
+ * answer outlive a withdrawal. An answer that was not made by `held` is not
+ * released (the tool layer refuses it).
+ *
  * Every binding has a version (`versions`, by session id) that every
  * withdrawal, refresh, replacement and revocation raises. A word against a
  * consent or an account (ended, expired, revoked, an account no longer
@@ -160,6 +169,8 @@ export class Bank {
   private readonly versions = new Map<string, number>();
   private readonly budget: UnattendedBudget;
   private readonly now: () => number;
+  /** How each answer with bank data in flight is checked and put together again when it is released. Nothing else. */
+  private readonly holds = new WeakMap<object, () => object>();
 
   constructor(private readonly options: BankOptions) {
     this.company = options.company;
@@ -265,7 +276,10 @@ export class Bank {
   async balances(reference: string) {
     const link = this.linked(reference);
     const read = await this.read(link, () => this.client.getBalances(link.uid));
-    return { account: accountHeader(link), fetchedAt: read.fetchedAt, balances: read.value.map(balanceView) };
+    return this.held(() => {
+      this.confirm(link);
+      return { account: accountHeader(link), fetchedAt: read.fetchedAt, balances: read.value.map(balanceView) };
+    });
   }
 
   async details(reference: string) {
@@ -278,7 +292,10 @@ export class Bank {
       this.withdrawAccount(link.session, link.uid, 'account_not_connected');
       throw new ConsentError('the bank returned a different account than the one registered; refusing to show it', 'account_not_connected');
     }
-    return { account: accountHeader(link), fetchedAt: read.fetchedAt, details: accountDetailsView(read.value) };
+    return this.held(() => {
+      this.confirm(link);
+      return { account: accountHeader(link), fetchedAt: read.fetchedAt, details: accountDetailsView(read.value) };
+    });
   }
 
   /** The period and status of a query, checked. */
@@ -340,23 +357,26 @@ export class Bank {
     const limit = query.limit ?? 200;
     const offset = query.offset ?? 0;
     const shown = rows.slice(offset, offset + limit);
-    return {
-      account: accountHeader(link),
-      period: { from: period.from ?? null, to: period.to ?? null, status: period.status, ...(period.strategy === 'longest' ? { strategy: period.strategy } : {}) },
-      fetchedAt,
-      // The totals cover every matching line of the period that was read, not only the lines shown.
-      totals: summarize(rows),
-      count: rows.length,
-      offset,
-      returned: shown.length,
-      // False: the bank had more lines for the period than this server reads in one go; count and totals then cover
-      // only the lines read. Ask for a shorter period.
-      complete,
-      // True when lines are missing from this answer: more matching lines than shown, or an incomplete read.
-      truncated: !complete || rows.length > offset + shown.length,
-      ...(rows.length > offset + shown.length ? { nextOffset: offset + shown.length } : {}),
-      transactions: shown,
-    };
+    return this.held(() => {
+      this.confirm(link);
+      return {
+        account: accountHeader(link),
+        period: { from: period.from ?? null, to: period.to ?? null, status: period.status, ...(period.strategy === 'longest' ? { strategy: period.strategy } : {}) },
+        fetchedAt,
+        // The totals cover every matching line of the period that was read, not only the lines shown.
+        totals: summarize(rows),
+        count: rows.length,
+        offset,
+        returned: shown.length,
+        // False: the bank had more lines for the period than this server reads in one go; count and totals then cover
+        // only the lines read. Ask for a shorter period.
+        complete,
+        // True when lines are missing from this answer: more matching lines than shown, or an incomplete read.
+        truncated: !complete || rows.length > offset + shown.length,
+        ...(rows.length > offset + shown.length ? { nextOffset: offset + shown.length } : {}),
+        transactions: shown,
+      };
+    });
   }
 
   /** What more the bank has on one line, by the detailsId of a listing. */
@@ -366,7 +386,10 @@ export class Bank {
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
       throw new ProblemError('transaction_not_found', 'The bank has no further details for that transaction.');
     }
-    return { account: accountHeader(link), fetchedAt, transaction: transactionView(raw) };
+    return this.held(() => {
+      this.confirm(link);
+      return { account: accountHeader(link), fetchedAt, transaction: transactionView(raw) };
+    });
   }
 
   /** Totals per counterparty and currency: computed here from the bank's lines and nothing else. */
@@ -376,17 +399,20 @@ export class Bank {
     const { rows, complete, fetchedAt } = await this.lines(link, period);
     const groups = summarizeByCounterparty(rows);
     const top = query.top ?? 50;
-    return {
-      account: accountHeader(link),
-      period: { from: period.from ?? null, to: period.to ?? null, status: period.status },
-      fetchedAt,
-      derived: true,
-      complete,
-      lines: rows.length,
-      totals: summarize(rows),
-      counterparties: groups.slice(0, top),
-      ...(groups.length > top ? { counterpartiesNotShown: groups.length - top } : {}),
-    };
+    return this.held(() => {
+      this.confirm(link);
+      return {
+        account: accountHeader(link),
+        period: { from: period.from ?? null, to: period.to ?? null, status: period.status },
+        fetchedAt,
+        derived: true,
+        complete,
+        lines: rows.length,
+        totals: summarize(rows),
+        counterparties: groups.slice(0, top),
+        ...(groups.length > top ? { counterpartiesNotShown: groups.length - top } : {}),
+      };
+    });
   }
 
   /** Lines that match a text or an amount across this company's accounts: computed here from the bank's lines. */
@@ -424,36 +450,40 @@ export class Bank {
       }
     }
     // The accounts were read one after another: a consent revoked, or an account withdrawn, while a later account was
-    // read is known now. Every account is checked again before anything it gave is returned; what an account that no
-    // longer stands gave is dropped, and the account is shown as not read, with why.
-    const matches: Array<TransactionView & { account: string }> = [];
-    let fetchedAt: string | undefined;
-    for (const { at, link, found, fetchedAt: when } of read) {
-      try {
-        this.confirm(link);
-      } catch (error) {
-        accounts[at] = { account: link.account.id, read: false, problem: problemOf(error) ?? 'consent_not_active', reason: formatUnknownError(error) };
-        continue;
+    // read is known now. Every account is checked again before anything it gave is returned (now, and again when the
+    // answer is released); what an account that no longer stands gave is dropped, and the account is shown as not
+    // read, with why.
+    return this.held(() => {
+      const shownAccounts = [...accounts];
+      const matches: Array<TransactionView & { account: string }> = [];
+      let fetchedAt: string | undefined;
+      for (const { at, link, found, fetchedAt: when } of read) {
+        try {
+          this.confirm(link);
+        } catch (error) {
+          shownAccounts[at] = { account: link.account.id, read: false, problem: problemOf(error) ?? 'consent_not_active', reason: formatUnknownError(error) };
+          continue;
+        }
+        for (const row of found) matches.push({ account: link.account.id, ...row });
+        if (!fetchedAt || when < fetchedAt) fetchedAt = when;
       }
-      for (const row of found) matches.push({ account: link.account.id, ...row });
-      if (!fetchedAt || when < fetchedAt) fetchedAt = when;
-    }
-    matches.sort(newestFirst);
-    const limit = query.limit ?? 100;
-    const shown = matches.slice(0, limit);
-    return {
-      period: { from: period.from ?? null, to: period.to ?? null, status: period.status },
-      ...(fetchedAt ? { fetchedAt } : {}),
-      derived: true,
-      // True only when every account was read to the end of the period.
-      complete: accounts.every(entry => entry.read && entry.complete),
-      accounts,
-      count: matches.length,
-      returned: shown.length,
-      truncated: matches.length > shown.length,
-      totals: summarize(shown),
-      transactions: shown,
-    };
+      matches.sort(newestFirst);
+      const limit = query.limit ?? 100;
+      const shown = matches.slice(0, limit);
+      return {
+        period: { from: period.from ?? null, to: period.to ?? null, status: period.status },
+        ...(fetchedAt ? { fetchedAt } : {}),
+        derived: true,
+        // True only when every account was read to the end of the period.
+        complete: shownAccounts.every(entry => entry.read && entry.complete),
+        accounts: shownAccounts,
+        count: matches.length,
+        returned: shown.length,
+        truncated: matches.length > shown.length,
+        totals: summarize(shown),
+        transactions: shown,
+      };
+    });
   }
 
   /** Each stored consent as Enable Banking holds it now. Not a read at the bank. */
@@ -503,17 +533,21 @@ export class Bank {
       }
     }
     // An answer in order for a consent that was withdrawn, revoked, replaced or refreshed here while its answer, or a
-    // later consent's, was on its way is not shown as Enable Banking gave it, but as changed, with why.
-    for (const { at, session, version } of checked) {
-      if (this.version(session.sessionId) === version) continue;
-      consents[at] = {
-        ...consents[at],
-        status: null,
-        problem: this.lostConsents.get(session.sessionId) ?? 'consent_not_active',
-        reason: 'The consent changed here while its status was being checked; ask again.',
-      };
-    }
-    return { company: company.name, checkedAt: new Date(now).toISOString(), consents };
+    // later consent's, was on its way is not shown as Enable Banking gave it, but as changed, with why. Checked now,
+    // and again when the answer is released.
+    return this.held(() => {
+      const shown = [...consents];
+      for (const { at, session, version } of checked) {
+        if (this.version(session.sessionId) === version) continue;
+        shown[at] = {
+          ...shown[at],
+          status: null,
+          problem: this.lostConsents.get(session.sessionId) ?? 'consent_not_active',
+          reason: 'The consent changed here while its status was being checked; ask again.',
+        };
+      }
+      return { company: company.name, checkedAt: new Date(now).toISOString(), consents: shown };
+    });
   }
 
   // ---------------------------------------------------------------- consent
@@ -896,6 +930,29 @@ export class Bank {
 
   private raise(sessionId: string): void {
     this.versions.set(sessionId, this.version(sessionId) + 1);
+  }
+
+  /**
+   * An answer with bank data, made by `assemble`: it checks every account the answer comes from (confirm) and puts
+   * the answer together from what still stands. It runs now, and once more when the answer is released.
+   */
+  private held<T extends object>(assemble: () => T): T {
+    const answer = assemble();
+    this.holds.set(answer, assemble);
+    return answer;
+  }
+
+  /**
+   * The answer as it may leave now: checked again and put together anew from what still stands at this moment (a
+   * search drops what a withdrawn account gave; any other answer is refused when its account no longer stands).
+   * Synchronous: the caller calls it after its last await and returns what it gives without awaiting anything. An
+   * answer that was not made here, or was released already, is refused.
+   */
+  release<T>(answer: T): T {
+    const assemble = typeof answer === 'object' && answer !== null ? this.holds.get(answer) : undefined;
+    if (!assemble) throw new Error('The answer was not checked against the consent before it was returned; it was withheld.');
+    this.holds.delete(answer as object);
+    return assemble() as T;
   }
 
   /**

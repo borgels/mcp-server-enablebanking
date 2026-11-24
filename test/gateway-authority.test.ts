@@ -671,6 +671,93 @@ describe('an address or a location of the person present, in another spelling th
     expect(note).toBe('Seen at ‹redacted› today');
   });
 
+  it.each([
+    // Named HTML references beyond the common ones: the whole HTML5 table is decoded.
+    ['an HTML em space', '55.6761&emsp;12.5683'],
+    ['an HTML thin space', '55.6761&ThinSpace;12.5683'],
+    ['an HTML hair space', '55.6761&hairsp;12.5683'],
+    ['an HTML medium space', '55.6761&MediumSpace;12.5683'],
+    ['an HTML no-break space without its semicolon', '55.6761&nbsp12.5683'],
+    ['an HTML zero-width space', '55.6761&ZeroWidthSpace;12.5683'],
+    // Numeric references, with and without the semicolon, with leading zeros, upper-case X.
+    ['a numeric thin space', '55.6761&#x2009;12.5683'],
+    ['a numeric thin space without its semicolon', '55.6761&#x2009 12.5683'],
+    ['a decimal reference with leading zeros', '55.6761&#0000000032;12.5683'],
+    ['an upper-case hex reference', '55.6761&#X2009;12.5683'],
+    // Percent-encoded UTF-8, not only ASCII bytes.
+    ['a percent-encoded no-break space', '55.6761%C2%A012.5683'],
+    ['a percent-encoded thin space in lower case', '55.6761%e2%80%8912.5683'],
+    ['a percent-encoded ideographic space', '55.6761%E3%80%8012.5683'],
+    // Unicode separators and characters that are not seen, written as they are.
+    ['a narrow no-break space', '55.6761 12.5683'],
+    ['an ideographic space', '55.6761　12.5683'],
+    ['a line separator', '55.6761 12.5683'],
+    ['a next-line control', '55.6761\u008512.5683'],
+    ['a zero-width joiner', '55.6761‍12.5683'],
+    ['a zero-width space around the comma', '55.6761​,​12.5683'],
+    ['a word joiner', '55.6761⁠12.5683'],
+    ['a byte order mark', '55.6761﻿12.5683'],
+    ['a zero-width space inside a number', '55.67​61,12.5683'],
+    ['a soft hyphen before the comma', '55.6761­,12.5683'],
+    ['a combining mark on a digit', '55.676́1,12.5683'],
+    // Other ways to write the digits and the signs.
+    ['fullwidth digits, point and comma', '５５．６７６１，１２．５６８３'],
+    ['Arabic-Indic digits and decimal separators', '٥٥٫٦٧٦١,١٢٫٥٦٨٣'],
+    ['a fullwidth percent-encoded comma', '55.6761％２Ｃ 12.5683'],
+    // JavaScript escapes of a Unicode space.
+    ['a \\u escape of a thin space', String.raw`55.6761 12.5683`],
+    ['a \\u{} escape of a thin space', String.raw`55.6761\u{2009}12.5683`],
+    ['a %u escape of a thin space', '55.6761%u200912.5683'],
+    ['an octal escape of a space', String.raw`55.6761\04012.5683`],
+    // Layers inside layers.
+    ['a percent-encoded HTML em space', '55.6761%26emsp%3B12.5683'],
+    ['an HTML-escaped HTML thin space', '55.6761&amp;ThinSpace;12.5683'],
+    ['a twice percent-encoded HTML en space', '55.6761%2526ensp%253B12.5683'],
+    ['an HTML reference of a percent-encoded no-break space', '55.6761&#37;C2&#37;A012.5683'],
+    ['a JSON escape of an HTML em space', String.raw`55.6761&emsp;12.5683`],
+  ])('removes a location with %s between or in its numbers', async (_, written) => {
+    const note = await through({ geoLocation: '55.676100,12.568300' }, `Seen at ${written} today`);
+    expect(note).toBe('Seen at ‹redacted› today');
+  });
+
+  it.each([
+    ['an en dash', '–33.8568, –151.2153'],
+    ['a fullwidth hyphen-minus and comma', '－33.8568，－151.2153'],
+    ['a hyphen', '‐33.8568 ‐151.2153'],
+  ])('removes a location south and west of zero written with %s', async (_, written) => {
+    expect(await through({ geoLocation: '-33.8568,-151.2153' }, `Seen at ${written} today`)).toBe('Seen at ‹redacted› today');
+  });
+
+  it.each([
+    'Beløb 1055,12 DKK',
+    'Beløb 55,12 kr. og 12,00 kr.',
+    'Ærø, Ålborg og Æbeltoft: 55,12 kr.',
+    'Faktura&nbsp;1001 betalt',
+    '５５ kr. １２ stk.',
+  ])('leaves ordinary text alone that only looks encoded: %s', async text => {
+    expect(await through({ geoLocation: '55.676100,12.568300' }, text)).toBe(text);
+  });
+
+  it('takes a location only with decimals in both numbers: a whole-degree position is not looked for, and the gateway refuses it', async () => {
+    // The rule: "55,12" says no more than an area of about 100 km and is written exactly as a Danish amount.
+    const redactor = new GatewayRedactor();
+    redactor.addLocation('55,12');
+    redactor.addLocation('55.6761,12');
+    expect(redactor.redactValues('Beløb 55,12 kr. og 55.6761,12')).toBe('Beløb 55,12 kr. og 55.6761,12');
+    // A location with decimals is matched through one matcher, so the form it was given in keeps the whole-number
+    // boundaries too: not inside a longer number, not as a Danish amount next to it.
+    redactor.addLocation('55.12,12.55');
+    expect(redactor.redactValues('55,12 kr., 155.12,12.55, 55.12,12.551 and 55.12,12.55')).toBe('55,12 kr., 155.12,12.55, 55.12,12.551 and ‹redacted›');
+    // Through the gateway, a position without decimals is not one the call can carry.
+    const { fetchImpl } = api({ sessionAccounts: [ACCOUNT_A], failing: new Map() });
+    const result = await gateway(fetchImpl).callTool(
+      'get_balances',
+      { account: ACCOUNT_A },
+      { credentials: { sessionId: SESSION, accountIds: [ACCOUNT_A] }, psu: { geoLocation: '55,12' } },
+    );
+    expect(result.errorCode).toBe('presence_incomplete');
+  });
+
   it('removes a location south and west of zero written with the minus sign', async () => {
     expect(await through({ geoLocation: '-33.8568,-151.2153' }, 'Seen at −33.8568, −151.2153 today')).toBe('Seen at ‹redacted› today');
   });

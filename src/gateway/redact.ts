@@ -1,4 +1,5 @@
 import { isIP } from 'node:net';
+import { decodeHTML } from 'entities/decode';
 
 /**
  * Redaction for the embedded gateway. Each gateway instance owns a redactor
@@ -8,23 +9,25 @@ import { isIP } from 'node:net';
  *
  * Redaction is the second line: the gateway's own errors carry no text from
  * Enable Banking or a bank (see errors.ts). What it removes:
- * - every value added, however it is written: as it is, percent-encoded
- *   (upper- or lower-case hex, "+" for a space, %uXXXX, any character
- *   encoded or not), escaped as in JSON or JavaScript (\uXXXX, \u{X}, \xXX,
- *   \t, \n, \r, \f, \v, \b and a quote, slash or backslash) or in HTML
- *   (numeric references and the named ones of ESCAPE), any of these inside
- *   another up to MAX_DECODE_DEPTH layers, and with other whitespace between
- *   its words. The text is decoded before it is compared;
+ * - every value added, however it is written: the text is searched as it is
+ *   and in every reading (see readings): up to MAX_DECODE_DEPTH layers of
+ *   encoding undone, each any mix of percent-encoding as UTF-8, JSON and
+ *   JavaScript escapes and HTML character references (ESCAPE); each layer
+ *   also normalised (NFKC, digits of any script, dashes), without the
+ *   characters that are not seen, and with any run of separators (any
+ *   Unicode whitespace or separator, the zero-width characters) as one space;
  * - an IP address and a location added as such, also in another spelling
  *   that says the same: an IPv6 address in upper case, written out in full
  *   or shortened differently, an IPv4 address as an IPv4-mapped IPv6
  *   address; a location as two numbers equal to its latitude and longitude,
  *   with any number of trailing zeros, a decimal point or a decimal comma,
- *   a minus or a minus sign, and a comma, a semicolon or whitespace between
- *   them (also encoded, as any value). They are matched whole, also as they
- *   were added: an address or a number inside a longer number or word is
- *   not one (standsWhole), and two whole numbers ("1055,12", "55 12") are
- *   read as an amount or a number, not as a location;
+ *   a minus or a dash, and a comma, a semicolon or separators between them,
+ *   in every reading. They are matched whole: an address or a number inside
+ *   a longer number or word is not one (standsWhole, COORDINATES), and two
+ *   whole numbers ("1055,12", "55 12") are read as an amount or a number,
+ *   not as a location. A location is only taken with decimals in both
+ *   numbers (addLocation), and is found through COORDINATES alone, also in
+ *   the form it was given in;
  * - for the key material, also every piece of it of FRAGMENT_LENGTH
  *   characters, so a part of the key is not left after a cut or an echo.
  *   Session ids and authorization codes are matched whole: a session id is a
@@ -83,62 +86,108 @@ interface View {
 }
 
 /**
- * One escaped character, in the ways a text passed through a URL, a form, JSON, JavaScript or HTML writes it. A
- * percent-encoded byte is decoded when it is ASCII: every value held here is ASCII, so a byte of a longer UTF-8
- * sequence cannot be part of one.
+ * One escaped character, in the ways a text passed through a URL, a form, JSON, JavaScript or HTML writes it:
+ * - a percent-encoded UTF-8 sequence of one to four bytes, upper- or lower-case hex (%2C, %C2%A0, %E2%80%89), and
+ *   JavaScript's %uXXXX;
+ * - a JSON or JavaScript escape: \uXXXX, \u{X}, \xXX, a legacy octal escape (\040), \t, \n, \r, \f, \v, \b, and a
+ *   quote, slash or backslash;
+ * - an HTML character reference: every numeric one (decimal or hex, with or without the semicolon), and every named
+ *   one of the HTML5 table, also those a browser reads without the semicolon. They are decoded by the `entities`
+ *   package (the full WHATWG table; pinned in package.json) as a browser decodes text;
+ * - "+" as a space, in the reading of a form.
  */
-/** HTML's named characters for whitespace and ASCII punctuation (names are case-sensitive). */
-const ENTITIES: Readonly<Record<string, string>> = {
-  amp: '&', lt: '<', gt: '>', quot: '"', apos: "'",
-  Tab: '\t', NewLine: '\n', nbsp: ' ',
-  excl: '!', num: '#', dollar: '$', percnt: '%', lpar: '(', rpar: ')', ast: '*', plus: '+', comma: ',', period: '.',
-  sol: '/', colon: ':', semi: ';', equals: '=', quest: '?', commat: '@', lsqb: '[', lbrack: '[', bsol: '\\', rsqb: ']',
-  rbrack: ']', Hat: '^', lowbar: '_', grave: '`', lcub: '{', lbrace: '{', verbar: '|', vert: '|', rcub: '}', rbrace: '}',
-};
-/** A backslash escape of JSON or JavaScript for a control character: \t, \n, \r, \f, \v and \b. */
-const CONTROL: Readonly<Record<string, string>> = { t: '\t', n: '\n', r: '\r', f: '\f', v: '\v', b: '\b' };
 const ESCAPE = new RegExp(
   [
-    '%([0-9a-fA-F]{2})',
+    '(%(?:[0-7][0-9a-fA-F]|[cdCD][0-9a-fA-F]%[89abAB][0-9a-fA-F]|[eE][0-9a-fA-F](?:%[89abAB][0-9a-fA-F]){2}|[fF][0-4](?:%[89abAB][0-9a-fA-F]){3}))',
     String.raw`\\u([0-9a-fA-F]{4})`,
     String.raw`\\x([0-9a-fA-F]{2})`,
     String.raw`\\(["'\\/])`,
-    '&#([0-9]{1,7});',
-    '&#[xX]([0-9a-fA-F]{1,6});',
-    `&(${Object.keys(ENTITIES).join('|')});`,
+    '(&(?:#[xX][0-9a-fA-F]{1,32}|#[0-9]{1,32}|[A-Za-z][A-Za-z0-9]{1,31});?)',
     String.raw`(\+)`,
     String.raw`\\([tnrfvb])`,
-    // JavaScript's code point escape, and the %u escape of JavaScript's escape().
+    // JavaScript's code point escape, the %u escape of JavaScript's escape(), and a legacy octal escape.
     String.raw`\\u\{([0-9a-fA-F]{1,6})\}`,
     '%u([0-9a-fA-F]{4})',
+    String.raw`\\([0-3][0-7]{0,2}|[4-7][0-7]?)`,
   ].join('|'),
   'g',
 );
-/** Whether a text can read differently decoded or re-spaced; one that cannot is compared as it is only. */
-const MAY_DIFFER = /[%\\&+]|\s\s|[^\S ]/;
-const WHITESPACE = /\s+/g;
+/** A backslash escape of JSON or JavaScript for a control character: \t, \n, \r, \f, \v and \b. */
+const CONTROL: Readonly<Record<string, string>> = { t: '\t', n: '\n', r: '\r', f: '\f', v: '\v', b: '\b' };
+const UTF8 = new TextDecoder('utf-8', { fatal: true });
+/**
+ * A character that separates words or numbers: any Unicode whitespace or separator (\s, \p{Z}), the next-line
+ * control U+0085, the Mongolian vowel separator U+180E, the zero-width characters U+200B-U+200D, U+2060 and U+FEFF,
+ * and the characters that are drawn blank (the Hangul fillers U+115F, U+1160, U+3164 and U+FFA0, the blank Braille
+ * pattern U+2800).
+ */
+const SEPARATOR = String.raw`[\s\p{Z}\u0085\u115F\u1160\u180E\u200B-\u200D\u2060\u2800\u3164\uFEFF\uFFA0]`;
+const SEPARATORS = new RegExp(`${SEPARATOR}+`, 'gu');
+/** Characters that are not seen: format characters (zero-width, soft hyphen, direction marks) and combining marks. */
+const INVISIBLE = /[\p{Cf}\p{Mn}\p{Me}]+/gu;
+/** A character outside ASCII with the combining marks that follow it: what normalised works on. */
+const NON_ASCII = /[^\x00-\x7F]\p{M}*/gu;
+/** The dashes a minus may be written with. */
+const DASHES = /[\u2010-\u2015\u2212\uFE58\uFE63\uFF0D]/gu;
+/** Other ways to write a decimal point, a comma and a semicolon that NFKC leaves as they are. */
+const MARKS: Readonly<Record<string, string>> = {
+  '\u00B7': '.',
+  '\u066B': '.',
+  '\u3002': '.',
+  '\u060C': ',',
+  '\u201A': ',',
+  '\u3001': ',',
+  '\u061B': ';',
+};
+const UNICODE_DIGIT = /\p{Nd}/u;
+/** Whether a text can read differently decoded, normalised or re-spaced; one that cannot is compared as it is only. */
+const MAY_DIFFER = /[%\\&+]|\s\s|[^\S ]|[^\x00-\x7F]/;
 
 function unescaped(match: RegExpExecArray, plus: boolean): string | undefined {
   if (match[1] !== undefined) {
-    const byte = Number.parseInt(match[1], 16);
-    return byte < 0x80 ? String.fromCharCode(byte) : undefined;
+    const bytes = Uint8Array.from(match[1].slice(1).split('%'), hex => Number.parseInt(hex, 16));
+    try {
+      return UTF8.decode(bytes);
+    } catch {
+      // Not a UTF-8 sequence (an overlong form, a stray continuation byte): left as it is.
+      return undefined;
+    }
   }
   if (match[2] !== undefined) return String.fromCharCode(Number.parseInt(match[2], 16));
   if (match[3] !== undefined) return String.fromCharCode(Number.parseInt(match[3], 16));
   if (match[4] !== undefined) return match[4];
-  if (match[5] !== undefined || match[6] !== undefined) {
-    const point = match[5] !== undefined ? Number.parseInt(match[5], 10) : Number.parseInt(match[6]!, 16);
+  if (match[5] !== undefined) return decodeHTML(match[5]);
+  if (match[6] !== undefined) return plus ? ' ' : undefined;
+  if (match[7] !== undefined) return CONTROL[match[7]];
+  if (match[8] !== undefined) {
+    const point = Number.parseInt(match[8], 16);
     return point <= 0x10ffff ? String.fromCodePoint(point) : undefined;
   }
-  if (match[7] !== undefined) return ENTITIES[match[7]];
-  if (match[8] !== undefined) return plus ? ' ' : undefined;
-  if (match[9] !== undefined) return CONTROL[match[9]];
-  if (match[10] !== undefined) {
-    const point = Number.parseInt(match[10], 16);
-    return point <= 0x10ffff ? String.fromCodePoint(point) : undefined;
-  }
-  if (match[11] !== undefined) return String.fromCharCode(Number.parseInt(match[11], 16));
+  if (match[9] !== undefined) return String.fromCharCode(Number.parseInt(match[9], 16));
+  if (match[10] !== undefined) return String.fromCharCode(Number.parseInt(match[10], 8));
   return undefined;
+}
+
+/** The value of a decimal digit of any script: its distance from the zero of its run of ten. */
+function digitValue(point: number): number {
+  let start = point;
+  while (start > 0 && point - start < 100 && UNICODE_DIGIT.test(String.fromCodePoint(start - 1))) start -= 1;
+  return (point - start) % 10;
+}
+
+/**
+ * A character outside ASCII as it reads: NFKC (a fullwidth or other compatibility form becomes what it stands for:
+ * "５" is "5", "，" is ","), a decimal digit of any script as its ASCII digit, any dash as a minus, and the other
+ * points, commas and semicolons of MARKS as theirs.
+ */
+function normalised(cluster: string): string {
+  let out = '';
+  for (const char of cluster.normalize('NFKC')) {
+    const point = char.codePointAt(0)!;
+    if (point > 0x7f && UNICODE_DIGIT.test(char)) out += String(digitValue(point));
+    else out += MARKS[char] ?? char;
+  }
+  return out.replace(DASHES, '-');
 }
 
 const isWordChar = (c: string | undefined) => c !== undefined && /[0-9A-Za-z]/.test(c);
@@ -171,19 +220,17 @@ function identity(text: string): View {
   return { text, from, to };
 }
 
-/** The view with every match of a pattern replaced; undefined when nothing changed. No replacement is longer than its match. */
+/** The view with every match of a pattern replaced; undefined when nothing changed. */
 function rewritten(view: View, pattern: RegExp, replacement: (match: RegExpExecArray) => string | undefined): View | undefined {
-  const from = new Int32Array(view.text.length);
-  const to = new Int32Array(view.text.length);
+  const from: number[] = [];
+  const to: number[] = [];
   const parts: string[] = [];
-  let length = 0;
   let last = 0;
   let changed = false;
   const copy = (start: number, end: number) => {
     for (let i = start; i < end; i += 1) {
-      from[length] = view.from[i]!;
-      to[length] = view.to[i]!;
-      length += 1;
+      from.push(view.from[i]!);
+      to.push(view.to[i]!);
     }
     parts.push(view.text.slice(start, end));
   };
@@ -193,10 +240,10 @@ function rewritten(view: View, pattern: RegExp, replacement: (match: RegExpExecA
     if (value === undefined || value === match[0]) continue;
     const end = match.index + match[0].length;
     copy(last, match.index);
+    // Every character the match became stands for the whole match in the original.
     for (let k = 0; k < value.length; k += 1) {
-      from[length] = view.from[match.index]!;
-      to[length] = view.to[end - 1]!;
-      length += 1;
+      from.push(view.from[match.index]!);
+      to.push(view.to[end - 1]!);
     }
     parts.push(value);
     last = end;
@@ -204,13 +251,17 @@ function rewritten(view: View, pattern: RegExp, replacement: (match: RegExpExecA
   }
   if (!changed) return undefined;
   copy(last, view.text.length);
-  return { text: parts.join(''), from: from.subarray(0, length), to: to.subarray(0, length) };
+  return { text: parts.join(''), from: Int32Array.from(from), to: Int32Array.from(to) };
 }
 
 /**
- * Every other way a text reads: with its whitespace runs as one space, and with one, two and up to MAX_DECODE_DEPTH
- * layers of encoding undone, "+" taken as itself and as a space, each of those re-spaced too. The text itself is
- * not among them.
+ * Every other way a text reads. The text and each layer of encoding undone (up to MAX_DECODE_DEPTH, "+" taken as
+ * itself and as a space) is read
+ * - as it is, and with every run of separators (SEPARATOR) as one space;
+ * - normalised (NFKC, digits of any script as ASCII digits, any dash as a minus), and that re-spaced;
+ * - normalised without the characters that are not seen (INVISIBLE), and that re-spaced.
+ * The next layer is undone on the normalised reading, so an escape written in fullwidth characters is undone too.
+ * The text itself is not among the readings.
  */
 function readings(text: string, visit: (view: View) => void): void {
   if (!MAY_DIFFER.test(text)) return;
@@ -220,17 +271,28 @@ function readings(text: string, visit: (view: View) => void): void {
     seen.add(view.text);
     visit(view);
   };
-  const respaced = (view: View) => rewritten(view, WHITESPACE, () => ' ');
-  const base = identity(text);
-  see(respaced(base));
+  const respaced = (view: View) => rewritten(view, SEPARATORS, () => ' ');
+  /** Sees the view and its other readings; returns the normalised one. */
+  const variants = (view: View): View => {
+    see(view);
+    see(respaced(view));
+    const normal = rewritten(view, NON_ASCII, match => normalised(match[0])) ?? view;
+    see(normal);
+    see(respaced(normal));
+    const plain = rewritten(normal, INVISIBLE, () => '');
+    if (plain) {
+      see(plain);
+      see(respaced(plain));
+    }
+    return normal;
+  };
+  const base = variants(identity(text));
   for (const plus of [false, true]) {
     let view = base;
     for (let depth = 0; depth < MAX_DECODE_DEPTH; depth += 1) {
       const next = rewritten(view, ESCAPE, match => unescaped(match, plus));
       if (!next) break;
-      view = next;
-      see(view);
-      see(respaced(view));
+      view = variants(next);
     }
   }
 }
@@ -243,11 +305,17 @@ const ADDRESS_TOKEN = /[0-9A-Fa-f:.]{3,}/g;
  */
 const COORDINATE = String.raw`[-−]?\d{1,3}(?:[.,]\d+)?`;
 /**
- * Two such numbers with a comma, a semicolon or whitespace between them, as coordinates are written. Each is a whole
- * number: not preceded by a digit (or a digit and a decimal mark), not followed by a digit (or a decimal mark and a
- * digit), so a coordinate is never found inside an amount, a date or an account number.
+ * Two such numbers with a comma or a semicolon between them, or only separators (SEPARATOR: any whitespace, the
+ * zero-width characters), as coordinates are written. Each is a whole number: not preceded by a digit (or a digit
+ * and a decimal mark), not followed by a digit (or a decimal mark and a digit), so a coordinate is never found inside
+ * an amount, a date or an account number.
  */
-const COORDINATES = new RegExp(String.raw`(?<!\d|\d[.,])(${COORDINATE})(\s{0,3}[,;]\s{0,3}|\s{1,3})(${COORDINATE})(?!\d|[.,]\d)`, 'g');
+const COORDINATES = new RegExp(
+  String.raw`(?<!\d|\d[.,])(${COORDINATE})(${SEPARATOR}{0,3}[,;]${SEPARATOR}{0,3}|${SEPARATOR}{1,3})(${COORDINATE})(?!\d|[.,]\d)`,
+  'gu',
+);
+/** A location as the gateway admits it: latitude and longitude, each with a decimal point and at least one decimal. */
+const LOCATION = /^-?\d{1,3}\.\d{1,20},-?\d{1,3}\.\d{1,20}$/;
 
 /** The latitude and longitude two matched numbers say; undefined when they are better read as something else. */
 function coordinates(match: RegExpExecArray): [number, number] | undefined {
@@ -337,11 +405,17 @@ export class GatewayRedactor {
     if (key) this.addresses.add(key);
   }
 
-  /** Adds a location ("latitude,longitude"): as addExact, and written with other zeros or another separator. */
+  /**
+   * Adds a location: "latitude,longitude", each with decimals, as the gateway admits it (PSU-Geo-Location). It is
+   * found as two numbers equal to its latitude and longitude that stand whole (COORDINATES), however they are
+   * written, the form it was given in included: one matcher, so every form has the same whole-number boundaries.
+   * A position without decimals ("55,12") is not taken: it says no more than an area of about a hundred kilometres
+   * and is written exactly as a Danish amount, so it is not looked for in bank text.
+   */
   addLocation(value: string | undefined): void {
-    this.addExact(value);
-    const parts = typeof value === 'string' ? value.split(',').map(Number) : [];
-    if (parts.length === 2 && parts.every(Number.isFinite)) this.locations.push([parts[0]!, parts[1]!]);
+    if (typeof value !== 'string' || !LOCATION.test(value)) return;
+    const [latitude, longitude] = value.split(',').map(Number) as [number, number];
+    this.locations.push([latitude, longitude]);
   }
 
   /**

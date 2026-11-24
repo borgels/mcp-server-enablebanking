@@ -82,11 +82,15 @@ The gateway follows this exactly:
   malformed statement is never turned into a background read.
 - The values are sent to the bank and removed from the call's finished result and error texts, so a bank that
   repeats them does not hand them on. The address and the location: always, where the value stands whole (not
-  inside a longer number or word), in any percent-, JSON-, JavaScript- or HTML-encoding up to three layers (escaped
-  whitespace such as `\t`, `\n`, `\u0009`, `&Tab;` and `&nbsp;` included) and in another spelling that says the
-  same (for a location: any trailing zeros, a decimal point or comma, a minus sign, and a comma, semicolon or
-  whitespace between the numbers, matched as whole numbers so amounts and dates are left alone). The other
-  values: best effort, from 8 characters. A value the bank has changed or cut up over several fields is not
+  inside a longer number or word), in any mix of percent-encoding as UTF-8 (`%C2%A0`), JSON and JavaScript escapes
+  and HTML character references (every numeric one and the whole HTML5 table of named ones, such as `&emsp;` and
+  `&ThinSpace;`) up to three layers, read after NFKC with digits of any script as ASCII digits, any Unicode
+  whitespace or separator and the zero-width characters as a separator, and invisible characters left out; and in
+  another spelling that says the same (for a location: any trailing zeros, a decimal point or comma, a minus sign
+  or dash, and a comma, semicolon or separators between the numbers, matched as whole numbers so amounts and dates
+  are left alone). A location needs decimals in both numbers: a position in whole degrees such as `55,12` is
+  refused, so `55,12 kr.` in a bank line is never taken for one. The other values: best effort, from 8
+  characters. A value the bank has changed or cut up over several fields is not
   removed, and the removal is no promise of anonymity. The README has the exact wording.
 - `context.unattended: true` marks the call as made with nobody present: no header is sent, and the call counts
   against the budget for unattended reads.
@@ -300,6 +304,11 @@ binding, raised by every withdrawal, refresh, replacement and revocation, so tha
 under way when it changed cannot return data or restore access. A word against a consent or an account is acted on
 whenever the answer that says it arrives, whatever the version; only lifting a withdrawal and binding accounts wait
 on it. A search checks every account again once its last account is read and drops what a withdrawn account gave.
+Every answer with bank data is checked once more after the tool's last await (the audit line), synchronously
+before it is returned, in the one response path all tools share (`Bank.release`, called by the tool wrapper); a
+tool whose answer was not made for that check is refused. The gateway does the same per instance: what a call
+learns about a session or an account (and `endSession`) is checked against every other call after its last await
+(`src/gateway/withdrawals.ts`), so an answer of a call under way does not outlive it.
 The gateway refuses a whole search when the bank says, for any of its accounts, that the consent is over. The rule and every way it learns that a consent is
 over are in the README ("Reads after a consent ended") and in `test/standalone-authority.test.ts`.
 
