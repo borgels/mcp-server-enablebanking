@@ -81,10 +81,11 @@ The gateway follows this exactly:
   with `presence_incomplete` before any request. Each value is checked as given, before anything is trimmed. A
   malformed statement is never turned into a background read.
 - The values are sent to the bank and removed from the call's finished result and error texts, so a bank that
-  repeats them does not hand them on. The address and the location: always, where the value stands whole, in any
-  percent-, JSON- or HTML-encoding up to three layers and in another spelling that says the same (for a location:
-  any trailing zeros, a decimal point or comma, and a comma, semicolon or whitespace between the numbers, matched as
-  whole numbers so amounts and dates are left alone). The other
+  repeats them does not hand them on. The address and the location: always, where the value stands whole (not
+  inside a longer number or word), in any percent-, JSON-, JavaScript- or HTML-encoding up to three layers (escaped
+  whitespace such as `\t`, `\n`, `\u0009`, `&Tab;` and `&nbsp;` included) and in another spelling that says the
+  same (for a location: any trailing zeros, a decimal point or comma, a minus sign, and a comma, semicolon or
+  whitespace between the numbers, matched as whole numbers so amounts and dates are left alone). The other
   values: best effort, from 8 characters. A value the bank has changed or cut up over several fields is not
   removed, and the removal is no promise of anonymity. The README has the exact wording.
 - `context.unattended: true` marks the call as made with nobody present: no header is sent, and the call counts
@@ -296,7 +297,10 @@ the bank is kept between calls anywhere, not even briefly in memory, and the ban
 met by the unattended budget (`ENABLEBANKING_UNATTENDED_FETCHES_PER_DAY`). What the standalone server keeps in
 memory is what it learned about each consent (ended, or without an account) and a version of each consent's
 binding, raised by every withdrawal, refresh, replacement and revocation, so that a read or a refresh that was
-under way when it changed cannot return data or restore access. The rule and every way it learns that a consent is
+under way when it changed cannot return data or restore access. A word against a consent or an account is acted on
+whenever the answer that says it arrives, whatever the version; only lifting a withdrawal and binding accounts wait
+on it. A search checks every account again once its last account is read and drops what a withdrawn account gave.
+The gateway refuses a whole search when the bank says, for any of its accounts, that the consent is over. The rule and every way it learns that a consent is
 over are in the README ("Reads after a consent ended") and in `test/standalone-authority.test.ts`.
 
 A cache added later must hold all of this, with a test for each:

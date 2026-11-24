@@ -513,6 +513,121 @@ describe('standalone: calls side by side', () => {
     expect((await w.tool('get_balances', { account: 'drift' })).failed).toBe(false);
   });
 
+  /** Enable Banking answers the next status request only on `release`, with `answer`; every other one as `state.session` says. */
+  function slowStatusOnce(w: World, answer: () => unknown) {
+    let release: () => void = () => undefined;
+    const waiting = new Promise<void>(resolve => {
+      release = resolve;
+    });
+    let arrived: () => void = () => undefined;
+    const atEnableBanking = new Promise<void>(resolve => {
+      arrived = resolve;
+    });
+    const usual = w.state.session;
+    let first = true;
+    w.state.session = () => {
+      if (!first) return usual();
+      first = false;
+      arrived();
+      return waiting.then(answer);
+    };
+    return { release, atEnableBanking };
+  }
+
+  it('a refresh that is told the consent is revoked withdraws it, even when another refresh finished meanwhile', async () => {
+    const w = await open();
+    await withBalancesRead(w, ['drift']);
+    // Refresh A waits for the session status ...
+    const slow = slowStatusOnce(w, () => ({ ...authorized(), status: 'REVOKED' }));
+    const first = w.tool('refresh_consent', { consent: CONSENT });
+    await slow.atEnableBanking;
+    // ... refresh B reads it in order and binds ...
+    const second = await w.tool('refresh_consent', { consent: CONSENT });
+    expect(second.failed, second.text).toBe(false);
+    // ... and then A is told that the consent is revoked.
+    slow.release();
+    const answer = await first;
+    expect(answer.failed, answer.text).toBe(true);
+    expect(answer.code).toBe('consent_revoked');
+    // The revocation stands: nothing is read under the consent.
+    await expectRefused(w, 'drift', 'consent_revoked');
+    await expectRefused(w, 'skat', 'consent_revoked');
+  });
+
+  it('a refresh that is told an account has left the consent withdraws it, even when another refresh finished meanwhile', async () => {
+    const w = await open();
+    await withBalancesRead(w);
+    const slow = slowStatusOnce(w, () => authorized([SKAT]));
+    const first = w.tool('refresh_consent', { consent: CONSENT });
+    await slow.atEnableBanking;
+    expect((await w.tool('refresh_consent', { consent: CONSENT })).failed).toBe(false);
+    slow.release();
+    const answer = await first;
+    expect(answer.failed, answer.text).toBe(true);
+    await expectRefused(w, 'drift', 'account_not_in_consent');
+    expect((await w.tool('get_balances', { account: 'skat' })).text).toContain(NEW);
+  });
+
+  it('a search drops what an account gave once the consent was revoked while a later account was read', async () => {
+    const w = await open();
+    // Drift is read; the bank is slow to answer for Skat ...
+    const bank = slowAt(w, `${SKAT}/transactions`, () => ({ transactions: [{ entry_reference: 'line-2', transaction_amount: { amount: OLD, currency: 'DKK' }, remittance_information: ['Husleje'] }] }));
+    const searching = w.tool('search_transactions', { search: 'husleje', ...PERIOD });
+    await bank.atTheBank;
+    // ... and meanwhile the status tool learns that the consent is revoked.
+    w.state.session = () => ({ ...authorized(), status: 'REVOKED' });
+    await w.tool('get_consent_status');
+    bank.release();
+    const answer = await searching;
+    expect(answer.failed, answer.text).toBe(false);
+    const search = JSON.parse(answer.text);
+    expect(search).toMatchObject({
+      complete: false,
+      count: 0,
+      returned: 0,
+      transactions: [],
+      totals: [],
+      accounts: [
+        { account: 'drift', read: false, problem: 'consent_revoked' },
+        { account: 'skat', read: false, problem: 'consent_revoked' },
+      ],
+    });
+    expect(answer.text).not.toContain('Husleje');
+    expect(answer.text).not.toContain(OLD);
+  });
+
+  it('a search drops only the account that left the consent while a later account was read', async () => {
+    const w = await open();
+    const bank = slowAt(w, `${SKAT}/transactions`, () => ({
+      transactions: [{ entry_reference: 'line-2', credit_debit_indicator: 'DBIT', status: 'BOOK', booking_date: '2026-09-12', transaction_amount: { amount: NEW, currency: 'DKK' }, remittance_information: ['Husleje skat'] }],
+    }));
+    const searching = w.tool('search_transactions', { search: 'husleje', ...PERIOD });
+    await bank.atTheBank;
+    w.state.session = () => authorized([SKAT]);
+    await w.tool('get_consent_status');
+    bank.release();
+    const search = JSON.parse((await searching).text);
+    expect(search.accounts).toMatchObject([
+      { account: 'drift', read: false, problem: 'account_not_in_consent' },
+      { account: 'skat', read: true, matches: 1 },
+    ]);
+    expect(search.transactions.map((row: { account: string }) => row.account)).toEqual(['skat']);
+    expect(JSON.stringify(search)).not.toContain(OLD);
+  });
+
+  it('a status answer in order is not shown as it was once the consent was withdrawn while it was on its way', async () => {
+    const w = await open();
+    // The status is asked, and while that answer is on its way a read learns that the consent is revoked.
+    const slow = slowStatusOnce(w, () => authorized());
+    const status = w.tool('get_consent_status');
+    await slow.atEnableBanking;
+    w.state.failing.set(`${DRIFT}/balances`, () => respond({ error: 'REVOKED_SESSION' }, 401));
+    expect((await w.tool('get_balances', { account: 'drift' })).code).toBe('consent_revoked');
+    slow.release();
+    const answer = JSON.parse((await status).text);
+    expect(answer.consents[0]).toMatchObject({ status: null, problem: 'consent_revoked' });
+  });
+
   it('a slow read that began before the consent was refreshed in order is still returned', async () => {
     const w = await open();
     const bank = slowAt(w, `${DRIFT}/balances`, oldBalance);

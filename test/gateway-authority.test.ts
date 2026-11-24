@@ -131,6 +131,27 @@ describe('no answer outlives its authority', () => {
     expect(bankReads().slice(before).every(call => !call.url.pathname.includes(ACCOUNT_B))).toBe(true);
   });
 
+  it.each([
+    ['REVOKED_SESSION', 401, 'consent_revoked'],
+    ['EXPIRED_SESSION', 401, 'consent_expired'],
+    ['SESSION_DOES_NOT_EXIST', 404, 'consent_not_active'],
+  ])('refuses a whole search when a later account says the consent is over (%s)', async (error, status, code) => {
+    // Account A is read; then the bank says, for account B, that the consent is over: A was read under it too.
+    const bank: Bank = { sessionAccounts: [ACCOUNT_A, ACCOUNT_B], failing: new Map([[ACCOUNT_B, { status, error }]]) };
+    const { fetchImpl } = api(bank);
+    const refused = await gateway(fetchImpl).callTool('search_transactions', { query: 'supplies' }, both);
+    expect(refused).toMatchObject({ isError: true, errorCode: code });
+    expect(JSON.stringify(refused)).not.toMatch(/Alpha|Beta/);
+  });
+
+  it('keeps the other accounts of a search when one account has left the consent', async () => {
+    const bank: Bank = { sessionAccounts: [ACCOUNT_A, ACCOUNT_B], failing: new Map([[ACCOUNT_B, { status: 404, error: 'ACCOUNT_DOES_NOT_EXIST' }]]) };
+    const { fetchImpl } = api(bank);
+    const result = data<Search>(await gateway(fetchImpl).callTool('search_transactions', { query: 'supplies' }, both));
+    expect(result.transactions.map(row => row.account)).toEqual([ACCOUNT_A]);
+    expect(result.accounts).toMatchObject([{ account: ACCOUNT_A, read: true }, { account: ACCOUNT_B, read: false, problem: 'account_not_in_consent' }]);
+  });
+
   it('never returns an account the host has taken off the list, and reads the bank for every call', async () => {
     const bank: Bank = { sessionAccounts: [ACCOUNT_A, ACCOUNT_B], failing: new Map() };
     const { fetchImpl, bankReads } = api(bank);
@@ -258,7 +279,8 @@ describe('the details of the person present', () => {
     const { fetchImpl } = api({ sessionAccounts: [ACCOUNT_A], failing: new Map(), echo });
     const context = { credentials: { sessionId: SESSION, accountIds: [ACCOUNT_A] }, psu: SHORT };
     const result = await gateway(fetchImpl).callTool('get_transaction_details', { account: ACCOUNT_A, transaction: 'id-Alpha-1' }, context);
-    expect(data<{ transaction: { note: string } }>(result).transaction.note).toBe('Robo7 betalt i dag, gzip, fra ‹redacted› ved ‹redacted› og 1‹redacted›5');
+    // A longer number that holds the address inside it is another number, and stays.
+    expect(data<{ transaction: { note: string } }>(result).transaction.note).toBe(`Robo7 betalt i dag, gzip, fra ‹redacted› ved ‹redacted› og 1${shortIp}5`);
   });
 
   it('are held by the redactor of one call only, in every form a bank could write them', () => {
@@ -626,6 +648,56 @@ describe('an address or a location of the person present, in another spelling th
 
   it('removes the location 55.0,12.0 itself, also with other zeros', async () => {
     expect(await through({ geoLocation: '55.0,12.0' }, 'At 55.0, 12.0 and 55.000 12.00, paid 1055,12 DKK')).toBe('At ‹redacted› and ‹redacted›, paid 1055,12 DKK');
+  });
+
+  it.each([
+    // The bank's text holds the backslash and the letter, as a JSON or JavaScript escape written into the text.
+    ['a tab', String.raw`55.6761\t12.5683`],
+    ['a newline', String.raw`55.6761\n12.5683`],
+    ['a carriage return and a newline', String.raw`55.6761\r\n12.5683`],
+    ['a form feed', String.raw`55.6761\f12.5683`],
+    ['a vertical tab', String.raw`55.6761\v12.5683`],
+    ['a tab as \\u0009', String.raw`55.6761\u000912.5683`],
+    ['a tab as \\u{9}', String.raw`55.6761\u{9}12.5683`],
+    ['a comma as \\u002C and a tab as \\t', String.raw`55.6761,\t12.5683`],
+    ['a tab escaped twice', String.raw`55.6761\\t12.5683`],
+    ['a comma as %u002C', '55.6761%u002C12.5683'],
+    ['an HTML tab', '55.6761&Tab;12.5683'],
+    ['an HTML no-break space', '55.6761&nbsp;12.5683'],
+    ['an HTML comma and decimal points', '55&period;6761&comma;12&period;5683'],
+    ['an HTML semicolon', '55.6761&semi;12.5683'],
+  ])('removes a location with %s between its numbers, written as an escape', async (_, written) => {
+    const note = await through({ geoLocation: '55.676100,12.568300' }, `Seen at ${written} today`);
+    expect(note).toBe('Seen at ‹redacted› today');
+  });
+
+  it('removes a location south and west of zero written with the minus sign', async () => {
+    expect(await through({ geoLocation: '-33.8568,-151.2153' }, 'Seen at −33.8568, −151.2153 today')).toBe('Seen at ‹redacted› today');
+  });
+
+  it.each([
+    ['a digit before it', '155.0,12.0'],
+    ['a digit after it', '55.0,12.01'],
+    ['a decimal mark and a digit after it', '55.0,12.0.5'],
+    ['a digit and a decimal mark before it', '3.55.0,12.0'],
+    ['a digit before it, percent-encoded', '155.0%2C12.0'],
+    ['a digit after it, percent-encoded', '55.0%2C12.01'],
+  ])('leaves a longer number that holds the location 55.0,12.0 written as it was sent: %s', async (_, written) => {
+    const text = `Ref ${written} done`;
+    expect(await through({ geoLocation: '55.0,12.0' }, text)).toBe(text);
+  });
+
+  it('removes the location 55.0,12.0 as it was sent where it stands whole, also next to punctuation', async () => {
+    expect(await through({ geoLocation: '55.0,12.0' }, '(55.0,12.0). "55.0%2C12.0", at:55.0,12.0;')).toBe('(‹redacted›). "‹redacted›", at:‹redacted›;');
+  });
+
+  it.each([
+    ['a digit before it', '1192.0.2.10'],
+    ['a digit after it', '192.0.2.105'],
+    ['a decimal point and a digit after it', '192.0.2.10.7'],
+  ])('leaves a longer number that holds the IPv4 address: %s', async (_, written) => {
+    const text = `Ref ${written} done`;
+    expect(await through({ ipAddress: '192.0.2.10' }, text)).toBe(text);
   });
 });
 

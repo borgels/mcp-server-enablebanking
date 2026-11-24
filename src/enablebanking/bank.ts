@@ -120,15 +120,20 @@ function filterAmount(value: number | string | undefined, name: string) {
  *   left it, reads of it are refused here, until Enable Banking shows it in
  *   order again or a new consent is completed.
  *
- * Calls run side by side, so every binding has a version (`versions`, by
- * session id) that every withdrawal, refresh, replacement and revocation
- * raises. A read takes the version before it asks the bank; when the version
- * has moved by the time the bank answers, the account is resolved anew from
- * the store and must still be the same account of the same consent, without a
- * word against it, or the answer is dropped. What lifts a word against a
- * consent (a status answer in order, a refresh) is acted on only when the
- * version has not moved while Enable Banking was asked: a withdrawal learned
- * meanwhile is newer and wins.
+ * Calls run side by side. When the bank answers, the account is resolved
+ * anew from the store and must still be the same account of the same consent,
+ * without a word against it, or the answer is dropped. An answer put together
+ * from several reads (a search over several accounts) is checked the same way
+ * for every account in it once the last read is done, and what an account gave
+ * is dropped from it when its consent or the account was withdrawn meanwhile.
+ *
+ * Every binding has a version (`versions`, by session id) that every
+ * withdrawal, refresh, replacement and revocation raises. A word against a
+ * consent or an account (ended, expired, revoked, an account no longer
+ * listed) is acted on whenever it arrives, whatever the version. What lifts a
+ * word against a consent or binds accounts to it (a status answer in order, a
+ * refresh) is acted on only when the version has not moved while Enable
+ * Banking was asked: a withdrawal learned meanwhile is newer and wins.
  *
  * Every way this server can learn it ends in `withdraw` or `withdrawAccount`:
  * - a read at the bank that fails with an ended consent or a missing account
@@ -397,8 +402,8 @@ export class Bank {
       ? [...new Map(query.accounts.map(reference => this.registry.resolve(this.company, reference)).map(account => [account.id, account])).values()]
       : company.accounts;
     const accounts: Array<{ account: string; read: boolean; lines?: number; matches?: number; complete?: boolean; problem?: ProblemCode; reason?: string }> = [];
-    const matches: Array<TransactionView & { account: string }> = [];
-    let fetchedAt: string | undefined;
+    // What each account that could be read gave, kept apart until every account has been asked.
+    const read: Array<{ at: number; link: LinkedAccount; found: TransactionView[]; fetchedAt: string }> = [];
     let stopped: ProblemCode | undefined;
     for (const account of wanted) {
       if (stopped) {
@@ -408,16 +413,30 @@ export class Bank {
       }
       try {
         const link = this.linked(account.id);
-        const read = await this.lines(link, period);
-        const found = read.rows.filter(row => matchesLine(row, filter));
-        for (const row of found) matches.push({ account: account.id, ...row });
-        accounts.push({ account: account.id, read: true, lines: read.rows.length, matches: found.length, complete: read.complete });
-        if (!fetchedAt || read.fetchedAt < fetchedAt) fetchedAt = read.fetchedAt;
+        const lines = await this.lines(link, period);
+        const found = lines.rows.filter(row => matchesLine(row, filter));
+        read.push({ at: accounts.length, link, found, fetchedAt: lines.fetchedAt });
+        accounts.push({ account: account.id, read: true, lines: lines.rows.length, matches: found.length, complete: lines.complete });
       } catch (error) {
         const problem = problemOf(error) ?? 'upstream_error';
         accounts.push({ account: account.id, read: false, problem, reason: formatUnknownError(error) });
         if (problem === 'rate_limited') stopped = problem;
       }
+    }
+    // The accounts were read one after another: a consent revoked, or an account withdrawn, while a later account was
+    // read is known now. Every account is checked again before anything it gave is returned; what an account that no
+    // longer stands gave is dropped, and the account is shown as not read, with why.
+    const matches: Array<TransactionView & { account: string }> = [];
+    let fetchedAt: string | undefined;
+    for (const { at, link, found, fetchedAt: when } of read) {
+      try {
+        this.confirm(link);
+      } catch (error) {
+        accounts[at] = { account: link.account.id, read: false, problem: problemOf(error) ?? 'consent_not_active', reason: formatUnknownError(error) };
+        continue;
+      }
+      for (const row of found) matches.push({ account: link.account.id, ...row });
+      if (!fetchedAt || when < fetchedAt) fetchedAt = when;
     }
     matches.sort(newestFirst);
     const limit = query.limit ?? 100;
@@ -441,7 +460,8 @@ export class Bank {
   async consentStatus() {
     const company = this.companyInfo();
     const now = this.now();
-    const consents = [];
+    const consents: Array<Record<string, unknown>> = [];
+    const checked: Array<{ at: number; session: StoredSession; version: number }> = [];
     for (const session of this.store.sessions()) {
       const base = {
         consent: session.key,
@@ -451,12 +471,15 @@ export class Bank {
         accounts: company.accounts.filter(account => session.accounts.some(bound => bound.iban === account.iban)).map(account => account.id),
       };
       try {
-        const version = this.version(session.sessionId);
+        const asked = this.version(session.sessionId);
         const status = await this.sessionAt(session);
         // What the answer says about the consent is acted on before it is shown: an ended consent, and an account
         // that has left it, is no longer read. A word against it learned while this answer was on its way is newer
         // and is not lifted by it.
-        this.learn(session, status, this.now(), this.version(session.sessionId) === version);
+        const unchanged = this.version(session.sessionId) === asked;
+        const problem = this.learn(session, status, this.now(), unchanged);
+        // An answer in order is shown as it is only when nothing changed here since it was asked (checked below).
+        if (!problem) checked.push({ at: consents.length, session, version: unchanged ? this.version(session.sessionId) : -1 });
         const covered = new Set(Array.isArray(status.accounts) ? status.accounts : []);
         const validUntil = typeof status.access?.valid_until === 'string' ? status.access.valid_until : session.validUntil;
         const until = Date.parse(validUntil);
@@ -478,6 +501,17 @@ export class Bank {
       } catch (error) {
         consents.push({ ...base, status: null, validUntil: session.validUntil, problem: problemOf(error) ?? 'upstream_error', reason: formatUnknownError(error) });
       }
+    }
+    // An answer in order for a consent that was withdrawn, revoked, replaced or refreshed here while its answer, or a
+    // later consent's, was on its way is not shown as Enable Banking gave it, but as changed, with why.
+    for (const { at, session, version } of checked) {
+      if (this.version(session.sessionId) === version) continue;
+      consents[at] = {
+        ...consents[at],
+        status: null,
+        problem: this.lostConsents.get(session.sessionId) ?? 'consent_not_active',
+        reason: 'The consent changed here while its status was being checked; ask again.',
+      };
     }
     return { company: company.name, checkedAt: new Date(now).toISOString(), consents };
   }
@@ -645,10 +679,12 @@ export class Bank {
     if (!session) throw new ConsentError(`no consent "${consent}"; see enablebanking_list_accounts`);
     const asked = this.version(session.sessionId);
     const status = await this.sessionAt(session);
-    // Something learned about the consent while Enable Banking was asked is newer than this answer.
-    if (this.version(session.sessionId) !== asked) throw this.changedMeanwhile(session);
+    // A word against the consent in this answer (over, expired, an account no longer listed) is acted on whatever
+    // happened while Enable Banking was asked. Only lifting and binding wait on the version: something learned about
+    // the consent meanwhile is newer than an answer in order.
+    const unchanged = this.version(session.sessionId) === asked;
     // Nothing is bound to a consent Enable Banking no longer honours.
-    const problem = this.learn(session, status, this.now(), true);
+    const problem = this.learn(session, status, this.now(), unchanged);
     if (problem) {
       throw new ConsentError(
         `Enable Banking no longer honours the ${session.aspsp.name} consent for ${this.companyInfo().name}. ` +
@@ -656,6 +692,7 @@ export class Bank {
         problem,
       );
     }
+    if (!unchanged) throw this.changedMeanwhile(session);
     const learned = this.version(session.sessionId);
     const details: AccountResource[] = [];
     for (const uid of Array.isArray(status.accounts) ? status.accounts : []) {
@@ -804,10 +841,12 @@ export class Bank {
       this.withdraw(session, problem);
       return problem;
     }
-    // An answer without a list of accounts covers none.
+    // An answer without a list of accounts covers none. An account it does not list is withdrawn, also one a refresh
+    // bound to the same consent while this answer was on its way: a word against an account is never ignored.
     const covered = new Set(Array.isArray(status?.accounts) ? status.accounts : []);
-    for (const bound of session.accounts) {
-      if (!covered.has(bound.uid)) this.withdrawAccount(session, bound.uid, 'account_not_in_consent');
+    const stored = this.store.sessions().find(candidate => candidate.sessionId === session.sessionId);
+    for (const uid of new Set([...session.accounts, ...(stored?.accounts ?? [])].map(bound => bound.uid))) {
+      if (!covered.has(uid)) this.withdrawAccount(session, uid, 'account_not_in_consent');
     }
     if (lift) {
       this.lostConsents.delete(session.sessionId);
@@ -869,20 +908,25 @@ export class Bank {
    * bound to another uid, expired or withdrawn, and the answer is dropped.
    */
   private async read<T>(link: LinkedAccount, load: () => Promise<T>): Promise<{ value: T; fetchedAt: string }> {
-    const version = this.version(link.session.sessionId);
     const value = await this.call(link, load);
-    if (this.version(link.session.sessionId) !== version) {
-      const now = this.linked(link.account.id);
-      if (now.session.sessionId !== link.session.sessionId || now.uid !== link.uid) {
-        throw new ConsentError(
-          `The ${link.session.aspsp.name} consent for ${link.account.name} (${maskIban(link.account.iban)}) changed while the bank was read; ` +
-            'the answer was dropped. Ask again.',
-          'consent_not_active',
-        );
-      }
+    this.confirm(link);
+    return { value, fetchedAt: new Date(this.now()).toISOString() };
+  }
+
+  /**
+   * Throws unless the account still stands as it did when it was read: resolved anew from the registry and the
+   * store, the same account of the same consent under the same uid, in date, and without a word against it.
+   */
+  private confirm(link: LinkedAccount): void {
+    const now = this.linked(link.account.id);
+    if (now.session.sessionId !== link.session.sessionId || now.uid !== link.uid) {
+      throw new ConsentError(
+        `The ${link.session.aspsp.name} consent for ${link.account.name} (${maskIban(link.account.iban)}) changed while the bank was read; ` +
+          'the answer was dropped. Ask again.',
+        'consent_not_active',
+      );
     }
     this.standing(link);
-    return { value, fetchedAt: new Date(this.now()).toISOString() };
   }
 }
 

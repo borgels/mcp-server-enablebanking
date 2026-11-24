@@ -52,6 +52,8 @@ const SEARCH_MAX_PAGES = 10;
 const SEARCH_MAX_ROWS = 2_500;
 const MAX_ACCOUNT_IDS = 100;
 const MAX_LIST_ACCOUNTS = 25;
+/** What a failed read says when the consent itself is over, not one account. */
+const CONSENT_OVER: ReadonlySet<ProblemCode> = new Set<ProblemCode>(['consent_expired', 'consent_revoked', 'consent_not_active']);
 const DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 const AMOUNT_PATTERN = /^\d{1,15}(\.\d{1,6})?$/;
 
@@ -801,6 +803,9 @@ async function searchTransactions(
     } catch (error) {
       const problem = problemOf(error) ?? 'upstream_error';
       env.onProblem?.(problem);
+      // The bank says the call's consent is over: what earlier accounts gave was read under it and is not returned.
+      // The whole answer is this refusal. (An account that has left the consent says nothing of the others.)
+      if (CONSENT_OVER.has(problem)) throw error;
       firstFailure ??= { problem, error };
       perAccount.push({ account, read: false, problem });
       if (problem === 'rate_limited') stopped = problem;

@@ -9,20 +9,22 @@ import { isIP } from 'node:net';
  * Redaction is the second line: the gateway's own errors carry no text from
  * Enable Banking or a bank (see errors.ts). What it removes:
  * - every value added, however it is written: as it is, percent-encoded
- *   (upper- or lower-case hex, "+" for a space, any character encoded or
- *   not), escaped as in JSON or HTML, any of these inside another up to
- *   MAX_DECODE_DEPTH layers, and with other whitespace between its words.
- *   The text is decoded before it is compared, so there is no list of
- *   spellings to fall outside of;
+ *   (upper- or lower-case hex, "+" for a space, %uXXXX, any character
+ *   encoded or not), escaped as in JSON or JavaScript (\uXXXX, \u{X}, \xXX,
+ *   \t, \n, \r, \f, \v, \b and a quote, slash or backslash) or in HTML
+ *   (numeric references and the named ones of ESCAPE), any of these inside
+ *   another up to MAX_DECODE_DEPTH layers, and with other whitespace between
+ *   its words. The text is decoded before it is compared;
  * - an IP address and a location added as such, also in another spelling
  *   that says the same: an IPv6 address in upper case, written out in full
  *   or shortened differently, an IPv4 address as an IPv4-mapped IPv6
  *   address; a location as two numbers equal to its latitude and longitude,
  *   with any number of trailing zeros, a decimal point or a decimal comma,
- *   and a comma, a semicolon or whitespace between them (also encoded, as
- *   any value). Numbers are matched whole: a number inside a longer number
- *   is not one, and two whole numbers ("1055,12", "55 12") are read as an
- *   amount or a number, not as a location;
+ *   a minus or a minus sign, and a comma, a semicolon or whitespace between
+ *   them (also encoded, as any value). They are matched whole, also as they
+ *   were added: an address or a number inside a longer number or word is
+ *   not one (standsWhole), and two whole numbers ("1055,12", "55 12") are
+ *   read as an amount or a number, not as a location;
  * - for the key material, also every piece of it of FRAGMENT_LENGTH
  *   characters, so a part of the key is not left after a cut or an echo.
  *   Session ids and authorization codes are matched whole: a session id is a
@@ -85,8 +87,33 @@ interface View {
  * percent-encoded byte is decoded when it is ASCII: every value held here is ASCII, so a byte of a longer UTF-8
  * sequence cannot be part of one.
  */
-const ESCAPE = /%([0-9a-fA-F]{2})|\\u([0-9a-fA-F]{4})|\\x([0-9a-fA-F]{2})|\\(["'\\/])|&#([0-9]{1,7});|&#[xX]([0-9a-fA-F]{1,6});|&(amp|lt|gt|quot|apos);|(\+)/g;
-const ENTITIES: Readonly<Record<string, string>> = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" };
+/** HTML's named characters for whitespace and ASCII punctuation (names are case-sensitive). */
+const ENTITIES: Readonly<Record<string, string>> = {
+  amp: '&', lt: '<', gt: '>', quot: '"', apos: "'",
+  Tab: '\t', NewLine: '\n', nbsp: ' ',
+  excl: '!', num: '#', dollar: '$', percnt: '%', lpar: '(', rpar: ')', ast: '*', plus: '+', comma: ',', period: '.',
+  sol: '/', colon: ':', semi: ';', equals: '=', quest: '?', commat: '@', lsqb: '[', lbrack: '[', bsol: '\\', rsqb: ']',
+  rbrack: ']', Hat: '^', lowbar: '_', grave: '`', lcub: '{', lbrace: '{', verbar: '|', vert: '|', rcub: '}', rbrace: '}',
+};
+/** A backslash escape of JSON or JavaScript for a control character: \t, \n, \r, \f, \v and \b. */
+const CONTROL: Readonly<Record<string, string>> = { t: '\t', n: '\n', r: '\r', f: '\f', v: '\v', b: '\b' };
+const ESCAPE = new RegExp(
+  [
+    '%([0-9a-fA-F]{2})',
+    String.raw`\\u([0-9a-fA-F]{4})`,
+    String.raw`\\x([0-9a-fA-F]{2})`,
+    String.raw`\\(["'\\/])`,
+    '&#([0-9]{1,7});',
+    '&#[xX]([0-9a-fA-F]{1,6});',
+    `&(${Object.keys(ENTITIES).join('|')});`,
+    String.raw`(\+)`,
+    String.raw`\\([tnrfvb])`,
+    // JavaScript's code point escape, and the %u escape of JavaScript's escape().
+    String.raw`\\u\{([0-9a-fA-F]{1,6})\}`,
+    '%u([0-9a-fA-F]{4})',
+  ].join('|'),
+  'g',
+);
 /** Whether a text can read differently decoded or re-spaced; one that cannot is compared as it is only. */
 const MAY_DIFFER = /[%\\&+]|\s\s|[^\S ]/;
 const WHITESPACE = /\s+/g;
@@ -104,7 +131,33 @@ function unescaped(match: RegExpExecArray, plus: boolean): string | undefined {
     return point <= 0x10ffff ? String.fromCodePoint(point) : undefined;
   }
   if (match[7] !== undefined) return ENTITIES[match[7]];
-  return plus ? ' ' : undefined;
+  if (match[8] !== undefined) return plus ? ' ' : undefined;
+  if (match[9] !== undefined) return CONTROL[match[9]];
+  if (match[10] !== undefined) {
+    const point = Number.parseInt(match[10], 16);
+    return point <= 0x10ffff ? String.fromCodePoint(point) : undefined;
+  }
+  if (match[11] !== undefined) return String.fromCharCode(Number.parseInt(match[11], 16));
+  return undefined;
+}
+
+const isWordChar = (c: string | undefined) => c !== undefined && /[0-9A-Za-z]/.test(c);
+const isDigit = (c: string | undefined) => c !== undefined && c >= '0' && c <= '9';
+
+/**
+ * Whether text[start, end) stands as a whole: an address or a location found there is not part of a longer number or
+ * word. A letter or digit, or a decimal mark with a digit beyond it, right next to it makes it part of something else.
+ */
+function standsWhole(text: string, start: number, end: number): boolean {
+  if (isWordChar(text[start])) {
+    const before = text[start - 1];
+    if (isWordChar(before) || ((before === '.' || before === ',') && isDigit(text[start - 2]))) return false;
+  }
+  if (isWordChar(text[end - 1])) {
+    const after = text[end];
+    if (isWordChar(after) || ((after === '.' || after === ',') && isDigit(text[end + 1]))) return false;
+  }
+  return true;
 }
 
 /** The text itself as a view: every character stands where it stands. */
@@ -184,8 +237,11 @@ function readings(text: string, visit: (view: View) => void): void {
 
 /** A stretch of the characters an IP address is written with. Whether it is one is decided by parsing it. */
 const ADDRESS_TOKEN = /[0-9A-Fa-f:.]{3,}/g;
-/** A latitude or a longitude: up to three digits, then a decimal point or comma and any number of digits. */
-const COORDINATE = String.raw`-?\d{1,3}(?:[.,]\d+)?`;
+/**
+ * A latitude or a longitude: a minus (ASCII or the Unicode minus sign), up to three digits, then a decimal point or
+ * comma and any number of digits.
+ */
+const COORDINATE = String.raw`[-−]?\d{1,3}(?:[.,]\d+)?`;
 /**
  * Two such numbers with a comma, a semicolon or whitespace between them, as coordinates are written. Each is a whole
  * number: not preceded by a digit (or a digit and a decimal mark), not followed by a digit (or a decimal mark and a
@@ -197,8 +253,9 @@ const COORDINATES = new RegExp(String.raw`(?<!\d|\d[.,])(${COORDINATE})(\s{0,3}[
 function coordinates(match: RegExpExecArray): [number, number] | undefined {
   const [, first, , second] = match as unknown as [string, string, string, string];
   // Two whole numbers are an amount ("1055,12"), a date or an account number far more often than a location.
-  if (/^-?\d+$/.test(first) && /^-?\d+$/.test(second)) return undefined;
-  return [Number(first.replace(',', '.')), Number(second.replace(',', '.'))];
+  if (/^[-−]?\d+$/.test(first) && /^[-−]?\d+$/.test(second)) return undefined;
+  const number = (written: string) => Number(written.replace(',', '.').replace('−', '-'));
+  return [number(first), number(second)];
 }
 
 /**
@@ -248,9 +305,10 @@ export class GatewayRedactor {
   private readonly addresses = new Set<string>();
   /** Locations, as latitude and longitude. */
   private readonly locations: Array<[number, number]> = [];
-  private readonly values = new Set<string>();
+  /** The values, each with whether it is found only where it stands whole (an address or a location: standsWhole). */
+  private readonly values = new Map<string, boolean>();
   /** The values and every other way each of them reads, longest first; built when first needed. */
-  private searched: string[] | undefined;
+  private searched: Searched[] | undefined;
   private readonly fragments = new Set<string>();
   /** Pieces the sink check looks for: of the key content and of the call's session id, in every form. */
   private readonly watched = new Set<string>();
@@ -268,7 +326,8 @@ export class GatewayRedactor {
    */
   addExact(value: string | undefined): void {
     if (typeof value !== 'string' || value === '') return;
-    for (const form of forms(value)) this.keep(form);
+    // An address or a location is a number of a kind: it is found where it stands whole, not inside a longer number.
+    for (const form of forms(value)) this.keep(form, true);
   }
 
   /** Adds an IP address: as addExact, and in every other spelling that says the same address. */
@@ -320,7 +379,7 @@ export class GatewayRedactor {
   /** A new redactor with the same values; adding to the fork does not change this one. */
   fork(): GatewayRedactor {
     const copy = new GatewayRedactor();
-    for (const value of this.values) copy.keep(value);
+    for (const [value, whole] of this.values) copy.keep(value, whole);
     for (const address of this.addresses) copy.addresses.add(address);
     for (const location of this.locations) copy.locations.push(location);
     for (const fragment of this.fragments) copy.fragments.add(fragment);
@@ -337,8 +396,8 @@ export class GatewayRedactor {
     let result = text;
     // Longest first, so a value containing another is removed whole.
     const searched = this.everyForm();
-    for (const value of searched) {
-      result = result.split(value).join('‹redacted›');
+    for (const { value, whole } of searched) {
+      result = whole ? replaceWhole(result, value) : result.split(value).join('‹redacted›');
     }
     // Then the text as it reads decoded and re-spaced: what a value covers there is removed from the text itself.
     result = this.redactReadings(result, searched);
@@ -346,15 +405,18 @@ export class GatewayRedactor {
   }
 
   /** The values held, and every other way each of them reads (decoded, re-spaced), longest first. */
-  private everyForm(): string[] {
+  private everyForm(): Searched[] {
     if (this.searched) return this.searched;
-    const all = new Set<string>(this.values);
-    for (const value of this.values) {
+    // A form that is also the form of a value found anywhere is found anywhere.
+    const all = new Map<string, boolean>();
+    const add = (form: string, whole: boolean) => all.set(form, (all.get(form) ?? true) && whole);
+    for (const [value, whole] of this.values) add(value, whole);
+    for (const [value, whole] of this.values) {
       readings(value, view => {
-        if (view.text.length >= MIN_EQUIVALENT_LENGTH && view.text.trim() !== '') all.add(view.text);
+        if (view.text.length >= MIN_EQUIVALENT_LENGTH && view.text.trim() !== '') add(view.text, whole);
       });
     }
-    this.searched = [...all].sort((a, b) => b.length - a.length);
+    this.searched = [...all].map(([value, whole]) => ({ value, whole })).sort((a, b) => b.value.length - a.value.length);
     return this.searched;
   }
 
@@ -362,7 +424,7 @@ export class GatewayRedactor {
    * Removes from a text every stretch that reads as a held value once the text is decoded or re-spaced, and every
    * stretch that says a held address or location in another spelling, in the text as it is and as it reads decoded.
    */
-  private redactReadings(text: string, searched: string[]): string {
+  private redactReadings(text: string, searched: Searched[]): string {
     const meanings = this.addresses.size > 0 || this.locations.length > 0;
     if (searched.length === 0 && !meanings) return text;
     const spans: Array<[number, number]> = [];
@@ -389,8 +451,9 @@ export class GatewayRedactor {
     };
     if (meanings) meant(identity(text));
     readings(text, view => {
-      for (const value of searched) {
-        for (let at = view.text.indexOf(value); at !== -1; at = view.text.indexOf(value, at + value.length)) {
+      for (const { value, whole } of searched) {
+        for (let at = view.text.indexOf(value); at !== -1; at = view.text.indexOf(value, at + (whole ? 1 : value.length))) {
+          if (whole && !standsWhole(view.text, at, at + value.length)) continue;
           spans.push([view.from[at]!, view.to[at + value.length - 1]!]);
         }
       }
@@ -471,19 +534,39 @@ export class GatewayRedactor {
 
   private remember(value: string): void {
     if (value.length < MIN_SECRET_LENGTH) return;
-    this.keep(value);
+    this.keep(value, false);
   }
 
-  private keep(value: string): void {
+  /** Holds a value; one held both ways is found anywhere. */
+  private keep(value: string, whole: boolean): void {
     this.searched = undefined;
+    const anywhere = this.values.get(value) === false || !whole;
     this.values.delete(value);
-    this.values.add(value);
+    this.values.set(value, !anywhere);
     while (this.values.size > MAX_REDACTED_VALUES) {
-      const oldest = this.values.values().next().value;
+      const oldest = this.values.keys().next().value;
       if (oldest === undefined) break;
       this.values.delete(oldest);
     }
   }
+}
+
+/** A form searched for, and whether it is found only where it stands whole. */
+interface Searched {
+  value: string;
+  whole: boolean;
+}
+
+/** The text with every place where the value stands whole replaced by the marker. */
+function replaceWhole(text: string, value: string): string {
+  let out = '';
+  let last = 0;
+  for (let at = text.indexOf(value); at !== -1; at = text.indexOf(value, at + 1)) {
+    if (at < last || !standsWhole(text, at, at + value.length)) continue;
+    out += `${text.slice(last, at)}‹redacted›`;
+    last = at + value.length;
+  }
+  return out + text.slice(last);
 }
 
 /** The value as it may appear: raw, URL-encoded and escaped inside a JSON string. */
