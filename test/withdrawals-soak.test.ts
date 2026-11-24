@@ -88,6 +88,41 @@ async function soak(seed: number, steps: number) {
 
   const statuses: Held[] = [];
   const reads: Held[] = [];
+  const deletes: Held[] = [];
+  /**
+   * The documented list of sessions ended here (README, "Answers after a withdrawal"), as the oracle keeps it: each
+   * session with how many endSession calls for it are under way, newest last; at most ENDED_KEPT, the oldest without
+   * an endSession under way dropped first. A read that starts while its session is on the list must be refused.
+   */
+  const endedList = new Map<string, number>();
+  const ENDED_KEPT = 2;
+  const startEnd = (id: string) => {
+    const running = endedList.get(id) ?? 0;
+    endedList.delete(id);
+    endedList.set(id, running + 1);
+  };
+  const finishEnd = (id: string) => {
+    const running = endedList.get(id);
+    if (running !== undefined && running > 0) endedList.set(id, running - 1);
+    for (const [entry, under] of endedList) {
+      if (endedList.size <= ENDED_KEPT) break;
+      if (under === 0) endedList.delete(entry);
+    }
+  };
+  /** endSession, not awaited: its DELETE is held until let go. */
+  const endSession = async (id: string) => {
+    for (const read of underWay) if (read.session === id && !read.done) read.refused = true;
+    startEnd(id);
+    void gw.endSession({ sessionId: id }).catch(() => undefined);
+    await settle();
+  };
+  const deliverDelete = async (held: Held) => {
+    deletes.splice(deletes.indexOf(held), 1);
+    held.respond();
+    await settle();
+    finishEnd(held.session);
+    collect();
+  };
   const fetchImpl: typeof fetch = async (input, init) => {
     const url = new URL(String(input));
     const sessionMatch = /^\/sessions\/([^/]+)$/.exec(url.pathname);
@@ -95,8 +130,21 @@ async function soak(seed: number, steps: number) {
       const id = sessionMatch[1]!;
       const session = bank.get(id) ?? { status: 'AUTHORIZED', accounts: new Set<string>(), until: clock + 3_600_000 };
       if ((init?.method ?? 'GET') === 'DELETE') {
-        session.status = 'CLOSED';
-        return json({});
+        // Held too, and sometimes failing: the session is closed at the bank only when one succeeds.
+        return new Promise<Response>(resolve => {
+          deletes.push({
+            session: id,
+            respond: () => {
+              if (next() < 0.3) {
+                counts.endFailures += 1;
+                resolve(json({ error: 'INTERNAL_ERROR' }, 500));
+              } else {
+                session.status = 'CLOSED';
+                resolve(json({}));
+              }
+            },
+          });
+        });
       }
       const snapshot: Snapshot =
         session.status === 'REVOKED' && next() < 0.3
@@ -133,7 +181,7 @@ async function soak(seed: number, steps: number) {
   });
 
   const underWay: Read[] = [];
-  const counts = { reads: 0, answered: 0, refused: 0, refusedForAccount: 0, refusedForConsent: 0, refusedForDate: 0, statusesOutOfOrder: 0, revocations: 0, removals: 0, restorations: 0, shortened: 0, ends: 0, advances: 0, renewals: 0, otherSessions: 0 };
+  const counts = { reads: 0, answered: 0, refused: 0, refusedForAccount: 0, refusedForConsent: 0, refusedForDate: 0, statusesOutOfOrder: 0, revocations: 0, removals: 0, restorations: 0, shortened: 0, ends: 0, endFailures: 0, concurrentEnds: 0, advances: 0, renewals: 0, otherSessions: 0, readsOnEndedList: 0 };
 
   /** The read's call has ended: the oracle. */
   const judge = (read: Read) => {
@@ -197,6 +245,11 @@ async function soak(seed: number, steps: number) {
       counts.reads += 1;
       const account = pick(accountsOf.get(sessionId)!);
       const read: Read = { session: sessionId, account, refused: false, missing: false, until: Number.NaN, done: false };
+      if (endedList.has(sessionId)) {
+        // Ended here, and still on the list: refused, whatever Enable Banking says now.
+        read.refused = true;
+        counts.readsOnEndedList += 1;
+      }
       underWay.push(read);
       void gw.callTool('get_balances', { account }, { credentials: { sessionId, accountIds: accountsOf.get(sessionId)! } }).then(result => {
         read.result = result;
@@ -232,11 +285,11 @@ async function soak(seed: number, steps: number) {
       session.until = Math.min(session.until, clock + (1 + Math.floor(next() * 3)) * 60_000);
     } else if (roll < 0.83) {
       counts.ends += 1;
-      for (const read of underWay) if (read.session === sessionId && !read.done) read.refused = true;
-      const ended = gw.endSession({ sessionId }).catch(() => undefined);
-      await settle();
-      await ended;
+      if (deletes.some(held => held.session === sessionId)) counts.concurrentEnds += 1;
+      await endSession(sessionId);
       collect();
+    } else if (roll < 0.86 && deletes.length > 0) {
+      await deliverDelete(pick(deletes));
     } else if (roll < 0.89) {
       counts.advances += 1;
       clock += Math.floor(next() * 3) * 60_000;
@@ -247,9 +300,9 @@ async function soak(seed: number, steps: number) {
       bank.set(other, { status: 'AUTHORIZED', accounts: new Set(), until: clock + 3_600_000 });
       if (next() < Number(process.env.SOAK_END_OTHERS ?? 0.3)) {
         // Sometimes one that is then ended: the list of ended sessions overflows.
-        const ended = gw.endSession({ sessionId: other }).catch(() => undefined);
-        await settle();
-        await ended;
+        await endSession(other);
+        const held = deletes.find(entry => entry.session === other);
+        if (held) await deliverDelete(held);
       }
       void gw.sessionStatus({ sessionId: other }).catch(() => undefined);
       await settle();
@@ -263,8 +316,12 @@ async function soak(seed: number, steps: number) {
     }
   }
   // Everything still held is let go, in random order, until every read has ended.
-  for (let guard = 0; (underWay.length > 0 || statuses.length > 0 || reads.length > 0) && guard < 10_000; guard += 1) {
-    if (statuses.length > 0 && (reads.length === 0 || next() < 0.5)) await deliverStatus(pick(statuses));
+  for (let guard = 0; (underWay.length > 0 || statuses.length > 0 || reads.length > 0 || deletes.length > 0) && guard < 10_000; guard += 1) {
+    const roll = next();
+    if (statuses.length > 0 && roll < 0.4) await deliverStatus(pick(statuses));
+    else if (reads.length > 0 && roll < 0.8) await deliverRead(pick(reads));
+    else if (deletes.length > 0) await deliverDelete(pick(deletes));
+    else if (statuses.length > 0) await deliverStatus(pick(statuses));
     else if (reads.length > 0) await deliverRead(pick(reads));
     else await settle();
     collect();
@@ -293,6 +350,9 @@ describe('the gateway under random interleavings', () => {
       expect(total.refusedForAccount!).toBeGreaterThan(seeds / 4);
       expect(total.refusedForDate!).toBeGreaterThan(seeds / 10);
       expect(total.statusesOutOfOrder!).toBeGreaterThan(seeds * 5);
+      expect(total.concurrentEnds!).toBeGreaterThan(seeds / 10);
+      expect(total.endFailures!).toBeGreaterThan(seeds);
+      expect(total.readsOnEndedList!).toBeGreaterThan(seeds);
     },
     Math.max(120_000, seeds * 2_000),
   );

@@ -85,8 +85,10 @@ export class Withdrawals {
   /** endSession has started for the session: every call under way is refused, and every call that starts while it is kept. */
   ending(session: string): void {
     for (const watch of this.watches(session)) watch.refused = true;
+    // Read before the entry is moved to the end (newest): every endSession under way is counted.
+    const running = this.ended.get(session) ?? 0;
     this.ended.delete(session);
-    this.ended.set(session, (this.ended.get(session) ?? 0) + 1);
+    this.ended.set(session, running + 1);
   }
 
   /** endSession has finished (or failed): its entry may now be dropped for room. */

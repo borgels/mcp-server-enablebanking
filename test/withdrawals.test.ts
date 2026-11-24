@@ -93,6 +93,22 @@ describe('the watch of a call under way', () => {
     expect(register.size.ended).toBeLessThanOrEqual(2);
   });
 
+  it('keeps a session while any of several endSession calls for it is under way', () => {
+    const register = new Withdrawals(1);
+    register.ending('s1');
+    register.ending('s1');
+    // The first fails and ends; another session is ended, so the list is over its size.
+    register.endingDone('s1');
+    register.ending('s2');
+    register.endingDone('s2');
+    // The second endSession for s1 is still under way: a call that starts now is refused.
+    expect(register.stands(register.begin('s1', [A]), NOW)).toBe(false);
+    register.endingDone('s1');
+    register.ending('s3');
+    register.endingDone('s3');
+    expect(register.size.ended).toBe(1);
+  });
+
   it('does not depend on anything but the call: other sessions do not touch its watch', () => {
     const register = new Withdrawals(1);
     const watch = register.begin('s1', [A]);
