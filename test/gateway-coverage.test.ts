@@ -1,5 +1,5 @@
 // The embedded gateway's account information coverage: who is present, the budget for reads nobody is present
-// for, the answer cache, fixed error codes, the tools added in 0.7.0 and the consent helpers. Made-up data only.
+// for, fixed error codes, the tools added in 0.7.0 and the consent helpers. Made-up data only.
 import { describe, expect, it, vi } from 'vitest';
 import {
   createEnableBankingGateway,
@@ -286,67 +286,6 @@ describe('list_accounts', () => {
   });
 });
 
-describe('the answer cache', () => {
-  it('keeps nothing by default', async () => {
-    const { fetchImpl, bankReads } = api();
-    const gw = gateway(fetchImpl);
-    await gw.callTool('get_balances', { account: ACCOUNT_1 }, ctx);
-    await gw.callTool('get_balances', { account: ACCOUNT_1 }, ctx);
-    expect(bankReads()).toHaveLength(2);
-  });
-
-  it('answers the same question again without a read at the bank, for the seconds the host allows', async () => {
-    let clock = NOW;
-    const { calls, fetchImpl, bankReads } = api();
-    const gw = gateway(fetchImpl, { cacheSeconds: 60, now: () => clock });
-    const first = await gw.callTool('get_balances', { account: ACCOUNT_1 }, ctx);
-    clock += 30_000;
-    const second = await gw.callTool('get_balances', { account: ACCOUNT_1 }, { ...ctx, unattended: true });
-    expect(second).toEqual(first);
-    // The answer says when the bank was read.
-    expect(data<{ fetchedAt: string }>(second).fetchedAt).toBe('2026-11-24T10:00:00.000Z');
-    expect(bankReads()).toHaveLength(1);
-    // The consent is still checked on every call.
-    expect(calls.filter(call => call.url.pathname.startsWith('/sessions/'))).toHaveLength(2);
-    // Another question, another account and another company's consent are not answered from it.
-    await gw.callTool('get_balances', { account: ACCOUNT_2 }, ctx);
-    await gw.callTool('get_account_details', { account: ACCOUNT_1 }, ctx);
-    await gw.callTool('get_balances', { account: ACCOUNT_1 }, { credentials: { sessionId: OTHER_SESSION, accountIds: [ACCOUNT_1] } });
-    expect(bankReads()).toHaveLength(4);
-    clock += 31_000;
-    await gw.callTool('get_balances', { account: ACCOUNT_1 }, ctx);
-    expect(bankReads()).toHaveLength(5);
-  });
-
-  it('is never used once the consent is no longer active, and never keeps an error', async () => {
-    let active = true;
-    let failing = false;
-    const { fetchImpl, bankReads } = api(call => {
-      if (call.url.pathname.startsWith('/sessions/') && !active) return json({ status: 'REVOKED', accounts: [ACCOUNT_1] });
-      if (call.url.pathname.endsWith('/balances') && failing) return json({ error: 'ASPSP_ERROR' }, 400);
-      return undefined;
-    });
-    const gw = gateway(fetchImpl, { cacheSeconds: 600 });
-    await gw.callTool('get_balances', { account: ACCOUNT_1 }, ctx);
-    active = false;
-    const revoked = await gw.callTool('get_balances', { account: ACCOUNT_1 }, ctx);
-    expect(revoked).toMatchObject({ isError: true, errorCode: 'consent_revoked' });
-    active = true;
-    await gw.callTool('get_balances', { account: ACCOUNT_1 }, ctx);
-    expect(bankReads()).toHaveLength(2);
-
-    failing = true;
-    expect((await gw.callTool('get_balances', { account: ACCOUNT_2 }, ctx)).errorCode).toBe('bank_unavailable');
-    failing = false;
-    expect((await gw.callTool('get_balances', { account: ACCOUNT_2 }, ctx)).isError).toBeUndefined();
-  });
-
-  it('is bounded to ten minutes', () => {
-    expect(() => gateway(api().fetchImpl, { cacheSeconds: 601 })).toThrow(/cacheSeconds/);
-    expect(() => gateway(api().fetchImpl, { cacheSeconds: -1 })).toThrow(/cacheSeconds/);
-  });
-});
-
 describe('fixed error codes', () => {
   it('tell an ended consent from a refused application, a rate limit and a bank that is down', async () => {
     const cases: Array<[number, string | undefined, string, number | undefined]> = [
@@ -532,6 +471,10 @@ describe('list_transactions', () => {
       row('M-2', '2.00', 'DBIT', 'A', '2026-11-03', { status: 'PDNG' }),
       row('M-3', '3.00', 'DBIT', 'A', '2026-11-04', { status: 'HOLD' }),
       row('M-4', '4.00', 'DBIT', 'A', '2026-11-05', { status: 'RJCT' }),
+      row('M-5', '5.00', 'DBIT', 'A', '2026-11-06', { status: 'OTHR' }),
+      row('M-6', '6.00', 'DBIT', 'A', '2026-11-07', { status: 'CNCL' }),
+      row('M-7', '7.00', 'DBIT', 'A', '2026-11-08', { status: 'SCHD' }),
+      row('M-8', '8.00', 'DBIT', 'A', '2026-11-09', { status: 'NOT-A-STATUS' }),
     ];
     const { calls, fetchImpl } = api(call => (call.url.pathname.endsWith('/transactions') ? json({ transactions: mixed }) : undefined));
     const gw = gateway(fetchImpl);
@@ -539,9 +482,10 @@ describe('list_transactions', () => {
       data<{ transactions: Array<{ reference: string }> }>(await gw.callTool('list_transactions', { account: ACCOUNT_1, status }, ctx)).transactions.map(line => line.reference);
     expect(await refs('booked')).toEqual(['M-1']);
     expect(calls.at(-1)!.url.searchParams.get('transaction_status')).toBe('BOOK');
-    expect(await refs('pending')).toEqual(['M-3', 'M-2']);
+    // Pending is the bank's PDNG, HOLD and SCHD, and nothing else: not OTHR, not a status nobody knows.
+    expect(await refs('pending')).toEqual(['M-7', 'M-3', 'M-2']);
     expect(calls.at(-1)!.url.searchParams.get('transaction_status')).toBe('PDNG');
-    expect(await refs('all')).toEqual(['M-4', 'M-3', 'M-2', 'M-1']);
+    expect(await refs('all')).toEqual(['M-8', 'M-7', 'M-6', 'M-5', 'M-4', 'M-3', 'M-2', 'M-1']);
     expect(calls.at(-1)!.url.searchParams.has('transaction_status')).toBe(false);
   });
 });
@@ -843,15 +787,6 @@ describe('consent helpers', () => {
       expect(error).toMatchObject({ status, problem });
       expect((error as Error).message).not.toContain(SESSION);
     }
-  });
-
-  it('forgets cached answers of a session when it is ended', async () => {
-    const { fetchImpl, bankReads } = consentApi(call => (call.method === 'DELETE' ? json({ message: 'OK' }) : undefined));
-    const gw = gateway(fetchImpl, { cacheSeconds: 600 });
-    await gw.callTool('get_balances', { account: ACCOUNT_1 }, ctx);
-    await gw.endSession({ sessionId: SESSION });
-    await gw.callTool('get_balances', { account: ACCOUNT_1 }, ctx);
-    expect(bankReads()).toHaveLength(2);
   });
 
   it('reads the application as Enable Banking sees it', async () => {

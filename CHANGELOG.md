@@ -57,6 +57,8 @@ Standalone server:
 - A failed call ends with `errorCode: <code>` and, where a wait is recommended, `retryAfterSeconds: <n>`.
 - `ENABLEBANKING_UNATTENDED_FETCHES_PER_DAY` (default 0: off): a budget of reads at the bank per consent in any 24
   hours. The standalone server has no details of a person to send, so all its reads are background reads.
+- The answer cache is emptied when Enable Banking answers that a consent is gone, and a search stops at the first
+  account the bank's rate limit refuses.
 - The account registry no longer assumes DKK for an account without a currency.
 - The package ships `docs/`.
 
@@ -69,8 +71,11 @@ Gateway (`mcp-server-enablebanking/gateway`), every change to the surface:
 - `GatewayCallContext`: `psu` (the details of the person who asked, sent as `Psu-*` headers) and `unattended`.
 - `EnableBankingGatewayCredentials`: `accounts` (optional), what the host stored about each account;
   `list_accounts` then answers without a read at the bank.
-- `EnableBankingGatewayOptions`: `cacheSeconds` (default 0: no cache; at most 600) and `unattendedFetchesPerDay`
-  (default 4; 0 turns the budget off). The budget applies only to calls marked `unattended: true`.
+- `EnableBankingGatewayOptions`: `unattendedFetchesPerDay` (default 4; 0 turns the budget off). The budget applies
+  only to calls marked `unattended: true`. The gateway keeps no answer between calls: there is no cache option.
+- A malformed `psu` or `unattended` (also `null`, and a value with a line break or another control character) is
+  refused with `presence_incomplete`, never read as "nobody is present". The values of `psu` are removed from the
+  result of the call, so a bank that repeats them cannot hand them on.
 - `GatewayToolResult`: `errorCode` on every error result and `retryAfterSeconds` where a wait is recommended. The
   fixed error texts of 0.6.x are unchanged.
 - `list_accounts`: adds `source` (`consent`, `bank` or `mixed`), `consent` (status, `validUntil`, `expiresInDays`,

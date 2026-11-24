@@ -271,9 +271,15 @@ export function transactionView(row: TransactionResource, assumedStatus?: string
   return view;
 }
 
-/** Whether a line counts as pending: not yet booked, and not cancelled or rejected. */
+/** The statuses of a line that is on its way to being booked: pending, held (reserved) and scheduled. */
+const PENDING_STATUSES: ReadonlySet<string> = new Set(['PDNG', 'HOLD', 'SCHD']);
+
+/**
+ * Whether a line counts as pending. A positive list: a cancelled, rejected or unspecified line (CNCL, RJCT, OTHR),
+ * and any status this server does not know, is neither booked nor pending and is shown only with status "all".
+ */
 export function isPending(status: string): boolean {
-  return status !== 'BOOK' && status !== 'CNCL' && status !== 'RJCT';
+  return PENDING_STATUSES.has(status);
 }
 
 /** Newest first, by booking date, else value date, else transaction date. */
@@ -559,4 +565,3 @@ export function matchesLine(row: TransactionView, filter: LineFilter): boolean {
 export function isoDate(date: Date): string {
   return date.toISOString().slice(0, 10);
 }
-

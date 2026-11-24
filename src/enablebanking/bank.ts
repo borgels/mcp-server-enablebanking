@@ -335,7 +335,13 @@ export class Bank {
     const accounts: Array<{ account: string; read: boolean; lines?: number; matches?: number; complete?: boolean; problem?: ProblemCode; reason?: string }> = [];
     const matches: Array<TransactionView & { account: string }> = [];
     let fetchedAt: string | undefined;
+    let stopped: ProblemCode | undefined;
     for (const account of wanted) {
+      if (stopped) {
+        // The bank allows no more reads: the remaining accounts are not asked.
+        accounts.push({ account: account.id, read: false, problem: stopped });
+        continue;
+      }
       try {
         const link = this.linked(account.id);
         const read = await this.lines(link, period);
@@ -344,7 +350,9 @@ export class Bank {
         accounts.push({ account: account.id, read: true, lines: read.rows.length, matches: found.length, complete: read.complete });
         if (!fetchedAt || read.fetchedAt < fetchedAt) fetchedAt = read.fetchedAt;
       } catch (error) {
-        accounts.push({ account: account.id, read: false, problem: problemOf(error) ?? 'upstream_error', reason: formatUnknownError(error) });
+        const problem = problemOf(error) ?? 'upstream_error';
+        accounts.push({ account: account.id, read: false, problem, reason: formatUnknownError(error) });
+        if (problem === 'rate_limited') stopped = problem;
       }
     }
     matches.sort(newestFirst);
@@ -652,6 +660,8 @@ export class Bank {
       return await fn();
     } catch (error) {
       if (error instanceof EnableBankingHttpError && error.consentLost) {
+        // Nothing read under a consent is served once Enable Banking says the consent is gone.
+        this.cache.clear();
         throw new ConsentError(
           `${link.session.aspsp.name} refused the consent for ${this.companyInfo().name} (${error.message}). ` +
             'It may have been revoked at the bank or expired; an administrator must renew it with enablebanking_start_consent.',
@@ -668,6 +678,21 @@ export class Bank {
    * Short cache per account and query. Banks may cap reads that the account
    * holder is not present for (PSD2: as few as 4 per account per day), so the
    * same question asked twice in a conversation must not cost two bank calls.
+   *
+   * What keeps a cached answer within its authority:
+   * - Every key starts with the bank's uid of one account in one stored
+   *   consent, and a caller only gets a uid from `linked()`, which resolves
+   *   the account through this company's registry and stored consent on every
+   *   call. An account taken out of the registry, and a consent past its
+   *   date, is refused before the cache is looked at.
+   * - A new consent has new uids, so answers of an old one cannot be reached.
+   *   The cache is also emptied whenever a consent is completed, refreshed or
+   *   revoked here, and when Enable Banking answers that a consent is gone.
+   * - What is kept is what the bank answered for that account (balances,
+   *   details, lines of a period), never a finished tool answer, so a tool
+   *   reads only its own kind of data. An error is never kept.
+   * - Not covered: a consent revoked at the bank is noticed at the next read
+   *   at the bank, so an earlier answer can be repeated for up to cacheMs.
    */
   private async cached<T>(key: string, load: () => Promise<T>): Promise<{ value: T; fetchedAt: string }> {
     const hit = this.cacheMs > 0 ? this.cache.get(key) : undefined;

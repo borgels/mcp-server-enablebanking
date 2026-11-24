@@ -64,6 +64,16 @@ export class GatewayRedactor {
   }
 
   /**
+   * Adds a value whose shape the caller has checked (an IP address, a geolocation): matched whole like add, in its
+   * raw, URL-encoded and JSON-escaped forms, but whatever its length. Not for free text: a short word added here
+   * would be removed from every text it occurs in.
+   */
+  addExact(value: string | undefined): void {
+    if (typeof value !== 'string' || value === '') return;
+    for (const form of forms(value)) this.keep(form);
+  }
+
+  /**
    * Adds key material: the value as with add, and its content without
    * PEM armour and whitespace, with every piece of FRAGMENT_LENGTH characters.
    */
@@ -180,6 +190,10 @@ export class GatewayRedactor {
 
   private remember(value: string): void {
     if (value.length < MIN_SECRET_LENGTH) return;
+    this.keep(value);
+  }
+
+  private keep(value: string): void {
     this.values.delete(value);
     this.values.add(value);
     while (this.values.size > MAX_REDACTED_VALUES) {

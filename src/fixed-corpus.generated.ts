@@ -584,7 +584,6 @@ export const FIXED_CORPUS: readonly string[] = [
   "boolean",
   "bound ",
   "business",
-  "cacheSeconds",
   "cancelled, RJCT rejected, OTHR other), the counterparty with account and bank, the remittance lines, the payment ",
   "cannot read the account registry at ",
   "capabilities",

@@ -17,7 +17,6 @@ import { EnableBankingHttpError, ERROR_CODES } from './errors.js';
 import { failureInForm, failureMetadata } from './gateway/failure.js';
 import { FRAGMENT_LENGTH, GatewayRedactor } from './gateway/redact.js';
 import {
-  AnswerCache,
   bankReads,
   callCredentials,
   consentAccount,
@@ -143,7 +142,6 @@ export class EnableBankingGatewayError extends Error {
   }
 }
 
-const MAX_CACHE_SECONDS = 600;
 const MAX_SELECTED_ACCOUNTS = 50;
 const DEFAULT_MAXIMUM_CONSENT_SECONDS = 90 * 86_400;
 const STATE_PATTERN = /^[A-Za-z0-9._~-]{16,512}$/;
@@ -176,7 +174,9 @@ function callPresence(context: GatewayCallContext | undefined): Presence | { kin
   const psu = (context as { psu?: unknown } | undefined)?.psu;
   const unattended = (context as { unattended?: unknown } | undefined)?.unattended;
   if (unattended !== undefined && typeof unattended !== 'boolean') return { kind: 'refused', reason: PSU_REFUSED };
-  if (psu !== undefined && psu !== null) {
+  // Only a field that is not there at all means "not said". null, like any other malformed value, is refused by
+  // psuHeaders: a host's mistake is never read as "nobody is present".
+  if (psu !== undefined) {
     if (unattended === true) return { kind: 'refused', reason: PRESENCE_CONTRADICTION };
     const parsed = psuHeaders(psu);
     return parsed.ok ? { kind: 'present', headers: parsed.headers } : { kind: 'refused', reason: PSU_REFUSED };
@@ -369,7 +369,6 @@ function buildEnableBankingGateway(options: EnableBankingGatewayOptions) {
   // Where each issued page token continues; never leaves the instance.
   const pages = new PageTokens(now);
   // Finished answers, only when the host asked for it (default: nothing is kept).
-  const cache = new AnswerCache(boundedInt(options.cacheSeconds, 0, 0, MAX_CACHE_SECONDS, 'cacheSeconds') * 1000, now);
   // Reads made with nobody present, per consent.
   const budget = new UnattendedBudget(
     boundedInt(options.unattendedFetchesPerDay, DEFAULT_UNATTENDED_FETCHES_PER_DAY, 0, 1_000, 'unattendedFetchesPerDay'),
@@ -478,9 +477,25 @@ function buildEnableBankingGateway(options: EnableBankingGatewayOptions) {
         callRedactor.add(sessionId);
         callRedactor.watch(sessionId);
       }
+      // The details of the person present go to the bank and nowhere else: whatever a bank answers, they are removed
+      // from the result and from every error text of this call. The address and the location always (their shape is
+      // checked); the free-text values like any other value this gateway removes, from MIN_SECRET_LENGTH characters,
+      // so that a browser name of a few letters cannot blank the same word in a bank line.
+      let presence: Presence | { kind: 'refused'; reason: string };
+      try {
+        presence = callPresence(context);
+      } catch {
+        presence = { kind: 'refused', reason: PSU_REFUSED };
+      }
+      if (presence.kind === 'present') {
+        for (const [header, value] of Object.entries(presence.headers)) {
+          if (header === PSU_HEADER_NAMES.ipAddress || header === PSU_HEADER_NAMES.geoLocation) callRedactor.addExact(value);
+          else callRedactor.add(value);
+        }
+      }
       let result: GatewayToolResult;
       try {
-        result = await runCall(toolName, input ?? {}, context);
+        result = await runCall(toolName, input ?? {}, context, presence);
       } catch (error) {
         // The text is ours; the code says what went wrong without it. Anything unnamed is a failure at Enable Banking.
         result = errorResult(callRedactor.message(error), failureMetadata(error), problemOf(error) ?? 'upstream_error');
@@ -677,7 +692,6 @@ function buildEnableBankingGateway(options: EnableBankingGatewayOptions) {
       const sessionId = input && typeof input === 'object' ? input.sessionId : undefined;
       return helper([typeof sessionId === 'string' ? sessionId : undefined], async () => {
         if (typeof sessionId !== 'string' || !ID_PATTERN.test(sessionId)) throw new Error('endSession: sessionId is missing or malformed.');
-        cache.dropConsent(AnswerCache.consentKey(sessionId));
         try {
           await client.deleteSession(sessionId);
         } catch (error) {
@@ -710,7 +724,12 @@ function buildEnableBankingGateway(options: EnableBankingGatewayOptions) {
     },
   };
 
-  async function runCall(toolName: string, input: GatewayJsonObject, context: GatewayCallContext | undefined): Promise<GatewayToolResult> {
+  async function runCall(
+    toolName: string,
+    input: GatewayJsonObject,
+    context: GatewayCallContext | undefined,
+    presence: Presence | { kind: 'refused'; reason: string },
+  ): Promise<GatewayToolResult> {
     const resolution = parseCall(toolName, input, now());
     if (!resolution.ok) return errorResult(resolution.reason, undefined, resolution.code);
     const { target, call } = resolution;
@@ -721,18 +740,14 @@ function buildEnableBankingGateway(options: EnableBankingGatewayOptions) {
     if (named.some(account => !credentials.accountIds.has(account))) return errorResult(NOT_ALLOWED, undefined, 'account_not_connected');
 
     // Who is behind the call, before anything is sent: a malformed answer is refused, never read as "nobody".
-    const presence = callPresence(context);
     if (presence.kind === 'refused') return errorResult(presence.reason, undefined, 'presence_incomplete');
 
-    // The bank session must still be authorised and still contain the account. Asked of Enable Banking on every call,
-    // cached answers included; it is not a read at the bank.
-    const consentKey = AnswerCache.consentKey(credentials.sessionId);
+    // The bank session must still be authorised and still contain the account. Asked of Enable Banking on every
+    // call; it is not a read at the bank. No answer is kept between calls: every answer is read under the consent
+    // and the account list of its own call.
     const session = await client.getSession(credentials.sessionId);
     const consent = consentState(session, now());
-    if (!consent.ok) {
-      cache.dropConsent(consentKey);
-      return errorResult(consent.reason, undefined, consent.code);
-    }
+    if (!consent.ok) return errorResult(consent.reason, undefined, consent.code);
     if (named.some(account => !consent.accounts.has(account))) return errorResult(NOT_IN_CONSENT, undefined, 'account_not_in_consent');
 
     let start: PageState | undefined;
@@ -772,16 +787,6 @@ function buildEnableBankingGateway(options: EnableBankingGatewayOptions) {
         g: period?.strategy ?? '',
       });
 
-    // The same question again, within the seconds the host allows: answered from memory, with no read at the bank.
-    const cacheKey =
-      cache.enabled && !start
-        ? cache.key(consentKey, [toolName, input, [...credentials.accountIds].sort(), [...credentials.known.values()]])
-        : undefined;
-    if (cacheKey) {
-      const kept = cache.get(cacheKey);
-      if (kept) return kept;
-    }
-
     // Nobody present: the read is taken from the day's budget for this consent, or refused before anything is sent.
     const reads = bankReads(call, credentials, consent);
     if (presence.kind === 'unattended' && reads > 0) {
@@ -789,24 +794,23 @@ function buildEnableBankingGateway(options: EnableBankingGatewayOptions) {
       if (!decision.ok) return errorResult(budgetRefusal(decision), undefined, 'unattended_limit');
     }
 
-    let result: GatewayToolResult;
+    // The bank says its limit is reached: no further background read for this consent until the pause is over.
+    // Also when the failure ends up inside an answer (a search that read some accounts and not others).
+    const onProblem = (problem: ProblemCode | undefined) => {
+      if (problem === 'rate_limited' && presence.kind !== 'present') budget.block(credentials.sessionId);
+    };
     try {
-      result = await runTool(
-        { client, now, issuePageToken, ...(presence.kind === 'present' ? { presence: presence.headers } : {}) },
+      return await runTool(
+        { client, now, issuePageToken, onProblem, ...(presence.kind === 'present' ? { presence: presence.headers } : {}) },
         call,
         credentials,
         consent,
         start ? { k: start.k, o: start.o } : undefined,
       );
     } catch (error) {
-      const problem = problemOf(error);
-      // The bank says its limit is reached: no further background read for this consent until the pause is over.
-      if (problem === 'rate_limited' && presence.kind !== 'present') budget.block(credentials.sessionId);
-      if (problem === 'consent_expired' || problem === 'consent_revoked' || problem === 'consent_not_active') cache.dropConsent(consentKey);
+      onProblem(problemOf(error));
       throw error;
     }
-    if (cacheKey) cache.set(cacheKey, consentKey, result);
-    return result;
   }
 }
 

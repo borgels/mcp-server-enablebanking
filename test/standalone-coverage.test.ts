@@ -324,3 +324,61 @@ describe('standalone consent', () => {
     expect(bank.listAccounts().accounts.map(account => account.currency)).toEqual(['SEK', 'EUR']);
   });
 });
+
+describe('standalone: what the review of 0.7.0 found', () => {
+  const tx = (reference: string, status: string) => ({
+    entry_reference: reference,
+    transaction_amount: { amount: '1.00', currency: 'DKK' },
+    credit_debit_indicator: 'DBIT',
+    status,
+    booking_date: '2026-09-10',
+    remittance_information: ['Husleje'],
+  });
+
+  it('counts only pending, held and scheduled lines as pending', async () => {
+    const api = fakeApi({
+      'GET /accounts/[^/]+/transactions': () => ({
+        transactions: [tx('s-book', 'BOOK'), tx('s-pdng', 'PDNG'), tx('s-hold', 'HOLD'), tx('s-schd', 'SCHD'), tx('s-othr', 'OTHR'), tx('s-cncl', 'CNCL'), tx('s-rjct', 'RJCT'), tx('s-new', 'NOT-A-STATUS')],
+      }),
+    });
+    const { bank } = await linked({ api });
+    const refs = async (status: 'booked' | 'pending' | 'all') =>
+      (await bank.transactions('drift', { from: '2026-09-01', to: '2026-09-30', status })).transactions.map(row => row.reference).sort();
+    expect(await refs('booked')).toEqual(['s-book']);
+    expect(await refs('pending')).toEqual(['s-hold', 's-pdng', 's-schd']);
+    expect(await refs('all')).toHaveLength(8);
+  });
+
+  it('stops a search at the bank’s rate limit instead of asking for the next account', async () => {
+    const api = fakeApi({ 'GET /accounts/uid-aaa-drift/transactions': () => respond({ error: 'ASPSP_RATE_LIMIT_EXCEEDED' }, 429) });
+    const { bank } = await linked({ api, unattendedFetchesPerDay: 4 });
+    const found = await bank.search({ from: '2026-09-01', to: '2026-09-30', search: 'husleje' });
+    expect(found.complete).toBe(false);
+    expect(found.accounts).toMatchObject([
+      { account: 'drift', read: false, problem: 'rate_limited' },
+      { account: 'skat', read: false, problem: 'rate_limited' },
+    ]);
+    expect(bankReads(api)).toHaveLength(1);
+    // The pause holds for the next call too: it is refused here, not at the bank.
+    const next = await bank.balances('skat').catch((error: unknown) => error);
+    expect(problemOf(next)).toBe('unattended_limit');
+    expect(bankReads(api)).toHaveLength(1);
+  });
+
+  it('serves nothing from its cache once Enable Banking says the consent is gone', async () => {
+    let gone = false;
+    const api = fakeApi({ 'GET /accounts/[^/]+/details': () => (gone ? respond({ error: 'REVOKED_SESSION' }, 401) : undefined) });
+    const { bank } = await linked({ api, cacheSeconds: 300 });
+    await bank.balances('drift');
+    await bank.balances('drift');
+    const reads = bankReads(api).filter(call => call.path.endsWith('/balances'));
+    expect(reads).toHaveLength(1);
+
+    gone = true;
+    const lost = await bank.details('skat').catch((error: unknown) => error);
+    expect(problemOf(lost)).toBe('consent_revoked');
+    // The balance read a moment ago is not repeated from memory: the bank is asked again.
+    await bank.balances('drift').catch(() => undefined);
+    expect(bankReads(api).filter(call => call.path.endsWith('/balances'))).toHaveLength(2);
+  });
+});

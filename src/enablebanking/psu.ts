@@ -38,8 +38,14 @@ export const PSU_HEADER_NAMES: Readonly<Record<keyof PsuPresence, string>> = Obj
 export const PSU_REFUSED =
   'Refused: the details of the person present are malformed (an IP address, and header values of printable characters, are expected).';
 
-/** A header value: printable ASCII and spaces, so no line break can add a header. */
+/**
+ * A header value: printable ASCII and spaces only, checked on the value exactly as the host gave it, before
+ * anything is trimmed. A line break, a tab, a NUL or any other control character, and anything outside ASCII, is
+ * refused, so no value can add a header or change one.
+ */
 const HEADER_VALUE = /^[\x20-\x7E]{1,512}$/;
+/** Shorter than any IPv4 address; the IPv6 forms this short (`::`, `::1`) are never a person's address. */
+const MIN_IP_LENGTH = 7;
 const GEO_LOCATION = /^-?\d{1,2}\.\d{1,6},-?\d{1,3}\.\d{1,6}$/;
 
 export type PsuHeaders = { ok: true; headers: Record<string, string> } | { ok: false };
@@ -57,9 +63,12 @@ export function psuHeaders(psu: unknown): PsuHeaders {
     if (value === undefined) continue;
     const name = Object.hasOwn(PSU_HEADER_NAMES, field) ? PSU_HEADER_NAMES[field as keyof PsuPresence] : undefined;
     if (!name || typeof value !== 'string') return { ok: false };
+    // As given, first: trimming would hide a line break at either end.
+    if (!HEADER_VALUE.test(value)) return { ok: false };
+    // Only spaces are left to trim.
     const trimmed = value.trim();
-    if (!HEADER_VALUE.test(trimmed)) return { ok: false };
-    if (field === 'ipAddress' && isIP(trimmed) === 0) return { ok: false };
+    if (trimmed === '') return { ok: false };
+    if (field === 'ipAddress' && (trimmed.length < MIN_IP_LENGTH || isIP(trimmed) === 0)) return { ok: false };
     if (field === 'geoLocation' && !GEO_LOCATION.test(trimmed)) return { ok: false };
     headers[name] = trimmed;
   }

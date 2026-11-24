@@ -156,8 +156,9 @@ describe('a bank line', () => {
   });
 
   it('knows which statuses are pending', () => {
-    expect(['PDNG', 'HOLD', 'SCHD', 'OTHR'].every(isPending)).toBe(true);
-    expect(['BOOK', 'CNCL', 'RJCT'].some(isPending)).toBe(false);
+    expect(['PDNG', 'HOLD', 'SCHD'].every(isPending)).toBe(true);
+    // A positive list: cancelled, rejected, unspecified and unknown statuses are neither booked nor pending.
+    expect(['BOOK', 'CNCL', 'RJCT', 'OTHR', '', 'pdng', 'NOT-A-STATUS'].some(isPending)).toBe(false);
   });
 });
 

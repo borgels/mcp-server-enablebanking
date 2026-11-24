@@ -111,13 +111,19 @@ reads the accounts without signing in at the bank themselves, until the consent 
 - **Reads with nobody present.** Enable Banking tells a read that a person asked for from a background read by
   the `Psu-*` headers of the request, and many banks allow only four background reads a day. This server answers
   a model, not a browser, so it has no details of a person to send and never invents any: every read it makes is a
-  background read. Answers are cached per account and query (`ENABLEBANKING_CACHE_SECONDS`, default 300), listing
-  accounts and reading the consent status cost no read at the bank, and the instructions ask the model to fetch a
-  period in one call. `ENABLEBANKING_UNATTENDED_FETCHES_PER_DAY` (default 0: off) sets a budget of reads at the
+  background read. Answers are cached per account and query (`ENABLEBANKING_CACHE_SECONDS`, default 300; 0 turns
+  the cache off), listing accounts and reading the consent status cost no read at the bank, and the instructions
+  ask the model to fetch a period in one call. The cache holds what the bank answered for one account of one
+  consent, in memory only. It is reached only after the account has been resolved through the registry and the
+  stored consent of this company on that call, so an account taken out of the registry, and a consent past its
+  date, is refused before the cache is looked at. It is emptied when a consent is completed, refreshed or revoked,
+  and when Enable Banking answers that a consent is gone. A consent revoked at the bank is not noticed until the
+  next read at the bank, so an answer read before the revocation can be repeated for up to the cache's seconds;
+  set it to 0 where that is not acceptable. `ENABLEBANKING_UNATTENDED_FETCHES_PER_DAY` (default 0: off) sets a budget of reads at the
   bank per consent in any 24 hours; when it is used up, a call is refused with `unattended_limit` and the time of
   the next possible read, instead of being sent and refused by the bank.
 - **The bank's own limit.** `rate_limited` with `retryAfterSeconds: 21600`: Enable Banking recommends waiting six
-  hours.
+  hours. A search stops at the first account the bank limits and does not ask for the rest.
 - **History.** Many banks give the full history only for about an hour after the sign-in and the last 90 days
   after that; a period the bank does not give is `period_not_available`.
 - **Consents are time-limited** (often 180 days at most). `enablebanking_list_accounts` and
@@ -310,7 +316,7 @@ const gateway = createEnableBankingGateway({
   applicationId: '<application id>', // the JWT kid
   privateKey: pemText,                // or a KeyObject
   // apiBaseUrl, timeoutMs (default 30 s), maxResponseBytes (default 4 MB), fetchImpl
-  // cacheSeconds (default 0: off), unattendedFetchesPerDay (default 4)
+  // unattendedFetchesPerDay (default 4)
 });
 
 const result = await gateway.callTool('get_balances', { account: accountId }, {
@@ -359,28 +365,45 @@ if (result.isError) {
     in any 24 hours. When the budget is used up the call is refused with
     `unattended_limit` and the time of the next possible read, before any
     request. After a `rate_limited` answer from the bank, unattended reads of
-    that consent pause for six hours. The budget lives in the memory of the
-    gateway instance.
+    that consent pause for six hours; also when the limit shows up inside an
+    answer, as when a search could read one account and not the next (the
+    remaining accounts are then not asked). The budget lives in the memory of
+    the gateway instance.
   - Neither: no header and no budget, as before 0.7.0.
-  - Both, or a malformed `psu` (not an IP address, control characters,
-    non-ASCII, longer than 512 characters, an unknown field): refused with
-    `presence_incomplete` before any request. A malformed statement is never
-    turned into a background read.
+  - Both, or a malformed statement: refused with `presence_incomplete`
+    before any request, never turned into a background read. Malformed is
+    anything but a plain object with at least one known field, each a string
+    of 1 to 512 printable ASCII characters: `null`, an empty object, an
+    unknown field, a value that is not a string, and any value holding a line
+    break, a tab, a NUL or another control character, or anything outside
+    ASCII. Each value is checked exactly as given, before anything is
+    trimmed, so no value can add or change a header. `ipAddress` must be an
+    IPv4 or IPv6 address of at least 7 characters, `geoLocation`
+    "latitude,longitude". Only a field that is not there (or is
+    `undefined`) means "not said"; `unattended` must be a boolean.
+  - The person's details go to the bank and nowhere else. They are removed
+    from the result and from every error text of the call, whole, in their
+    raw, URL-encoded and JSON-escaped forms, so a bank that repeats what it
+    was sent cannot hand a person's address, browser or location on to a
+    model: `ipAddress` and `geoLocation` always, the other values from 8
+    characters (a browser name of a few letters or a two-letter language
+    identifies nobody, and removing it would blank the same word in a bank
+    line).
 - **Listing accounts without a read at the bank.** With
   `credentials.accounts` (`{ id, name?, maskedIban?, currency?, product?, identification? }`
   per account, as `completeSession` returned them), `list_accounts` answers
   from that and the session, and says `source: "consent"`. Accounts the host
   stored nothing about are read at the bank (`source: "mixed"` or `"bank"`).
   Entries for ids outside `accountIds` are ignored.
-- **Answer cache, off by default.** `cacheSeconds` (1 to 600) keeps finished
-  answers in the memory of the gateway instance: at most 500, keyed by
-  consent, tool, input and the account list of the call, for that many
-  seconds. A kept answer is redacted on its way out like any other. An error is never
-  kept, an answer is never given to another consent, and the answers of a
-  consent are dropped when it ends or `endSession` is called. The session is
-  still read on every call, so an ended consent is refused at once. An answer
-  from the cache has the `fetchedAt` of the read at the bank. Nothing is
-  written to disk.
+- **No answer is kept between calls.** What a call returns is read under
+  that call's own authority: the session as Enable Banking holds it at that
+  moment, the `accountIds` given with the call, and who is present. There is
+  no answer cache, so nothing read earlier can be returned after a consent
+  ended, after an account left the session, after the host took an account
+  off the list, or to a caller with other accounts. The only state the
+  gateway instance holds between calls is the page tokens (15 minutes; where
+  to continue a listing, never bank data; the consent and the account are
+  checked again on every page) and the budget of unattended reads.
 - **Fixed error codes.** An error result has `errorCode`, one of
   `enableBankingProblemCodes` (see [Error codes](#error-codes)), and
   `retryAfterSeconds` where a wait is recommended. Errors thrown by the

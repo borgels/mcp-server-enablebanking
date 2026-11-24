@@ -1,4 +1,4 @@
-import { createHash, randomBytes } from 'node:crypto';
+import { randomBytes } from 'node:crypto';
 import type { AccountResource, SessionStatus, TransactionResource } from '../enablebanking/api.js';
 import { parseDecimal } from '../enablebanking/decimal.js';
 import {
@@ -155,63 +155,6 @@ export class PageTokens {
       if (entry.expires > now) break;
       this.entries.delete(id);
     }
-  }
-}
-
-// ------------------------------------------------------------------ answer cache
-
-const MAX_CACHED_ANSWERS = 500;
-
-/**
- * Finished answers, in the memory of one gateway instance, for the seconds
- * the host asked for (default: none, and then nothing is ever kept). The key
- * is a hash of the session id, the accounts the call may read and the call's
- * input; the session id itself is not kept. Never on disk.
- */
-export class AnswerCache {
-  private readonly entries = new Map<string, { expires: number; consent: string; value: GatewayToolResult }>();
-
-  constructor(
-    private readonly ttlMs: number,
-    private readonly now: () => number,
-  ) {}
-
-  get enabled(): boolean {
-    return this.ttlMs > 0;
-  }
-
-  static consentKey(sessionId: string): string {
-    return createHash('sha256').update(sessionId).digest('base64url');
-  }
-
-  key(consent: string, parts: unknown): string {
-    return createHash('sha256').update(consent).update('\n').update(JSON.stringify(parts)).digest('base64url');
-  }
-
-  get(key: string): GatewayToolResult | undefined {
-    if (!this.enabled) return undefined;
-    const entry = this.entries.get(key);
-    if (!entry) return undefined;
-    if (entry.expires <= this.now()) {
-      this.entries.delete(key);
-      return undefined;
-    }
-    return structuredClone(entry.value);
-  }
-
-  set(key: string, consent: string, value: GatewayToolResult): void {
-    if (!this.enabled || value.isError) return;
-    const now = this.now();
-    for (const [id, entry] of this.entries) {
-      if (entry.expires > now && this.entries.size < MAX_CACHED_ANSWERS) break;
-      this.entries.delete(id);
-    }
-    this.entries.set(key, { expires: now + this.ttlMs, consent, value: structuredClone(value) });
-  }
-
-  /** Forgets every answer of a consent: called when the consent fails. */
-  dropConsent(consent: string): void {
-    for (const [id, entry] of this.entries) if (entry.consent === consent) this.entries.delete(id);
   }
 }
 
@@ -610,6 +553,12 @@ export interface ToolEnvironment {
   presence?: PresenceHeaders;
   now: () => number;
   issuePageToken: (next: { k: string; o: number }) => string;
+  /**
+   * Told of every failed read at the bank, also one that ends up inside an
+   * answer (a search that could read some accounts and not others), so the
+   * caller can act on it: a bank's rate limit pauses unattended reads.
+   */
+  onProblem?: (problem: ProblemCode) => void;
 }
 
 /** The connected accounts that the consent still covers, in the host's order. */
@@ -858,6 +807,7 @@ async function searchTransactions(
       perAccount.push({ account, read: true, lines: rows.length, matches: found.length, complete: !next });
     } catch (error) {
       const problem = problemOf(error) ?? 'upstream_error';
+      env.onProblem?.(problem);
       firstFailure ??= { problem, error };
       perAccount.push({ account, read: false, problem });
       if (problem === 'rate_limited') stopped = problem;

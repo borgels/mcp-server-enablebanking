@@ -76,8 +76,12 @@ export type EnableBankingPsu = PsuPresence;
  *   limit on background reads does not apply. Give only what the host really observed of that person.
  * - `unattended: true`: nobody is present (a schedule, a background job). No `Psu-*` header is sent, and the read is
  *   counted against the gateway's daily budget per consent; over budget it is refused before anything is sent.
- * - neither: as before 0.7.0. No `Psu-*` header is sent, so the bank counts a background read, and the gateway keeps
- *   no budget. A host should say one or the other.
+ * - neither (the fields are not there): as before 0.7.0. No `Psu-*` header is sent, so the bank counts a background
+ *   read, and the gateway keeps no budget. A host should say one or the other.
+ *
+ * Anything malformed (null, an empty or unknown `psu`, a value with a line break or another control character, both
+ * at once) is refused, never read as "nobody is present". The values of `psu` are removed from the result of the
+ * call, so a bank that repeats them cannot hand them on.
  */
 export interface GatewayCallContext {
   caller?: string;
@@ -99,13 +103,6 @@ export interface EnableBankingGatewayOptions {
   timeoutMs?: number;
   /** Largest successful response body accepted. Default 4 MB. */
   maxResponseBytes?: number;
-  /**
-   * Keep answers in the memory of this instance for this many seconds, so the same question asked again does not
-   * read the bank again. Default 0: nothing is kept. At most 600. What is kept: the finished answer of a tool call
-   * (bank data), under a key made of a hash of the session id and the call's input; in process memory only, never on
-   * disk, at most 500 answers, dropped when their time is up, when the instance ends, or when the consent fails.
-   */
-  cacheSeconds?: number;
   /**
    * Reads allowed per consent in 24 hours for calls marked `unattended`. Default 4 (the PSD2 limit many banks apply).
    * 0 turns the budget off. Counted in the memory of this instance only.
