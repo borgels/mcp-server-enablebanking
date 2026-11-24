@@ -1,8 +1,8 @@
-// The standalone server keeps what the bank answered for a few minutes. This file is the proof of the rule it does
-// that under (src/enablebanking/bank.ts, at the top of the class): the moment any answer from Enable Banking says a
-// consent is over, or that an account has left it, nothing read under it is served again, from memory or from the
-// bank, until it is seen in order again. Every way the server can learn it has a test here, and every test goes
-// through the tools as a client calls them. Made-up data only.
+// The standalone server keeps no answer from the bank between calls. This file is the proof of the rule it reads
+// under (src/enablebanking/bank.ts, at the top of the class): the moment any answer from Enable Banking says a consent
+// is over, or that an account has left it, nothing is read or returned under it, until it is seen in order again,
+// also for a call that was already waiting for the bank. Every way the server can learn it has a test here, and every
+// test goes through the tools as a client calls them. Made-up data only.
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { describe, expect, it } from 'vitest';
@@ -60,7 +60,7 @@ function world() {
   return { state, api };
 }
 
-async function open(options: { cacheSeconds?: number; now?: () => number } = {}) {
+async function open(options: { now?: () => number } = {}) {
   const { state, api } = world();
   api.setSessionAccounts(BOTH);
   const { bank } = makeBank({ ...options, api });
@@ -84,18 +84,36 @@ async function open(options: { cacheSeconds?: number; now?: () => number } = {})
 
 type World = Awaited<ReturnType<typeof open>>;
 
-/** A balance read and kept, and then a bank that would answer something else. */
-async function withKeptBalances(w: World, accounts = ['drift', 'skat']) {
+/** A balance read once per account, and then a bank that answers something else: an answer with OLD is an old one. */
+async function withBalancesRead(w: World, accounts = ['drift', 'skat']) {
   for (const account of accounts) {
     const first = await w.tool('get_balances', { account });
     expect(first.failed, first.text).toBe(false);
     expect(first.text).toContain(OLD);
-    // Asked again at once: answered from memory.
-    expect((await w.tool('get_balances', { account })).text).toContain(OLD);
   }
   expect(w.reads('balances')).toBe(accounts.length);
   w.state.balance = NEW;
 }
+
+/** A bank that holds the answer for one kind of read until `release`; `atTheBank` resolves when it has been asked. */
+function slowAt(w: World, key: string, answer: () => unknown) {
+  let release: () => void = () => undefined;
+  const waiting = new Promise<void>(resolve => {
+    release = resolve;
+  });
+  let arrived: () => void = () => undefined;
+  const atTheBank = new Promise<void>(resolve => {
+    arrived = resolve;
+  });
+  w.state.failing.set(key, async () => {
+    arrived();
+    await waiting;
+    return answer();
+  });
+  return { release, atTheBank };
+}
+
+const oldBalance = () => ({ balances: [{ balance_type: 'CLBD', balance_amount: { amount: OLD, currency: 'DKK' }, reference_date: '2026-10-01' }] });
 
 /** Every tool that reads an account answers with the refusal, shows nothing of the bank, and asks nobody. */
 async function expectRefused(w: World, account: string, code: string) {
@@ -120,9 +138,9 @@ async function expectRefused(w: World, account: string, code: string) {
 }
 
 describe('standalone: the consent status tool', () => {
-  it('stops serving a kept balance when Enable Banking answers that the session is revoked', async () => {
+  it('refuses every read once Enable Banking answers that the session is revoked', async () => {
     const w = await open();
-    await withKeptBalances(w);
+    await withBalancesRead(w);
 
     w.state.session = () => respond({ error: 'REVOKED_SESSION', message: 'made-up vendor text' }, 401);
     const status = await w.tool('get_consent_status');
@@ -142,7 +160,7 @@ describe('standalone: the consent status tool', () => {
     ['WRONG_SESSION_STATUS', 422, 'consent_not_active'],
   ])('does the same for an error answer %s', async (error, status, code) => {
     const w = await open();
-    await withKeptBalances(w);
+    await withBalancesRead(w);
     w.state.session = () => respond({ error }, status);
     await w.tool('get_consent_status');
     await expectRefused(w, 'drift', code);
@@ -160,7 +178,7 @@ describe('standalone: the consent status tool', () => {
     [7, 'consent_not_active'],
   ])('does the same for an ordinary answer with status %s', async (status, code) => {
     const w = await open();
-    await withKeptBalances(w);
+    await withBalancesRead(w);
     w.state.session = () => ({ ...authorized(), status });
     const answer = JSON.parse((await w.tool('get_consent_status')).text);
     expect(answer.consents[0].status).toBe(typeof status === 'string' ? status : null);
@@ -171,26 +189,26 @@ describe('standalone: the consent status tool', () => {
 
   it('does the same for a session that is authorised but past its date', async () => {
     const w = await open();
-    await withKeptBalances(w);
+    await withBalancesRead(w);
     w.state.session = () => authorized([DRIFT, SKAT], '2020-01-01T00:00:00Z');
     await w.tool('get_consent_status');
     await expectRefused(w, 'drift', 'consent_expired');
   });
 
-  it('stops serving an account that has left the session, and only that one', async () => {
+  it('refuses an account that has left the session, and only that one', async () => {
     const w = await open();
-    await withKeptBalances(w);
+    await withBalancesRead(w);
 
     w.state.session = () => authorized([SKAT]);
     const status = JSON.parse((await w.tool('get_consent_status')).text);
     expect(status.consents[0]).toMatchObject({ status: 'AUTHORIZED', noLongerCovered: ['drift'] });
 
     await expectRefused(w, 'drift', 'account_not_in_consent');
-    // The other account stands as before: still answered from memory.
-    const kept = await w.tool('get_balances', { account: 'skat' });
-    expect(kept.failed).toBe(false);
-    expect(kept.text).toContain(OLD);
-    expect(w.reads('balances')).toBe(2);
+    // The other account stands as before: the bank is asked anew.
+    const other = await w.tool('get_balances', { account: 'skat' });
+    expect(other.failed).toBe(false);
+    expect(other.text).toContain(NEW);
+    expect(w.reads('balances')).toBe(3);
     const listed = JSON.parse((await w.tool('list_accounts')).text);
     expect(listed.accounts.map((account: { id: string; status: string }) => [account.id, account.status])).toEqual([
       ['drift', 'consent_ended'],
@@ -206,7 +224,7 @@ describe('standalone: the consent status tool', () => {
 
   it('takes a session answer without a list of accounts to cover none', async () => {
     const w = await open();
-    await withKeptBalances(w);
+    await withBalancesRead(w);
     w.state.session = () => ({ status: 'AUTHORIZED', access: { valid_until: '2099-01-01T00:00:00Z' } });
     await w.tool('get_consent_status');
     await expectRefused(w, 'drift', 'account_not_in_consent');
@@ -215,7 +233,7 @@ describe('standalone: the consent status tool', () => {
 
   it('lets the consent be read again once Enable Banking shows it in order, and then asks the bank anew', async () => {
     const w = await open();
-    await withKeptBalances(w);
+    await withBalancesRead(w);
     w.state.session = () => ({ ...authorized([SKAT]), status: 'REVOKED' });
     await w.tool('get_consent_status');
     await expectRefused(w, 'skat', 'consent_revoked');
@@ -239,13 +257,13 @@ describe('standalone: the consent status tool', () => {
 
   it('leaves everything as it is when the status cannot be read for another reason', async () => {
     const w = await open();
-    await withKeptBalances(w);
+    await withBalancesRead(w);
     w.state.session = () => respond({ error: 'ASPSP_ERROR' }, 500);
     const status = JSON.parse((await w.tool('get_consent_status')).text);
     expect(status.consents[0]).toMatchObject({ problem: 'bank_unavailable' });
-    // Nothing was learned about the consent: the kept answer still stands.
-    expect((await w.tool('get_balances', { account: 'drift' })).text).toContain(OLD);
-    expect(w.reads('balances')).toBe(2);
+    // Nothing was learned about the consent: the account is read as before, at the bank.
+    expect((await w.tool('get_balances', { account: 'drift' })).text).toContain(NEW);
+    expect(w.reads('balances')).toBe(3);
   });
 });
 
@@ -261,7 +279,7 @@ describe('standalone: a read that fails', () => {
 
   it.each(READS)('with an ended consent, from %s, withdraws the whole consent', async (name, args, kind) => {
     const w = await open();
-    await withKeptBalances(w, ['drift']);
+    await withBalancesRead(w, ['drift']);
     w.state.failing.set(`${SKAT}/${kind}`, () => respond({ error: 'REVOKED_SESSION' }, 401));
     const failed = await w.tool(name, args);
     if (name === 'search_transactions') expect(JSON.parse(failed.text).accounts[0]).toMatchObject({ read: false, problem: 'consent_revoked' });
@@ -279,7 +297,7 @@ describe('standalone: a read that fails', () => {
     ['WRONG_SESSION_STATUS', 'consent_not_active'],
   ])('withdraws the consent for %s', async (error, code) => {
     const w = await open();
-    await withKeptBalances(w, ['drift']);
+    await withBalancesRead(w, ['drift']);
     w.state.failing.set(`${SKAT}/details`, () => respond({ error }, 401));
     expect((await w.tool('get_account_details', { account: 'skat' })).code).toBe(code);
     w.state.failing.clear();
@@ -288,28 +306,28 @@ describe('standalone: a read that fails', () => {
 
   it('with an account the session does not have, withdraws that account and nothing else', async () => {
     const w = await open();
-    await withKeptBalances(w);
+    await withBalancesRead(w);
     w.state.failing.set(`${DRIFT}/transactions`, () => respond({ error: 'ACCOUNT_DOES_NOT_EXIST' }, 404));
     expect((await w.tool('list_transactions', { account: 'drift', ...PERIOD })).code).toBe('account_not_in_consent');
     w.state.failing.clear();
 
     await expectRefused(w, 'drift', 'account_not_in_consent');
-    const kept = await w.tool('get_balances', { account: 'skat' });
-    expect(kept.text).toContain(OLD);
-    expect(w.reads('balances')).toBe(2);
+    const other = await w.tool('get_balances', { account: 'skat' });
+    expect(other.text).toContain(NEW);
+    expect(w.reads('balances')).toBe(3);
   });
 
-  it('with an account the bank refuses, drops what was kept of that account and asks again next time', async () => {
+  it('with an account the bank refuses, leaves read access as it is and asks the bank again next time', async () => {
     const w = await open();
-    await withKeptBalances(w);
+    await withBalancesRead(w);
     w.state.failing.set(`${DRIFT}/transactions`, () => respond({ error: 'ASPSP_ACCOUNT_NOT_ACCESSIBLE' }, 403));
     expect((await w.tool('list_transactions', { account: 'drift', ...PERIOD })).code).toBe('account_not_accessible');
 
     const asked = await w.tool('get_balances', { account: 'drift' });
     expect(asked.text).toContain(NEW);
     expect(asked.text).not.toContain(OLD);
-    expect((await w.tool('get_balances', { account: 'skat' })).text).toContain(OLD);
-    expect(w.reads('balances')).toBe(3);
+    expect((await w.tool('get_balances', { account: 'skat' })).text).toContain(NEW);
+    expect(w.reads('balances')).toBe(4);
   });
 
   it.each([
@@ -317,9 +335,9 @@ describe('standalone: a read that fails', () => {
     ['NO_ACCOUNTS_ADDED', 403, 'application_restricted'],
     [undefined, 401, 'access_refused'],
     [undefined, 403, 'access_refused'],
-  ])('with the application refused (%s, %i), drops everything kept and asks again next time', async (error, status, code) => {
+  ])('with the application refused (%s, %i), asks the bank again next time', async (error, status, code) => {
     const w = await open();
-    await withKeptBalances(w);
+    await withBalancesRead(w);
     w.state.failing.set(`${DRIFT}/transactions`, () => respond(error ? { error } : {}, status));
     expect((await w.tool('list_transactions', { account: 'drift', ...PERIOD })).code).toBe(code);
 
@@ -335,54 +353,42 @@ describe('standalone: a read that fails', () => {
     ['ASPSP_ERROR', 500, 'bank_unavailable'],
     ['ASPSP_RATE_LIMIT_EXCEEDED', 429, 'rate_limited'],
     ['WRONG_TRANSACTIONS_PERIOD', 422, 'period_not_available'],
-  ])('for a reason that says nothing of the consent (%s), keeps what it has', async (error, status, code) => {
+  ])('for a reason that says nothing of the consent (%s), leaves read access as it is', async (error, status, code) => {
     const w = await open();
-    await withKeptBalances(w);
+    await withBalancesRead(w);
     w.state.failing.set(`${DRIFT}/transactions`, () => respond({ error }, status));
     expect((await w.tool('list_transactions', { account: 'drift', ...PERIOD })).code).toBe(code);
-    expect((await w.tool('get_balances', { account: 'drift' })).text).toContain(OLD);
-    expect(w.reads('balances')).toBe(2);
+    expect((await w.tool('get_balances', { account: 'drift' })).text).toContain(NEW);
+    expect(w.reads('balances')).toBe(3);
   });
 
   it('with another account behind the same id, withdraws that account', async () => {
     const w = await open();
-    await withKeptBalances(w);
+    await withBalancesRead(w);
     w.state.details.set(DRIFT, { uid: DRIFT, account_id: { iban: IBAN.stray }, name: 'Made-up other account', currency: 'DKK' });
     const details = await w.tool('get_account_details', { account: 'drift' });
     expect(details.code).toBe('account_not_connected');
     expect(details.text).not.toContain('Made-up other account');
 
     await expectRefused(w, 'drift', 'account_not_connected');
-    expect((await w.tool('get_balances', { account: 'skat' })).text).toContain(OLD);
+    expect((await w.tool('get_balances', { account: 'skat' })).text).toContain(NEW);
   });
 
-  it('does not keep or serve an answer that arrives after the consent was withdrawn', async () => {
+  it('does not return an answer that arrives after the consent was withdrawn', async () => {
     const w = await open();
-    let release: () => void = () => undefined;
-    const waiting = new Promise<void>(resolve => {
-      release = resolve;
-    });
-    let arrived: () => void = () => undefined;
-    const atTheBank = new Promise<void>(resolve => {
-      arrived = resolve;
-    });
     // The bank is slow to answer the balance ...
-    w.state.failing.set(`${DRIFT}/balances`, async () => {
-      arrived();
-      await waiting;
-      return { balances: [{ balance_type: 'CLBD', balance_amount: { amount: OLD, currency: 'DKK' }, reference_date: '2026-10-01' }] };
-    });
+    const bank = slowAt(w, `${DRIFT}/balances`, oldBalance);
     const slow = w.tool('get_balances', { account: 'drift' });
-    await atTheBank;
+    await bank.atTheBank;
     // ... and meanwhile the status tool learns that the consent is revoked.
     w.state.session = () => ({ ...authorized(), status: 'REVOKED' });
     await w.tool('get_consent_status');
-    release();
+    bank.release();
     const answer = await slow;
     expect(answer.failed).toBe(true);
     expect(answer.code).toBe('consent_revoked');
     expect(answer.text).not.toContain(OLD);
-    // And it was not kept: once the consent is in order again, the bank is asked anew.
+    // Once the consent is in order again, the bank is asked anew.
     w.state.failing.clear();
     w.state.balance = NEW;
     await expectRefused(w, 'drift', 'consent_revoked');
@@ -394,10 +400,136 @@ describe('standalone: a read that fails', () => {
   });
 });
 
+describe('standalone: calls side by side', () => {
+  it('does not return a slow balance once the consent was revoked here meanwhile', async () => {
+    const w = await open();
+    const bank = slowAt(w, `${DRIFT}/balances`, oldBalance);
+    const slow = w.tool('get_balances', { account: 'drift' });
+    await bank.atTheBank;
+    expect((await w.tool('revoke_consent', { consent: CONSENT })).failed).toBe(false);
+    bank.release();
+    const answer = await slow;
+    expect(answer.failed, answer.text).toBe(true);
+    expect(answer.code).toBe('no_consent');
+    expect(answer.text).not.toContain(OLD);
+    // Nothing of it stays behind: no consent covers the account, and the bank is not asked.
+    w.state.failing.clear();
+    const before = w.reads();
+    const again = await w.tool('get_balances', { account: 'drift' });
+    expect(again.code).toBe('no_consent');
+    expect(w.reads()).toBe(before);
+  });
+
+  it.each([
+    ['get_balances', { account: 'drift' }, 'balances'],
+    ['list_transactions', { account: 'drift', ...PERIOD }, 'transactions'],
+    ['get_transaction_details', { account: 'drift', transaction: 'details-1' }, 'transactions'],
+  ] as Array<[string, Record<string, unknown>, string]>)(
+    'does not return a slow %s once a refresh has taken the account out of the consent',
+    async (name, args, kind) => {
+      const w = await open();
+      const bank = slowAt(w, `${DRIFT}/${kind}`, () =>
+        kind === 'balances' ? oldBalance() : { transactions: [{ entry_reference: 'line-1', transaction_amount: { amount: OLD, currency: 'DKK' }, remittance_information: ['Husleje'] }] },
+      );
+      const slow = w.tool(name, args);
+      await bank.atTheBank;
+      w.state.session = () => authorized([SKAT]);
+      const refreshed = await w.tool('refresh_consent', { consent: CONSENT });
+      expect(refreshed.failed, refreshed.text).toBe(false);
+      bank.release();
+      const answer = await slow;
+      expect(answer.failed, answer.text).toBe(true);
+      expect(answer.code).toBe('no_consent');
+      expect(answer.text).not.toContain(OLD);
+      expect(answer.text).not.toContain('Husleje');
+    },
+  );
+
+  it('does not return a slow balance when a refresh rebinds the account under another id meanwhile', async () => {
+    const w = await open();
+    const bank = slowAt(w, `${DRIFT}/balances`, oldBalance);
+    const slow = w.tool('get_balances', { account: 'drift' });
+    await bank.atTheBank;
+    // Enable Banking now lists the same account under a new id.
+    w.state.details.set('uid-aaa-drift-2', { uid: 'uid-aaa-drift-2', account_id: { iban: IBAN.aaaDrift }, name: 'Drift', currency: 'DKK' });
+    w.state.session = () => authorized(['uid-aaa-drift-2', SKAT]);
+    expect((await w.tool('refresh_consent', { consent: CONSENT })).failed).toBe(false);
+    bank.release();
+    const answer = await slow;
+    expect(answer.failed, answer.text).toBe(true);
+    expect(answer.code).toBe('consent_not_active');
+    expect(answer.text).not.toContain(OLD);
+  });
+
+  it('a refresh that read the consent in order does not restore it after a status answer said it is revoked', async () => {
+    const w = await open();
+    // The refresh reads AUTHORIZED, then waits for the bank's account details ...
+    const bank = slowAt(w, `${DRIFT}/details`, () => BOTH[0]);
+    const refreshing = w.tool('refresh_consent', { consent: CONSENT });
+    await bank.atTheBank;
+    // ... while the status tool learns that the consent is revoked.
+    w.state.session = () => ({ ...authorized(), status: 'REVOKED' });
+    await w.tool('get_consent_status');
+    bank.release();
+    const refreshed = await refreshing;
+    expect(refreshed.failed, refreshed.text).toBe(true);
+    expect(refreshed.code).toBe('consent_revoked');
+    // Access stays withdrawn: nothing is read, and the list says so.
+    w.state.failing.clear();
+    await expectRefused(w, 'drift', 'consent_revoked');
+    await expectRefused(w, 'skat', 'consent_revoked');
+    const listed = JSON.parse((await w.tool('list_accounts')).text);
+    expect(listed.accounts.map((account: { status: string }) => account.status)).toEqual(['consent_ended', 'consent_ended']);
+  });
+
+  it('a status answer in order that was on its way does not lift a withdrawal learned meanwhile', async () => {
+    const w = await open();
+    let release: () => void = () => undefined;
+    const waiting = new Promise<void>(resolve => {
+      release = resolve;
+    });
+    let arrived: () => void = () => undefined;
+    const atEnableBanking = new Promise<void>(resolve => {
+      arrived = resolve;
+    });
+    // Enable Banking is slow to say the consent is in order ...
+    w.state.session = async () => {
+      arrived();
+      await waiting;
+      return authorized();
+    };
+    const status = w.tool('get_consent_status');
+    await atEnableBanking;
+    // ... and meanwhile a read learns that it is revoked.
+    w.state.failing.set(`${DRIFT}/balances`, () => respond({ error: 'REVOKED_SESSION' }, 401));
+    expect((await w.tool('get_balances', { account: 'drift' })).code).toBe('consent_revoked');
+    release();
+    await status;
+    w.state.failing.clear();
+    await expectRefused(w, 'drift', 'consent_revoked');
+    // A status answer asked after the withdrawal does lift it.
+    w.state.session = () => authorized();
+    await w.tool('get_consent_status');
+    expect((await w.tool('get_balances', { account: 'drift' })).failed).toBe(false);
+  });
+
+  it('a slow read that began before the consent was refreshed in order is still returned', async () => {
+    const w = await open();
+    const bank = slowAt(w, `${DRIFT}/balances`, oldBalance);
+    const slow = w.tool('get_balances', { account: 'drift' });
+    await bank.atTheBank;
+    expect((await w.tool('refresh_consent', { consent: CONSENT })).failed).toBe(false);
+    bank.release();
+    const answer = await slow;
+    expect(answer.failed, answer.text).toBe(false);
+    expect(answer.text).toContain(OLD);
+  });
+});
+
 describe('standalone: the consent tools', () => {
   it('refresh binds nothing to a consent Enable Banking no longer honours, and withdraws it', async () => {
     const w = await open();
-    await withKeptBalances(w);
+    await withBalancesRead(w);
     w.state.session = () => ({ ...authorized(), status: 'REVOKED' });
     const refreshed = await w.tool('refresh_consent', { consent: CONSENT });
     expect(refreshed.failed).toBe(true);
@@ -407,23 +539,23 @@ describe('standalone: the consent tools', () => {
 
   it('refresh that fails with an ended consent withdraws it', async () => {
     const w = await open();
-    await withKeptBalances(w);
+    await withBalancesRead(w);
     w.state.session = () => respond({ error: 'EXPIRED_SESSION' }, 401);
     expect((await w.tool('refresh_consent', { consent: CONSENT })).code).toBe('consent_expired');
     await expectRefused(w, 'skat', 'consent_expired');
 
     // The same when it is the read of an account, in the middle of the refresh, that says so.
     const second = await open();
-    await withKeptBalances(second);
+    await withBalancesRead(second);
     second.state.failing.set('details', () => respond({ error: 'REVOKED_SESSION' }, 401));
     expect((await second.tool('refresh_consent', { consent: CONSENT })).code).toBe('consent_revoked');
     second.state.failing.clear();
     await expectRefused(second, 'drift', 'consent_revoked');
   });
 
-  it('refresh drops what was kept: an account that has left is not readable, the rest is read anew', async () => {
+  it('refresh: an account that has left is not readable, the rest is read anew', async () => {
     const w = await open();
-    await withKeptBalances(w);
+    await withBalancesRead(w);
     w.state.session = () => authorized([SKAT]);
     const refreshed = await w.tool('refresh_consent', { consent: CONSENT });
     expect(refreshed.failed, refreshed.text).toBe(false);
@@ -438,7 +570,7 @@ describe('standalone: the consent tools', () => {
 
   it('refresh of a consent in order lifts what was held against it', async () => {
     const w = await open();
-    await withKeptBalances(w);
+    await withBalancesRead(w);
     w.state.session = () => authorized([SKAT]);
     await w.tool('get_consent_status');
     await expectRefused(w, 'drift', 'account_not_in_consent');
@@ -450,9 +582,9 @@ describe('standalone: the consent tools', () => {
     expect(anew.text).toContain(NEW);
   });
 
-  it('revoke removes read access and everything kept', async () => {
+  it('revoke removes read access', async () => {
     const w = await open();
-    await withKeptBalances(w);
+    await withBalancesRead(w);
     expect((await w.tool('revoke_consent', { consent: CONSENT })).failed).toBe(false);
     const before = w.reads();
     for (const account of ['drift', 'skat']) {
@@ -463,9 +595,9 @@ describe('standalone: the consent tools', () => {
     expect(w.reads()).toBe(before);
   });
 
-  it('a new consent starts without what was held against the old one, and with nothing kept from it', async () => {
+  it('a new consent starts without what was held against the old one', async () => {
     const w = await open();
-    await withKeptBalances(w);
+    await withBalancesRead(w);
     w.state.session = () => ({ ...authorized(), status: 'REVOKED' });
     await w.tool('get_consent_status');
     await expectRefused(w, 'drift', 'consent_revoked');
@@ -479,8 +611,8 @@ describe('standalone: the consent tools', () => {
     expect(anew.text).not.toContain(OLD);
   });
 
-  it('with the cache turned off asks the bank every time, and still refuses a withdrawn consent', async () => {
-    const w = await open({ cacheSeconds: 0 });
+  it('asks the bank on every call: nothing is kept between calls', async () => {
+    const w = await open();
     await w.tool('get_balances', { account: 'drift' });
     await w.tool('get_balances', { account: 'drift' });
     expect(w.reads('balances')).toBe(2);

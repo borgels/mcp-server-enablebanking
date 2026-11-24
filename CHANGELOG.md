@@ -57,11 +57,16 @@ Standalone server:
 - A failed call ends with `errorCode: <code>` and, where a wait is recommended, `retryAfterSeconds: <n>`.
 - `ENABLEBANKING_UNATTENDED_FETCHES_PER_DAY` (default 0: off): a budget of reads at the bank per consent in any 24
   hours. The standalone server has no details of a person to send, so all its reads are background reads.
-- The answer cache stands under a stated rule (README, "What the cache may answer"): once any answer from Enable
-  Banking says a consent is over or an account has left it (a failed read, the consent status, a refresh), nothing
-  read under it is served again and reads of it are refused, until it is seen in order again or a new consent is
-  completed. Before, the consent status tool could report a revoked consent and a kept balance was still served.
-  `enablebanking_list_accounts` has a new account status for it: `consent_ended`.
+- The answer cache is gone: no answer from the bank is kept between calls, not even briefly in memory, and every
+  call that shows bank data asks the bank. `ENABLEBANKING_CACHE_SECONDS` is no longer read. The bank's limit on
+  background reads is met by `ENABLEBANKING_UNATTENDED_FETCHES_PER_DAY`. Before, the consent status tool could
+  report a revoked consent while a kept balance was still served.
+- Reads stand under a stated rule (README, "Reads after a consent ended"): once any answer from Enable Banking says
+  a consent is over or an account has left it (a failed read, the consent status, a refresh), reads of it are
+  refused, until it is seen in order again or a new consent is completed. Also for calls side by side: a read that
+  was waiting for the bank when the consent was withdrawn, revoked, replaced or refreshed without its account
+  returns nothing, and a status answer or a refresh that was under way when a withdrawal was learned does not lift
+  it. `enablebanking_list_accounts` has a new account status for it: `consent_ended`.
 - `enablebanking_refresh_consent` refuses a consent that is no longer authorised instead of binding to it.
 - A search stops at the first account the bank's rate limit refuses.
 - The account registry no longer assumes DKK for an account without a currency.
@@ -81,7 +86,9 @@ Gateway (`mcp-server-enablebanking/gateway`), every change to the surface:
 - A malformed `psu` or `unattended` (also `null`, and a value with a line break or another control character) is
   refused with `presence_incomplete`, never read as "nobody is present".
 - The values of `psu` are removed from the finished result of the call, so a bank that repeats them does not hand
-  them on: `ipAddress` and `geoLocation` always, however they are encoded or spelled; the other fields best
+  them on: `ipAddress` and `geoLocation` always, however they are encoded or spelled (a location also with any
+  trailing zeros, a decimal comma, or whitespace instead of the comma, matched as whole numbers so that amounts,
+  dates and account numbers are left alone); the other fields best
   effort, from 8 characters. The README says exactly what is promised ("Who is present"). The redaction of every
   value the gateway holds (session id, key, authorization code) now reads a text decoded before comparing, so a
   percent-encoding in lower case, a double encoding or an HTML entity no longer hides a value.

@@ -17,8 +17,12 @@ import { isIP } from 'node:net';
  * - an IP address and a location added as such, also in another spelling
  *   that says the same: an IPv6 address in upper case, written out in full
  *   or shortened differently, an IPv4 address as an IPv4-mapped IPv6
- *   address, coordinates with more or fewer trailing zeros or with a space
- *   or a semicolon between them;
+ *   address; a location as two numbers equal to its latitude and longitude,
+ *   with any number of trailing zeros, a decimal point or a decimal comma,
+ *   and a comma, a semicolon or whitespace between them (also encoded, as
+ *   any value). Numbers are matched whole: a number inside a longer number
+ *   is not one, and two whole numbers ("1055,12", "55 12") are read as an
+ *   amount or a number, not as a location;
  * - for the key material, also every piece of it of FRAGMENT_LENGTH
  *   characters, so a part of the key is not left after a cut or an echo.
  *   Session ids and authorization codes are matched whole: a session id is a
@@ -180,8 +184,22 @@ function readings(text: string, visit: (view: View) => void): void {
 
 /** A stretch of the characters an IP address is written with. Whether it is one is decided by parsing it. */
 const ADDRESS_TOKEN = /[0-9A-Fa-f:.]{3,}/g;
-/** Two decimal numbers with a comma or a semicolon between them, as coordinates are written. */
-const COORDINATES = /(-?\d{1,3}(?:\.\d{1,12})?)\s{0,3}[,;]\s{0,3}(-?\d{1,3}(?:\.\d{1,12})?)/g;
+/** A latitude or a longitude: up to three digits, then a decimal point or comma and any number of digits. */
+const COORDINATE = String.raw`-?\d{1,3}(?:[.,]\d+)?`;
+/**
+ * Two such numbers with a comma, a semicolon or whitespace between them, as coordinates are written. Each is a whole
+ * number: not preceded by a digit (or a digit and a decimal mark), not followed by a digit (or a decimal mark and a
+ * digit), so a coordinate is never found inside an amount, a date or an account number.
+ */
+const COORDINATES = new RegExp(String.raw`(?<!\d|\d[.,])(${COORDINATE})(\s{0,3}[,;]\s{0,3}|\s{1,3})(${COORDINATE})(?!\d|[.,]\d)`, 'g');
+
+/** The latitude and longitude two matched numbers say; undefined when they are better read as something else. */
+function coordinates(match: RegExpExecArray): [number, number] | undefined {
+  const [, first, , second] = match as unknown as [string, string, string, string];
+  // Two whole numbers are an amount ("1055,12"), a date or an account number far more often than a location.
+  if (/^-?\d+$/.test(first) && /^-?\d+$/.test(second)) return undefined;
+  return [Number(first.replace(',', '.')), Number(second.replace(',', '.'))];
+}
 
 /**
  * What an IP address says, whatever its spelling: its 16 bytes as 32 hex
@@ -359,10 +377,12 @@ export class GatewayRedactor {
       if (this.locations.length > 0) {
         COORDINATES.lastIndex = 0;
         for (let match = COORDINATES.exec(view.text); match; match = COORDINATES.exec(view.text)) {
-          const latitude = Number(match[1]);
-          const longitude = Number(match[2]);
-          if (this.locations.some(([a, b]) => a === latitude && b === longitude)) {
+          const said = coordinates(match);
+          if (said && this.locations.some(([a, b]) => a === said[0] && b === said[1])) {
             spans.push([view.from[match.index]!, view.to[match.index + match[0].length - 1]!]);
+          } else {
+            // Not this pair: its second number may be the first of the next one ("12 55.6761 12.5683").
+            COORDINATES.lastIndex = match.index + 1;
           }
         }
       }

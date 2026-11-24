@@ -66,7 +66,8 @@ Accounts are named by their registry id (`drift`) or IBAN. Amounts are decimal s
 precision (never floats); negative means money left the account; totals are kept per currency and never added
 across currencies. Booked and pending lines are separate: `status` is `booked` (default), `pending` or `all`.
 
-Every answer from the bank has `fetchedAt`: when the bank was read, also for an answer from the cache. A
+Every answer from the bank has `fetchedAt`: when the bank was read. Nothing is kept between calls: every call
+that shows bank data asks the bank. A
 transaction answer has `complete` (false when the read stopped at the bound of 50 pages), `truncated` and, when
 there are more matching lines than `limit`, `nextOffset` for the next call.
 
@@ -111,21 +112,23 @@ reads the accounts without signing in at the bank themselves, until the consent 
 - **Reads with nobody present.** Enable Banking tells a read that a person asked for from a background read by
   the `Psu-*` headers of the request, and many banks allow only four background reads a day. This server answers
   a model, not a browser, so it has no details of a person to send and never invents any: every read it makes is a
-  background read. Answers are cached per account and query (`ENABLEBANKING_CACHE_SECONDS`, default 300; 0 turns
-  the cache off), listing accounts and reading the consent status cost no read at the bank, and the instructions
-  ask the model to fetch a period in one call. `ENABLEBANKING_UNATTENDED_FETCHES_PER_DAY` (default 0: off) sets a budget of reads at the
-  bank per consent in any 24 hours; when it is used up, a call is refused with `unattended_limit` and the time of
-  the next possible read, instead of being sent and refused by the bank.
+  background read. No answer from the bank is kept between calls, not even briefly in memory, so every call that
+  shows bank data is a read at the bank (one per account it reads). Listing accounts and reading the consent status
+  cost no read at the bank, and the instructions ask the model to fetch a period in one call.
+  `ENABLEBANKING_UNATTENDED_FETCHES_PER_DAY` (default 0: off; 4 matches the common bank limit) sets a budget of
+  reads at the bank per consent in any 24 hours; when it is used up, a call is refused with `unattended_limit` and
+  the time of the next possible read, instead of being sent and refused by the bank.
 - **The bank's own limit.** `rate_limited` with `retryAfterSeconds: 21600`: Enable Banking recommends waiting six
   hours. A search stops at the first account the bank limits and does not ask for the rest.
-- **What the cache may answer.** The cache is why this server can answer the same question twice on a bank's four
-  reads a day; it is kept for that, and it stands under one rule: *an answer is served, from memory or from the
-  bank, only for an account whose consent this server has no word against.* It holds what the bank answered for
-  one account of one consent, in memory only, and is reached only after the account has been resolved through the
-  registry and the stored consent of this company on that call. The moment any answer from Enable Banking says a
-  consent is over, or that an account has left it, everything read under it is dropped and reads of it are
-  refused here (`consent_revoked`, `consent_expired`, `consent_not_active`, `account_not_in_consent`), until
-  Enable Banking shows it in order again or a new consent is completed. The server learns it from:
+- **Reads after a consent ended.** One rule: *an answer is returned only for an account whose consent this server
+  has no word against at the moment the answer is returned.* Every read resolves the account through the registry
+  and the stored consent of this company on that call, before the bank is asked. The moment any answer from Enable
+  Banking says a consent is over, or that an account has left it, reads of it are refused here (`consent_revoked`,
+  `consent_expired`, `consent_not_active`, `account_not_in_consent`), until Enable Banking shows it in order again
+  or a new consent is completed. That holds for calls running side by side too: a read that was waiting for the
+  bank when the consent was withdrawn, revoked, replaced or refreshed without its account returns nothing, and a
+  status answer or a refresh that was on its way when a withdrawal was learned does not lift it. The server learns
+  it from:
   - a read at the bank that fails with an ended consent or a missing account, from any tool;
   - `enablebanking_get_consent_status`: an error for the session, a status other than `AUTHORIZED`, a date that
     has passed, an account the session no longer lists;
@@ -133,12 +136,11 @@ reads the accounts without signing in at the bank themselves, until the consent 
   - `enablebanking_revoke_consent`, and a consent replaced by a new one;
   - the bank answering with another account than the registered one.
 
-  A refusal of the application itself (`application_refused`, `application_restricted`, `access_refused`) empties
-  the cache and leaves read access as it is. `enablebanking_list_accounts` shows an account the server has such
-  word against as `consent_ended`. What the rule cannot cover: a consent ended at the bank that nobody has asked
-  Enable Banking about yet. Until the next read at the bank or the next look at the consent status, an answer read
-  before that can be repeated for up to the cache's seconds; `ENABLEBANKING_CACHE_SECONDS=0` turns the cache off,
-  and every read then goes to the bank. Each way of learning has a test in `test/standalone-authority.test.ts`.
+  A refusal of the application itself (`application_refused`, `application_restricted`, `access_refused`) leaves
+  read access as it is; the next read asks the bank again. `enablebanking_list_accounts` shows an account the server
+  has such word against as `consent_ended`. A read does not ask Enable Banking for the session first: a consent
+  ended at the bank that nobody has asked about yet is learned from the bank's answer to the read itself. Each way
+  of learning, and each race, has a test in `test/standalone-authority.test.ts`.
 - **History.** Many banks give the full history only for about an hour after the sign-in and the last 90 days
   after that; a period the bank does not give is `period_not_available`.
 - **Consents are time-limited** (often 180 days at most). `enablebanking_list_accounts` and
@@ -218,8 +220,9 @@ Invalid numeric or boolean values stop the server at startup with a message
 naming the variable. `GET /healthz` answers `{"ok":true,"company":...,"consent":...}`
 without authentication, for container health checks. The consent callback path (when enabled) is
 also served without the bearer token: the signed, single-use state authorises it.
-`ENABLEBANKING_CACHE_SECONDS` and `ENABLEBANKING_TIMEOUT_MS` must be integers; values
-outside their range are clamped as before. The `ENABLEBANKING_*` flags
+`ENABLEBANKING_UNATTENDED_FETCHES_PER_DAY` and `ENABLEBANKING_TIMEOUT_MS` must be integers; values
+outside their range are clamped as before. `ENABLEBANKING_CACHE_SECONDS` of earlier versions is no
+longer read: there is no answer cache. The `ENABLEBANKING_*` flags
 (`ENABLEBANKING_TRUST_FORWARDED_USER`, `ENABLEBANKING_ENABLE_CONSENT`,
 `ENABLEBANKING_CONSENT_CALLBACK`) are only on with exactly `true`; any other value
 (including `TRUE` or `1`) leaves them off, unlike the `MCP_*` flags above.
@@ -409,9 +412,16 @@ if (result.isError) {
       a space), escaped as in JSON, JavaScript or HTML, or any of these
       inside another up to three layers. Also in another spelling that says
       the same: an IPv6 address in upper case, written out in full or
-      shortened differently, an IPv4 address as an IPv4-mapped IPv6 address,
-      coordinates with other trailing zeros or with a space or a semicolon
-      between them.
+      shortened differently, an IPv4 address as an IPv4-mapped IPv6 address.
+      A location also as any two numbers equal to its latitude and longitude:
+      with any number of trailing zeros, with a decimal point or a decimal
+      comma, and with a comma, a semicolon or whitespace (a space, a tab, or
+      one of those encoded, such as `%20` or `&#32;`) between them. Numbers
+      are matched whole, so a coordinate inside a longer number, an amount
+      (`1.055,12 kr.`, `1055,12 DKK`), a date or an account number is left
+      as it is; two whole numbers (`55 12`, `55,12`) are never taken as a
+      location. Not removed: a location rounded, with its numbers in the
+      other order, in degrees and minutes, or split over several fields.
     - The other fields (`userAgent`, `referer` and the `accept` fields):
       best effort. A value of 8 characters or more is removed where it
       stands whole, in the same encodings and with any whitespace between

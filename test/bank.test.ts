@@ -123,12 +123,12 @@ describe('reads', () => {
 
     const filtered = await bank.transactions('drift', { from: '2026-09-01', to: '2026-09-30', search: 'husleje', direction: 'out' });
     expect(filtered.transactions.map(t => t.reference)).toEqual(['t1']);
-    // Served from cache: no new bank calls.
-    expect(api.calls.filter(c => c.path.includes('/transactions'))).toHaveLength(2);
+    // Nothing is kept between calls: the bank is read again, both pages.
+    expect(api.calls.filter(c => c.path.includes('/transactions'))).toHaveLength(4);
   });
 
   it('reads balances and refuses details for a uid that turned into another IBAN', async () => {
-    const { bank, api } = await linked({ cacheSeconds: 0 });
+    const { bank, api } = await linked();
     expect((await bank.balances('drift')).balances[0]).toMatchObject({ amount: '1234.50', currency: 'DKK' });
     api.setSessionAccounts([{ uid: 'uid-aaa-drift', account_id: { iban: IBAN.bbbDrift }, name: 'x', currency: 'DKK' }]);
     await expect(bank.details('drift')).rejects.toThrow(/different account/);

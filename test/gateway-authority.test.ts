@@ -594,9 +594,38 @@ describe('an address or a location of the person present, in another spelling th
     ['with a space after the comma', '55.676100, 12.568300'],
     ['with a semicolon', '55.676100;12.568300'],
     ['with a percent-encoded comma and space', '55.6761%2c%2012.5683'],
+    ['with a space and no comma', '55.6761 12.5683'],
+    ['with a tab and no comma', '55.6761\t12.5683'],
+    ['with a percent-encoded space and no comma', '55.6761%2012.5683'],
+    ['with an HTML-encoded space and no comma', '55.6761&#32;12.5683'],
+    ['with thirteen decimals', '55.6761000000000,12.5683000000000'],
+    ['with twenty decimals and a space', '55.67610000000000000000 12.56830000000000000000'],
+    ['with decimal commas and a semicolon', '55,6761;12,5683'],
+    ['with decimal commas and a space', '55,676100 12,568300'],
   ])('removes a location %s', async (_, written) => {
     const note = await through({ geoLocation: '55.676100,12.568300' }, `Seen at ${written} today, paid 55.67, 12.56 and 10.00,20.00`);
     expect(note).toBe('Seen at ‹redacted› today, paid 55.67, 12.56 and 10.00,20.00');
+  });
+
+  it('finds a location right after a number that is not one of its coordinates', async () => {
+    const note = await through({ geoLocation: '55.676100,12.568300' }, 'Seen 12 55.6761 12.5683 today');
+    expect(note).toBe('Seen 12 ‹redacted› today');
+  });
+
+  it.each([
+    'Beløb 1055,12 DKK',
+    'Beløb 1.055,12 kr.',
+    'Beløb 55,12 kr. og 12,00 kr.',
+    'Beløb 1055.12 DKK og 255.0, 12.0 point',
+    'Bogført 2026-09-10, valør 10.09.2026 kl. 12.00',
+    'Konto 5470 0001234567, reg. 5470-1234567',
+    'Faktura 55 12 0 betalt',
+  ])('leaves ordinary Danish amounts, dates and numbers alone near the location 55.0,12.0: %s', async text => {
+    expect(await through({ geoLocation: '55.0,12.0' }, text)).toBe(text);
+  });
+
+  it('removes the location 55.0,12.0 itself, also with other zeros', async () => {
+    expect(await through({ geoLocation: '55.0,12.0' }, 'At 55.0, 12.0 and 55.000 12.00, paid 1055,12 DKK')).toBe('At ‹redacted› and ‹redacted›, paid 1055,12 DKK');
   });
 });
 

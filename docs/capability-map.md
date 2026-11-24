@@ -42,7 +42,7 @@ schemas named below with `src/enablebanking/api.ts` and the error codes with `ER
 | `GET /aspsps` | `enablebanking_list_banks` | `listBanks()` helper | before; every country, both customer types, sign-in methods, required headers, group and beta flag in 0.7.0 |
 | `POST /auth` | `enablebanking_start_consent` | `startAuthorization()` helper | before; sign-in method, account selection, access flags and personal customers in 0.7.0 |
 | `POST /sessions` | `enablebanking_complete_consent` | `completeSession()` helper | before; "no accounts" as its own result in 0.7.0 |
-| `GET /sessions/{session_id}` | every read, `enablebanking_refresh_consent`, `enablebanking_get_consent_status` | every tool call, `sessionStatus()` helper | before; bank, customer type, times and access in 0.7.0 |
+| `GET /sessions/{session_id}` | `enablebanking_refresh_consent`, `enablebanking_get_consent_status`; a read does not ask for the session, it checks the stored consent and what was learned about it before and after the bank answers | every tool call, `sessionStatus()` helper | before; bank, customer type, times and access in 0.7.0 |
 | `DELETE /sessions/{session_id}` | `enablebanking_revoke_consent`, and on renewal | `endSession()` helper | before; an already ended session counts as ended in 0.7.0 |
 | `GET /accounts/{account_id}/details` | `enablebanking_get_account_details`, the IBAN check of each account | `get_account_details`, `list_accounts` (only for accounts the host knows nothing about) | before (standalone); a tool of its own on the gateway in 0.7.0 |
 | `GET /accounts/{account_id}/balances` | `enablebanking_get_balances` | `get_balances` | before |
@@ -82,7 +82,9 @@ The gateway follows this exactly:
   malformed statement is never turned into a background read.
 - The values are sent to the bank and removed from the call's finished result and error texts, so a bank that
   repeats them does not hand them on. The address and the location: always, where the value stands whole, in any
-  percent-, JSON- or HTML-encoding up to three layers and in another spelling that says the same. The other
+  percent-, JSON- or HTML-encoding up to three layers and in another spelling that says the same (for a location:
+  any trailing zeros, a decimal point or comma, and a comma, semicolon or whitespace between the numbers, matched as
+  whole numbers so amounts and dates are left alone). The other
   values: best effort, from 8 characters. A value the bank has changed or cut up over several fields is not
   removed, and the removal is no promise of anonymity. The README has the exact wording.
 - `context.unattended: true` marks the call as made with nobody present: no header is sent, and the call counts
@@ -152,7 +154,7 @@ that is not text where the description says text is dropped rather than shown.
 | `last_change_date_time` | 0.7.0 | `lastChange` |
 | `last_committed_transaction` | 0.7.0 | `lastCommittedTransaction` |
 
-Each balance answer also has `fetchedAt`: when the bank was read, also for an answer from a cache. The API has no
+Each balance answer also has `fetchedAt`: when the bank was read; neither surface keeps an answer. The API has no
 historic balances, so there is no balance "as of" a date; `balanceAfter` on a line is the only history a bank gives.
 
 ## Bank data: `AccountResource`
@@ -279,9 +281,9 @@ The exact mapping is `problemFromHttp` in `src/enablebanking/problems.ts`; `test
 | The bank's own rate limit | 429 `ASPSP_RATE_LIMIT_EXCEEDED`; FAQ: continue after 6 hours | `rate_limited` with `retryAfterSeconds: 21600`; unattended reads of that consent pause for six hours, also when the limit shows up for one account inside a search, and also for the next page of a listing; a search does not ask for the remaining accounts |
 | Transaction history | Reference and FAQ: full history for about an hour after sign-in, then often 90 days | `period_not_available` with that explanation; `strategy: "longest"` asks for as much as the bank gives |
 | Consent length | `maximum_consent_validity` per bank, at most 180 days for most | Shown per bank; days left in `list_accounts` and the consent status |
-| Caching | none required | Standalone: 300 seconds by default (`ENABLEBANKING_CACHE_SECONDS`), per account of one consent, reached only after the registry and the stored consent have been checked on that call. Once any answer from Enable Banking says a consent is over or an account has left it (a failed read, the consent status, a refresh), what was read under it is dropped and it is not read until it is seen in order again. Gateway: none; see below. |
+| Caching | none required | None on either surface: no answer from the bank is kept between calls. Standalone: every read resolves the account through the registry and the stored consent on that call, and its answer is returned only if, when the bank has answered, the account is still bound the same way and nothing stands against its consent. Once any answer from Enable Banking says a consent is over or an account has left it (a failed read, the consent status, a refresh), it is not read until it is seen in order again. See below. |
 
-### No answer cache in the gateway
+### No answer cache
 
 A draft of 0.7.0 had an opt-in cache of finished answers in the gateway. It was taken out before release: a kept
 answer could be returned after the session had stopped covering one of its accounts, and making that certain for
@@ -289,12 +291,15 @@ every tool was not a small change. The gateway now keeps no bank data between ca
 decided by that call alone. With `credentials.accounts`, listing accounts needs no read at the bank; a person who
 asks is not limited; and the budget keeps unattended reads within the bank's limit, so little is lost.
 
-The standalone server keeps its cache: it has no person to send details of, so every read it makes is a background
-read on the bank's four a day, and answering the same question twice from memory is what makes it usable. Its rule
-and every way it learns that a consent is over are in the README ("What the cache may answer") and in
-`test/standalone-authority.test.ts`.
+The standalone server had a short cache of the bank's answers per account; it was taken out too. No answer from
+the bank is kept between calls anywhere, not even briefly in memory, and the bank's limit on background reads is
+met by the unattended budget (`ENABLEBANKING_UNATTENDED_FETCHES_PER_DAY`). What the standalone server keeps in
+memory is what it learned about each consent (ended, or without an account) and a version of each consent's
+binding, raised by every withdrawal, refresh, replacement and revocation, so that a read or a refresh that was
+under way when it changed cannot return data or restore access. The rule and every way it learns that a consent is
+over are in the README ("Reads after a consent ended") and in `test/standalone-authority.test.ts`.
 
-A cache added to the gateway later must hold all of this, with a test for each:
+A cache added later must hold all of this, with a test for each:
 
 1. An answer is returned only if every account it holds is in the session's accounts as read on this call, and in
    the `accountIds` given with this call.

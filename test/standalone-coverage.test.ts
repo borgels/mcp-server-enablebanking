@@ -27,15 +27,15 @@ const bankReads = (api: ReturnType<typeof fakeApi>) => api.calls.filter(call => 
 const respond = (body: unknown, status: number) => new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
 
 describe('standalone reads', () => {
-  it('says when the bank was read, also for an answer from the cache', async () => {
+  it('says when the bank was read, and reads it again for every call: nothing is kept', async () => {
     let now = Date.parse('2026-11-24T10:00:00Z');
     const { bank, api } = await linked({ now: () => now });
     const first = await bank.balances('drift');
     now += 60_000;
     const second = await bank.balances('drift');
     expect(first.fetchedAt).toBe('2026-11-24T10:00:00.000Z');
-    expect(second.fetchedAt).toBe(first.fetchedAt);
-    expect(bankReads(api)).toHaveLength(1);
+    expect(second.fetchedAt).toBe('2026-11-24T10:01:00.000Z');
+    expect(bankReads(api)).toHaveLength(2);
     expect(first.balances[0]).toMatchObject({ code: 'CLBD', amount: '1234.50', currency: 'DKK', referenceDate: '2026-10-01' });
     expect(first.balances[0]!.type).toMatch(/^CLBD — closing booked/);
   });
@@ -144,8 +144,8 @@ describe('standalone reads', () => {
       { account: 'skat', read: true, lines: 3, matches: 1, complete: true },
     ]);
     expect(found.transactions.map(line => line.account)).toEqual(['drift', 'skat']);
-    // drift was already read for the summary: one more read at the bank for skat (two pages).
-    expect(api.calls.filter(call => call.path.includes('/transactions'))).toHaveLength(4);
+    // Nothing is kept between calls: drift is read again for the search, and skat too (two pages each).
+    expect(api.calls.filter(call => call.path.includes('/transactions'))).toHaveLength(6);
 
     await expect(bank.search(period)).rejects.toThrow(/at least one of search/);
     // An account of another company stops the search before anything is read.
@@ -197,16 +197,15 @@ describe('standalone reads', () => {
 
 describe('standalone limits and errors', () => {
   it('keeps a daily budget of reads only when one is configured', async () => {
-    const { bank, api } = await linked({ unattendedFetchesPerDay: 2, cacheSeconds: 300 });
+    const { bank, api } = await linked({ unattendedFetchesPerDay: 2 });
     await bank.balances('drift');
-    await bank.balances('drift'); // from the cache: free
     await bank.balances('skat');
     const refused = await bank.details('drift').catch((error: unknown) => error);
     expect(problemOf(refused)).toBe('unattended_limit');
     expect((refused as Error).message).toMatch(/only 2 automatic read\(s\) a day/);
     expect(bankReads(api)).toHaveLength(2);
 
-    const unlimited = await linked({ cacheSeconds: 0 });
+    const unlimited = await linked();
     for (let i = 0; i < 6; i += 1) await unlimited.bank.balances('drift');
     expect(bankReads(unlimited.api)).toHaveLength(6);
     expect(loadConfig({ ENABLEBANKING_COMPANY: 'aaa' }).unattendedFetchesPerDay).toBe(0);
@@ -223,7 +222,7 @@ describe('standalone limits and errors', () => {
       [422, 'WRONG_TRANSACTIONS_PERIOD', 'period_not_available', /90 days/],
     ] as const) {
       const api = fakeApi({ 'GET /accounts/[^/]+/(balances|transactions)': () => respond(vendor ? { error: vendor, message: 'made-up vendor text' } : {}, status) });
-      const { bank } = await linked({ api, cacheSeconds: 0 });
+      const { bank } = await linked({ api });
       const error = await (problem === 'period_not_available' ? bank.transactions('drift', {}) : bank.balances('drift')).catch((e: unknown) => e);
       expect(problemOf(error), `${status} ${vendor}`).toBe(problem);
       expect((error as Error).message).toMatch(message);
@@ -365,11 +364,10 @@ describe('standalone: what the review of 0.7.0 found', () => {
     expect(bankReads(api)).toHaveLength(1);
   });
 
-  it('serves nothing from its cache once Enable Banking says the consent is gone', async () => {
+  it('reads nothing more once Enable Banking says the consent is gone', async () => {
     let gone = false;
     const api = fakeApi({ 'GET /accounts/[^/]+/details': () => (gone ? respond({ error: 'REVOKED_SESSION' }, 401) : undefined) });
-    const { bank } = await linked({ api, cacheSeconds: 300 });
-    await bank.balances('drift');
+    const { bank } = await linked({ api });
     await bank.balances('drift');
     const reads = bankReads(api).filter(call => call.path.endsWith('/balances'));
     expect(reads).toHaveLength(1);
@@ -377,8 +375,8 @@ describe('standalone: what the review of 0.7.0 found', () => {
     gone = true;
     const lost = await bank.details('skat').catch((error: unknown) => error);
     expect(problemOf(lost)).toBe('consent_revoked');
-    // The balance read a moment ago is not repeated from memory, and the bank is not asked under a consent that
-    // is over (test/standalone-authority.test.ts has every way the server can learn it).
+    // The bank is not asked under a consent that is over (test/standalone-authority.test.ts has every way the
+    // server can learn it).
     const refused = await bank.balances('drift').catch((error: unknown) => error);
     expect(problemOf(refused)).toBe('consent_revoked');
     expect(bankReads(api).filter(call => call.path.endsWith('/balances'))).toHaveLength(1);

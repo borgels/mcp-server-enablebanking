@@ -64,15 +64,16 @@ describe('numeric configuration', () => {
     expect(() => loadConfig({ ENABLEBANKING_COMPANY: 'aaa', ENABLEBANKING_TIMEOUT_MS: 'abc' })).toThrow(
       /ENABLEBANKING_TIMEOUT_MS/,
     );
-    expect(() => loadConfig({ ENABLEBANKING_COMPANY: 'aaa', ENABLEBANKING_CACHE_SECONDS: '5m' })).toThrow(
-      /ENABLEBANKING_CACHE_SECONDS/,
+    expect(() => loadConfig({ ENABLEBANKING_COMPANY: 'aaa', ENABLEBANKING_UNATTENDED_FETCHES_PER_DAY: '4x' })).toThrow(
+      /ENABLEBANKING_UNATTENDED_FETCHES_PER_DAY/,
     );
   });
 
   it('keeps defaults for unset values and clamps out-of-range integers', () => {
-    expect(loadConfig({ ENABLEBANKING_COMPANY: 'aaa' })).toMatchObject({ timeoutMs: 30_000, cacheSeconds: 300 });
+    expect(loadConfig({ ENABLEBANKING_COMPANY: 'aaa' })).toMatchObject({ timeoutMs: 30_000, unattendedFetchesPerDay: 0 });
     expect(loadConfig({ ENABLEBANKING_COMPANY: 'aaa', ENABLEBANKING_TIMEOUT_MS: '10' }).timeoutMs).toBe(1_000);
-    expect(loadConfig({ ENABLEBANKING_COMPANY: 'aaa', ENABLEBANKING_CACHE_SECONDS: '0' }).cacheSeconds).toBe(0);
+    // The answer cache is gone: a setting left over from earlier versions is not read.
+    expect(loadConfig({ ENABLEBANKING_COMPANY: 'aaa', ENABLEBANKING_CACHE_SECONDS: '300' })).not.toHaveProperty('cacheSeconds');
   });
 });
 

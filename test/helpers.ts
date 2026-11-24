@@ -143,7 +143,6 @@ export function makeBank(options: {
   registry?: unknown;
   dataDir?: string;
   now?: () => number;
-  cacheSeconds?: number;
   unattendedFetchesPerDay?: number;
 } = {}) {
   const api = options.api ?? fakeApi();
@@ -155,7 +154,6 @@ export function makeBank(options: {
     registry: new AccountRegistry(options.registry ?? REGISTRY),
     store: new SessionStore(company, dataDir, MASTER_KEY),
     redirectUrl: 'https://consent.example.com/bank-consent',
-    cacheSeconds: options.cacheSeconds ?? 300,
     unattendedFetchesPerDay: options.unattendedFetchesPerDay,
     now: options.now,
   });
