@@ -80,8 +80,10 @@ export type EnableBankingPsu = PsuPresence;
  *   read, and the gateway keeps no budget. A host should say one or the other.
  *
  * Anything malformed (null, an empty or unknown `psu`, a value with a line break or another control character, both
- * at once) is refused, never read as "nobody is present". The values of `psu` are removed from the result of the
- * call, so a bank that repeats them cannot hand them on.
+ * at once) is refused, never read as "nobody is present". The values of `psu` are removed from the finished result
+ * of the call, so a bank that repeats them does not hand them on: the address and the location always, the other
+ * fields best effort and from 8 characters. It guards against an echo; it is no promise of anonymity (README, "Who
+ * is present").
  */
 export interface GatewayCallContext {
   caller?: string;

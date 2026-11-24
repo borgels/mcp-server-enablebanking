@@ -7,7 +7,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { createEnableBankingGateway, type GatewayCallContext } from '../src/gateway.js';
 import { FRAGMENT_LENGTH } from '../src/gateway/redact.js';
-import { KEY } from './helpers.js';
+import { KEY, dkIban } from './helpers.js';
 
 const PEM = KEY.privateKey.export({ type: 'pkcs8', format: 'pem' }).toString();
 const CONTENT = PEM.replace(/-----(BEGIN|END) [A-Z ]*-----/g, '').replace(/\s+/g, '');
@@ -642,6 +642,9 @@ describe('round 12', () => {
 });
 
 describe('identification hashes', () => {
+  // Invented: an account number of zeros with a checksum worked out here, and a name nobody has.
+  const MADE_UP_IBAN = dkIban('0'.repeat(14));
+  const MADE_UP_OWNER = 'Made-up Owner (invented)';
   const HASH = 'WwUJU8ZJw2Xy0rFdrDFBF2tV3+sRuI3qPk4ZdHs/fTI=.zQx6z2rN4qkc9u1D4TfjtWAeFqa+X7LrV7K0J6P5jVZtnF8KfE';
   const session = (hash: string) => ({
     session_id: SESSION,
@@ -649,7 +652,7 @@ describe('identification hashes', () => {
     aspsp: { name: 'Opdigtet Bank', country: 'DK' },
     access: { valid_until: '2099-01-01T00:00:00Z' },
     accounts: [ACCOUNT],
-    accounts_data: [{ uid: ACCOUNT, identification_hash: hash, iban: 'DK5000400440116243', owner: 'Lund VVS ApS', extra: { nested: HASH } }],
+    accounts_data: [{ uid: ACCOUNT, identification_hash: hash, iban: MADE_UP_IBAN, owner: MADE_UP_OWNER, extra: { nested: HASH } }],
   });
 
   it('carries no piece of the key in a hash, and nothing else of accounts_data', async () => {
@@ -671,7 +674,9 @@ describe('identification hashes', () => {
       }
     }
     expect(leaks(answers)).toEqual([]);
-    expect(JSON.stringify(answers)).not.toMatch(/Lund VVS|DK5000400440116243|nested/);
+    expect(JSON.stringify(answers)).not.toMatch(/nested/);
+    expect(JSON.stringify(answers)).not.toContain(MADE_UP_IBAN);
+    expect(JSON.stringify(answers)).not.toContain('Made-up Owner');
   });
 
   it('gives the hash to the consent helpers and keeps it out of the list_accounts answer', async () => {

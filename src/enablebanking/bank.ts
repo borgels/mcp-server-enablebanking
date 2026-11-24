@@ -1,7 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import { EnableBankingHttpError, formatUnknownError } from '../errors.js';
 import { budgetRefusal, UnattendedBudget } from './budget.js';
-import type { AccountResource, Aspsp, EnableBankingClient, TransactionResource } from './client.js';
+import type { AccountResource, Aspsp, EnableBankingClient, SessionStatus, TransactionResource } from './client.js';
 import { parseDecimal } from './decimal.js';
 import {
   accountDetailsView,
@@ -16,7 +16,7 @@ import {
   type LineFilter,
   type TransactionView,
 } from './format.js';
-import { problemOf, ProblemError, type ProblemCode } from './problems.js';
+import { problemFromSessionStatus, problemOf, ProblemError, type ProblemCode } from './problems.js';
 import { maskIban, normalizeIban, type AccountRegistry, type Company, type RegisteredAccount } from './registry.js';
 import type { BoundAccount, ConsentState, ExcludedAccount, SessionStore, StoredSession } from './store.js';
 
@@ -104,15 +104,46 @@ function filterAmount(value: number | string | undefined, name: string) {
 
 /**
  * The company boundary in one place. Every read goes through `linked()`,
- * which checks the registry (now, not at consent time) and the consent
- * expiry before an account uid is ever handed to the client.
+ * which checks the registry (now, not at consent time), the consent expiry
+ * and what this server has learned about the consent since it was stored,
+ * before an account uid is ever handed to the client or the cache.
+ *
+ * The invariant of the cache and of read access:
+ *
+ *   An answer is served, from memory or from the bank, only for an account
+ *   whose consent this server has no word against. The moment any answer
+ *   from Enable Banking says a consent is over, or that an account has left
+ *   it, everything read under it is dropped and reads of it are refused
+ *   here, until Enable Banking shows it in order again or a new consent is
+ *   completed.
+ *
+ * Every way this server can learn it ends in `withdraw` or `withdrawAccount`:
+ * - a read at the bank that fails with an ended consent or a missing account
+ *   (`call`), from any tool;
+ * - the consent status tool: an error for the session, a status that is not
+ *   AUTHORIZED, a date that has passed, an account no longer listed
+ *   (`learn`);
+ * - refreshing a consent: the same, before anything is bound (`learn`);
+ * - revoking or replacing a consent here (`forget`);
+ * - the bank answering with another account than the registered one.
+ * A refusal that speaks of the application or of access in general, not of
+ * the consent, empties the cache and leaves read access as it is.
+ *
+ * What it cannot cover: a consent ended at the bank that nobody has asked
+ * Enable Banking about yet. Until the next read at the bank or the next look
+ * at the consent status, an answer read before that can be repeated for up to
+ * the cache time (ENABLEBANKING_CACHE_SECONDS; 0 turns the cache off).
  */
 export class Bank {
   readonly company: string;
   private readonly client: EnableBankingClient;
   private readonly registry: AccountRegistry;
   private readonly store: SessionStore;
-  private readonly cache = new Map<string, { expires: number; fetchedAt: string; value: unknown }>();
+  private readonly cache = new Map<string, { expires: number; fetchedAt: string; value: unknown; uid: string }>();
+  /** Consents (by session id) Enable Banking no longer honours, with why. In memory, like the cache. */
+  private readonly lostConsents = new Map<string, ProblemCode>();
+  /** Accounts (by the bank's uid) that have left their consent, with why. */
+  private readonly lostAccounts = new Map<string, ProblemCode>();
   private readonly cacheMs: number;
   private readonly budget: UnattendedBudget;
   private readonly now: () => number;
@@ -145,6 +176,9 @@ export class Bank {
       accounts: company.accounts.map(account => {
         const session = sessions.find(candidate => candidate.accounts.some(bound => bound.iban === account.iban));
         const expiresInDays = session ? Math.floor((Date.parse(session.validUntil) - now) / DAY_MS) : null;
+        const uid = session?.accounts.find(bound => bound.iban === account.iban)?.uid;
+        // What this server has learned since the consent was stored: ended, or without this account.
+        const ended = session !== undefined && (this.lostConsents.has(session.sessionId) || (uid !== undefined && this.lostAccounts.has(uid)));
         return {
           id: account.id,
           iban: account.iban,
@@ -153,7 +187,7 @@ export class Bank {
           // The registry's currency, else what the bank said when the consent was bound. Never assumed.
           currency: account.currency ?? session?.accounts.find(bound => bound.iban === account.iban)?.currency ?? null,
           ledgerAccount: account.ledgerAccount ?? null,
-          status: !session ? 'no_consent' : expiresInDays !== null && expiresInDays < 0 ? 'consent_expired' : 'linked',
+          status: !session ? 'no_consent' : expiresInDays !== null && expiresInDays < 0 ? 'consent_expired' : ended ? 'consent_ended' : 'linked',
           consentValidUntil: session?.validUntil ?? null,
           consentExpiresInDays: expiresInDays,
         };
@@ -190,21 +224,46 @@ export class Bank {
       );
     }
     const bound = session.accounts.find(candidate => candidate.iban === account.iban)!;
-    return { account, session, uid: bound.uid };
+    const link = { account, session, uid: bound.uid };
+    this.standing(link);
+    return link;
+  }
+
+  /** Throws when this server has learned that the consent is over or that the account has left it. */
+  private standing(link: LinkedAccount): void {
+    const { account, session } = link;
+    const lost = this.lostConsents.get(session.sessionId);
+    if (lost) {
+      throw new ConsentError(
+        `Enable Banking no longer honours the ${session.aspsp.name} consent for ${this.companyInfo().name}. ` +
+          'An administrator must renew it with enablebanking_start_consent; enablebanking_get_consent_status shows how it stands now.',
+        lost,
+      );
+    }
+    const gone = this.lostAccounts.get(link.uid);
+    if (gone) {
+      throw new ConsentError(
+        `${account.name} (${maskIban(account.iban)}) is no longer part of the ${session.aspsp.name} consent for ${this.companyInfo().name}. ` +
+          'An administrator must renew the consent with enablebanking_start_consent; enablebanking_get_consent_status shows how it stands now.',
+        gone,
+      );
+    }
   }
 
   async balances(reference: string) {
     const link = this.linked(reference);
-    const read = await this.cached(`balances:${link.uid}`, () => this.call(link, () => this.client.getBalances(link.uid)));
+    const read = await this.cached(link, `balances:${link.uid}`, () => this.call(link, () => this.client.getBalances(link.uid)));
     return { account: accountHeader(link), fetchedAt: read.fetchedAt, balances: read.value.map(balanceView) };
   }
 
   async details(reference: string) {
     const link = this.linked(reference);
-    const read = await this.cached(`details:${link.uid}`, () => this.call(link, () => this.client.getAccountDetails(link.uid)));
+    const read = await this.cached(link, `details:${link.uid}`, () => this.call(link, () => this.client.getAccountDetails(link.uid)));
     // Belt and braces: the bank must still say this uid is the registered IBAN.
     const iban = ibanOf(read.value);
     if (iban && iban !== link.account.iban) {
+      // What was read under this uid is not this company's account: nothing of it is served again.
+      this.withdrawAccount(link.uid, 'account_not_connected');
       throw new ConsentError('the bank returned a different account than the one registered; refusing to show it', 'account_not_connected');
     }
     return { account: accountHeader(link), fetchedAt: read.fetchedAt, details: accountDetailsView(read.value) };
@@ -229,7 +288,7 @@ export class Bank {
 
   /** Every line of a period as the bank gave it, read once and kept for the cache time. */
   private async lines(link: LinkedAccount, period: ReturnType<Bank['period']>) {
-    const read = await this.cached(`tx:${link.uid}:${period.from ?? ''}:${period.to ?? ''}:${period.status}:${period.strategy}`, () =>
+    const read = await this.cached(link, `tx:${link.uid}:${period.from ?? ''}:${period.to ?? ''}:${period.status}:${period.strategy}`, () =>
       this.call(link, () =>
         this.client.listTransactions(link.uid, {
           ...(period.from ? { dateFrom: period.from } : {}),
@@ -294,6 +353,7 @@ export class Bank {
   async transactionDetails(reference: string, transaction: string) {
     const link = this.linked(reference);
     const raw = await this.call(link, () => this.client.getTransaction(link.uid, transaction));
+    this.standing(link);
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
       throw new ProblemError('transaction_not_found', 'The bank has no further details for that transaction.');
     }
@@ -387,7 +447,10 @@ export class Bank {
         accounts: company.accounts.filter(account => session.accounts.some(bound => bound.iban === account.iban)).map(account => account.id),
       };
       try {
-        const status = await this.client.getSession(session.sessionId);
+        const status = await this.sessionAt(session);
+        // What the answer says about the consent is acted on before it is shown: an ended consent, and an account
+        // that has left it, is no longer read or served from memory.
+        this.learn(session, status, now);
         const covered = new Set(Array.isArray(status.accounts) ? status.accounts : []);
         const validUntil = typeof status.access?.valid_until === 'string' ? status.access.valid_until : session.validUntil;
         const until = Date.parse(validUntil);
@@ -558,10 +621,11 @@ export class Bank {
       excluded: binding.excluded,
     };
     const replaced = this.store.upsert(session);
+    if (replaced) this.forget(replaced);
     if (replaced && replaced.sessionId !== session.sessionId) {
       await this.client.deleteSession(replaced.sessionId).catch(() => undefined);
     }
-    this.cache.clear();
+    this.forget(session);
     return { report: this.report(state.aspsp.name, session.validUntil, binding), user: state.user };
   }
 
@@ -573,10 +637,24 @@ export class Bank {
   async refreshConsent(consent: string): Promise<BindingReport> {
     const session = this.store.sessions().find(candidate => candidate.key === consent);
     if (!session) throw new ConsentError(`no consent "${consent}"; see enablebanking_list_accounts`);
-    const status = await this.client.getSession(session.sessionId);
+    const status = await this.sessionAt(session);
+    // Nothing is bound to a consent Enable Banking no longer honours.
+    const problem = this.learn(session, status, this.now());
+    if (problem) {
+      throw new ConsentError(
+        `Enable Banking no longer honours the ${session.aspsp.name} consent for ${this.companyInfo().name}. ` +
+          'An administrator must renew it with enablebanking_start_consent.',
+        problem,
+      );
+    }
     const details: AccountResource[] = [];
-    for (const uid of status.accounts ?? []) {
-      details.push({ ...(await this.client.getAccountDetails(uid)), uid });
+    for (const uid of Array.isArray(status.accounts) ? status.accounts : []) {
+      try {
+        details.push({ ...(await this.client.getAccountDetails(uid)), uid });
+      } catch (error) {
+        this.failed(session, uid, error);
+        throw error;
+      }
     }
     const binding = this.bind(details);
     this.store.upsert({
@@ -585,7 +663,8 @@ export class Bank {
       accounts: binding.bound,
       excluded: binding.excluded,
     });
-    this.cache.clear();
+    // The binding is new: what was read under the old one is dropped, and it starts without a word against it.
+    this.forget(session);
     return this.report(session.aspsp.name, status.access?.valid_until ?? session.validUntil, binding);
   }
 
@@ -601,7 +680,7 @@ export class Bank {
       revokedAtBank = error instanceof EnableBankingHttpError && error.consentLost;
     }
     this.store.remove(consent);
-    this.cache.clear();
+    this.forget(session);
     return { consent, bank: session.aspsp.name, removed: true, revokedAtBank };
   }
 
@@ -659,9 +738,9 @@ export class Bank {
     try {
       return await fn();
     } catch (error) {
+      // What the failure says about the consent or the account is acted on first, whatever tool asked.
+      this.failed(link.session, link.uid, error);
       if (error instanceof EnableBankingHttpError && error.consentLost) {
-        // Nothing read under a consent is served once Enable Banking says the consent is gone.
-        this.cache.clear();
         throw new ConsentError(
           `${link.session.aspsp.name} refused the consent for ${this.companyInfo().name} (${error.message}). ` +
             'It may have been revoked at the bank or expired; an administrator must renew it with enablebanking_start_consent.',
@@ -674,33 +753,108 @@ export class Bank {
     }
   }
 
+  // ------------------------------------------------------- what was learned
+
+  /** The session as Enable Banking holds it. A failure that says the consent is over is acted on before it is thrown. */
+  private async sessionAt(session: StoredSession): Promise<SessionStatus> {
+    try {
+      return await this.client.getSession(session.sessionId);
+    } catch (error) {
+      this.failed(session, undefined, error);
+      throw error;
+    }
+  }
+
+  /**
+   * Acts on what Enable Banking answered for a session. Returns the problem
+   * when the consent is over, undefined while it is authorised and in date.
+   * Then the accounts it no longer lists are withdrawn one by one, and the
+   * rest stand without a word against them again.
+   */
+  private learn(session: StoredSession, status: SessionStatus | undefined, now: number): ProblemCode | undefined {
+    const state = typeof status?.status === 'string' ? status.status : undefined;
+    const until = typeof status?.access?.valid_until === 'string' ? Date.parse(status.access.valid_until) : Number.NaN;
+    const problem = state !== 'AUTHORIZED' ? problemFromSessionStatus(state) : until <= now ? 'consent_expired' : undefined;
+    if (problem) {
+      this.withdraw(session, problem);
+      return problem;
+    }
+    this.lostConsents.delete(session.sessionId);
+    // An answer without a list of accounts covers none.
+    const covered = new Set(Array.isArray(status?.accounts) ? status.accounts : []);
+    for (const bound of session.accounts) {
+      if (covered.has(bound.uid)) this.lostAccounts.delete(bound.uid);
+      else this.withdrawAccount(bound.uid, 'account_not_in_consent');
+    }
+    return undefined;
+  }
+
+  /** Acts on a failed request at Enable Banking, for a consent and (when the request was for one) an account. */
+  private failed(session: StoredSession, uid: string | undefined, error: unknown): void {
+    const problem = problemOf(error);
+    if (problem === 'consent_expired' || problem === 'consent_revoked' || problem === 'consent_not_active') {
+      this.withdraw(session, problem);
+    } else if (problem === 'account_not_in_consent') {
+      if (uid === undefined) this.withdraw(session, problem);
+      else this.withdrawAccount(uid, problem);
+    } else if (problem === 'account_not_accessible' && uid !== undefined) {
+      // The bank refuses this account now. It is asked again next time; nothing read earlier answers for it.
+      this.drop(new Set([uid]));
+    } else if (problem === 'access_refused' || problem === 'application_refused' || problem === 'application_restricted') {
+      // The application itself was refused: nothing read earlier is served, and every read asks again.
+      this.cache.clear();
+    }
+  }
+
+  /** The consent is over: nothing read under it is served, and it is not read, until it is seen in order again. */
+  private withdraw(session: StoredSession, problem: ProblemCode): void {
+    this.lostConsents.set(session.sessionId, problem);
+    this.drop(new Set(session.accounts.map(bound => bound.uid)));
+  }
+
+  /** The account has left its consent: nothing read from it is served, and it is not read. */
+  private withdrawAccount(uid: string, problem: ProblemCode): void {
+    this.lostAccounts.set(uid, problem);
+    this.drop(new Set([uid]));
+  }
+
+  /** A consent stored anew, replaced or removed here: what was read under it is dropped, and so is what was held against it. */
+  private forget(session: StoredSession): void {
+    this.lostConsents.delete(session.sessionId);
+    for (const bound of session.accounts) this.lostAccounts.delete(bound.uid);
+    // Bindings changed: nothing read under any earlier binding is kept.
+    this.cache.clear();
+  }
+
+  private drop(uids: Set<string>): void {
+    for (const [key, entry] of this.cache) if (uids.has(entry.uid)) this.cache.delete(key);
+  }
+
   /**
    * Short cache per account and query. Banks may cap reads that the account
    * holder is not present for (PSD2: as few as 4 per account per day), so the
    * same question asked twice in a conversation must not cost two bank calls.
    *
-   * What keeps a cached answer within its authority:
-   * - Every key starts with the bank's uid of one account in one stored
-   *   consent, and a caller only gets a uid from `linked()`, which resolves
-   *   the account through this company's registry and stored consent on every
-   *   call. An account taken out of the registry, and a consent past its
-   *   date, is refused before the cache is looked at.
-   * - A new consent has new uids, so answers of an old one cannot be reached.
-   *   The cache is also emptied whenever a consent is completed, refreshed or
-   *   revoked here, and when Enable Banking answers that a consent is gone.
+   * It stands under the invariant at the top of this class:
+   * - A caller gets here only with a link from `linked()`, made on this call:
+   *   the registry, the stored consent, its date and what was learned about
+   *   it are checked before the cache is looked at.
+   * - Every entry belongs to one account (the bank's uid in one consent) and
+   *   is dropped with it. A new consent has new uids.
    * - What is kept is what the bank answered for that account (balances,
-   *   details, lines of a period), never a finished tool answer, so a tool
-   *   reads only its own kind of data. An error is never kept.
-   * - Not covered: a consent revoked at the bank is noticed at the next read
-   *   at the bank, so an earlier answer can be repeated for up to cacheMs.
+   *   details, lines of a period), never a finished tool answer. An error is
+   *   never kept. An answer that arrives after its consent or account was
+   *   withdrawn, while the bank was being read, is neither kept nor served.
    */
-  private async cached<T>(key: string, load: () => Promise<T>): Promise<{ value: T; fetchedAt: string }> {
+  private async cached<T>(link: LinkedAccount, key: string, load: () => Promise<T>): Promise<{ value: T; fetchedAt: string }> {
     const hit = this.cacheMs > 0 ? this.cache.get(key) : undefined;
     if (hit && hit.expires > this.now()) return { value: hit.value as T, fetchedAt: hit.fetchedAt };
     const value = await load();
+    // Another call may have learned, while this one waited for the bank, that the consent is over.
+    this.standing(link);
     // When the bank was read: an answer from the cache says how old it is.
     const fetchedAt = new Date(this.now()).toISOString();
-    if (this.cacheMs > 0) this.cache.set(key, { expires: this.now() + this.cacheMs, fetchedAt, value });
+    if (this.cacheMs > 0) this.cache.set(key, { expires: this.now() + this.cacheMs, fetchedAt, value, uid: link.uid });
     return { value, fetchedAt };
   }
 }

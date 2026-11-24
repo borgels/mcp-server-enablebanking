@@ -368,7 +368,6 @@ function buildEnableBankingGateway(options: EnableBankingGatewayOptions) {
   const now = options.now ?? Date.now;
   // Where each issued page token continues; never leaves the instance.
   const pages = new PageTokens(now);
-  // Finished answers, only when the host asked for it (default: nothing is kept).
   // Reads made with nobody present, per consent.
   const budget = new UnattendedBudget(
     boundedInt(options.unattendedFetchesPerDay, DEFAULT_UNATTENDED_FETCHES_PER_DAY, 0, 1_000, 'unattendedFetchesPerDay'),
@@ -479,8 +478,9 @@ function buildEnableBankingGateway(options: EnableBankingGatewayOptions) {
       }
       // The details of the person present go to the bank and nowhere else: whatever a bank answers, they are removed
       // from the result and from every error text of this call. The address and the location always (their shape is
-      // checked); the free-text values like any other value this gateway removes, from MIN_SECRET_LENGTH characters,
-      // so that a browser name of a few letters cannot blank the same word in a bank line.
+      // checked), also in another spelling that says the same; the free-text values like any other value this
+      // gateway removes, from MIN_SECRET_LENGTH characters, so that a browser name of a few letters cannot blank the
+      // same word in a bank line. What this does and does not promise is in the README ("Who is present").
       let presence: Presence | { kind: 'refused'; reason: string };
       try {
         presence = callPresence(context);
@@ -489,7 +489,8 @@ function buildEnableBankingGateway(options: EnableBankingGatewayOptions) {
       }
       if (presence.kind === 'present') {
         for (const [header, value] of Object.entries(presence.headers)) {
-          if (header === PSU_HEADER_NAMES.ipAddress || header === PSU_HEADER_NAMES.geoLocation) callRedactor.addExact(value);
+          if (header === PSU_HEADER_NAMES.ipAddress) callRedactor.addAddress(value);
+          else if (header === PSU_HEADER_NAMES.geoLocation) callRedactor.addLocation(value);
           else callRedactor.add(value);
         }
       }
@@ -788,8 +789,11 @@ function buildEnableBankingGateway(options: EnableBankingGatewayOptions) {
       });
 
     // Nobody present: the read is taken from the day's budget for this consent, or refused before anything is sent.
+    // A continued page takes nothing from the budget (it belongs to the read that started the listing), but it is a
+    // request to the bank all the same: the pause after the bank's rate limit holds for it like for any other.
     const reads = bankReads(call, credentials, consent);
-    if (presence.kind === 'unattended' && reads > 0) {
+    const continued = call.tool === 'list_transactions' && call.pageToken !== undefined;
+    if (presence.kind === 'unattended' && (reads > 0 || continued)) {
       const decision = budget.take(credentials.sessionId, reads);
       if (!decision.ok) return errorResult(budgetRefusal(decision), undefined, 'unattended_limit');
     }

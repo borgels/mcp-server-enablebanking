@@ -53,7 +53,7 @@ describe('tool surface', () => {
     const client = await connect({});
     const listed = await client.callTool({ name: 'enablebanking_list_accounts', arguments: {} });
     const body = JSON.parse((listed.content as Array<{ text: string }>)[0]!.text);
-    expect(body.company).toEqual({ code: 'aaa', name: 'Alfa Drift ApS', cvr: '12345678' });
+    expect(body.company).toEqual({ code: 'aaa', name: 'Opdigtet Alfa ApS', cvr: '12345678' });
     expect(body.accounts.map((a: { id: string; status: string }) => `${a.id}:${a.status}`)).toEqual(['drift:no_consent', 'skat:no_consent']);
     const balances = await client.callTool({ name: 'enablebanking_get_balances', arguments: { account: 'drift' } });
     expect(balances.isError).toBe(true);

@@ -113,17 +113,32 @@ reads the accounts without signing in at the bank themselves, until the consent 
   a model, not a browser, so it has no details of a person to send and never invents any: every read it makes is a
   background read. Answers are cached per account and query (`ENABLEBANKING_CACHE_SECONDS`, default 300; 0 turns
   the cache off), listing accounts and reading the consent status cost no read at the bank, and the instructions
-  ask the model to fetch a period in one call. The cache holds what the bank answered for one account of one
-  consent, in memory only. It is reached only after the account has been resolved through the registry and the
-  stored consent of this company on that call, so an account taken out of the registry, and a consent past its
-  date, is refused before the cache is looked at. It is emptied when a consent is completed, refreshed or revoked,
-  and when Enable Banking answers that a consent is gone. A consent revoked at the bank is not noticed until the
-  next read at the bank, so an answer read before the revocation can be repeated for up to the cache's seconds;
-  set it to 0 where that is not acceptable. `ENABLEBANKING_UNATTENDED_FETCHES_PER_DAY` (default 0: off) sets a budget of reads at the
+  ask the model to fetch a period in one call. `ENABLEBANKING_UNATTENDED_FETCHES_PER_DAY` (default 0: off) sets a budget of reads at the
   bank per consent in any 24 hours; when it is used up, a call is refused with `unattended_limit` and the time of
   the next possible read, instead of being sent and refused by the bank.
 - **The bank's own limit.** `rate_limited` with `retryAfterSeconds: 21600`: Enable Banking recommends waiting six
   hours. A search stops at the first account the bank limits and does not ask for the rest.
+- **What the cache may answer.** The cache is why this server can answer the same question twice on a bank's four
+  reads a day; it is kept for that, and it stands under one rule: *an answer is served, from memory or from the
+  bank, only for an account whose consent this server has no word against.* It holds what the bank answered for
+  one account of one consent, in memory only, and is reached only after the account has been resolved through the
+  registry and the stored consent of this company on that call. The moment any answer from Enable Banking says a
+  consent is over, or that an account has left it, everything read under it is dropped and reads of it are
+  refused here (`consent_revoked`, `consent_expired`, `consent_not_active`, `account_not_in_consent`), until
+  Enable Banking shows it in order again or a new consent is completed. The server learns it from:
+  - a read at the bank that fails with an ended consent or a missing account, from any tool;
+  - `enablebanking_get_consent_status`: an error for the session, a status other than `AUTHORIZED`, a date that
+    has passed, an account the session no longer lists;
+  - `enablebanking_refresh_consent`: the same, before anything is bound;
+  - `enablebanking_revoke_consent`, and a consent replaced by a new one;
+  - the bank answering with another account than the registered one.
+
+  A refusal of the application itself (`application_refused`, `application_restricted`, `access_refused`) empties
+  the cache and leaves read access as it is. `enablebanking_list_accounts` shows an account the server has such
+  word against as `consent_ended`. What the rule cannot cover: a consent ended at the bank that nobody has asked
+  Enable Banking about yet. Until the next read at the bank or the next look at the consent status, an answer read
+  before that can be repeated for up to the cache's seconds; `ENABLEBANKING_CACHE_SECONDS=0` turns the cache off,
+  and every read then goes to the bank. Each way of learning has a test in `test/standalone-authority.test.ts`.
 - **History.** Many banks give the full history only for about an hour after the sign-in and the last 90 days
   after that; a period the bank does not give is `period_not_available`.
 - **Consents are time-limited** (often 180 days at most). `enablebanking_list_accounts` and
@@ -367,8 +382,10 @@ if (result.isError) {
     request. After a `rate_limited` answer from the bank, unattended reads of
     that consent pause for six hours; also when the limit shows up inside an
     answer, as when a search could read one account and not the next (the
-    remaining accounts are then not asked). The budget lives in the memory of
-    the gateway instance.
+    remaining accounts are then not asked). The pause holds for every
+    unattended call that would reach the bank, the next page of a listing
+    (`pageToken`) included, although a next page takes nothing from the
+    budget. The budget lives in the memory of the gateway instance.
   - Neither: no header and no budget, as before 0.7.0.
   - Both, or a malformed statement: refused with `presence_incomplete`
     before any request, never turned into a background read. Malformed is
@@ -381,14 +398,33 @@ if (result.isError) {
     IPv4 or IPv6 address of at least 7 characters, `geoLocation`
     "latitude,longitude". Only a field that is not there (or is
     `undefined`) means "not said"; `unattended` must be a boolean.
-  - The person's details go to the bank and nowhere else. They are removed
-    from the result and from every error text of the call, whole, in their
-    raw, URL-encoded and JSON-escaped forms, so a bank that repeats what it
-    was sent cannot hand a person's address, browser or location on to a
-    model: `ipAddress` and `geoLocation` always, the other values from 8
-    characters (a browser name of a few letters or a two-letter language
-    identifies nobody, and removing it would blank the same word in a bank
-    line).
+  - The person's details are sent to the bank and removed from what the
+    call returns, so a bank that repeats what it was sent does not hand a
+    person's address or location on to a model. The removal is done last,
+    on the finished result and on every error text, after the gateway's own
+    joining and spacing of the bank's texts. What it promises, and no more:
+    - `ipAddress` and `geoLocation`: always removed, from every text and
+      every key of the result, wherever the value stands whole. Also when it
+      is percent-encoded (upper- or lower-case hex, any characters, `+` for
+      a space), escaped as in JSON, JavaScript or HTML, or any of these
+      inside another up to three layers. Also in another spelling that says
+      the same: an IPv6 address in upper case, written out in full or
+      shortened differently, an IPv4 address as an IPv4-mapped IPv6 address,
+      coordinates with other trailing zeros or with a space or a semicolon
+      between them.
+    - The other fields (`userAgent`, `referer` and the `accept` fields):
+      best effort. A value of 8 characters or more is removed where it
+      stands whole, in the same encodings and with any whitespace between
+      its words. A shorter value is left in: a browser name of a few
+      letters or a two-letter language would blank the same word in the
+      bank's own lines.
+    - Not removed, for any field: a value the bank has changed (cut short,
+      rounded, in other letter case, re-ordered, hashed, translated, or in
+      an encoding not listed above) or cut up over several fields that the
+      result shows apart.
+    - It is a guard against an echo, not anonymity: what a bank writes
+      about a payment can identify a person in other ways, and that text
+      is the answer.
 - **Listing accounts without a read at the bank.** With
   `credentials.accounts` (`{ id, name?, maskedIban?, currency?, product?, identification? }`
   per account, as `completeSession` returned them), `list_accounts` answers

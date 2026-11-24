@@ -45,7 +45,7 @@ describe('standalone reads', () => {
       'GET /accounts/[^/]+/details': () => ({
         account_id: { iban: IBAN.aaaDrift },
         all_account_ids: [{ identification: '54700001234567', scheme_name: 'BBAN' }],
-        name: 'Alfa Drift ApS',
+        name: 'Opdigtet Alfa ApS',
         product: 'Erhvervskonto',
         currency: 'DKK',
         usage: 'ORGA',
@@ -56,7 +56,7 @@ describe('standalone reads', () => {
     });
     const { bank } = await linked({ api });
     expect((await bank.details('drift')).details).toMatchObject({
-      holderName: 'Alfa Drift ApS',
+      holderName: 'Opdigtet Alfa ApS',
       product: 'Erhvervskonto',
       usage: { code: 'ORGA' },
       cashAccountType: { code: 'CACC', meaning: 'current account' },
@@ -377,8 +377,10 @@ describe('standalone: what the review of 0.7.0 found', () => {
     gone = true;
     const lost = await bank.details('skat').catch((error: unknown) => error);
     expect(problemOf(lost)).toBe('consent_revoked');
-    // The balance read a moment ago is not repeated from memory: the bank is asked again.
-    await bank.balances('drift').catch(() => undefined);
-    expect(bankReads(api).filter(call => call.path.endsWith('/balances'))).toHaveLength(2);
+    // The balance read a moment ago is not repeated from memory, and the bank is not asked under a consent that
+    // is over (test/standalone-authority.test.ts has every way the server can learn it).
+    const refused = await bank.balances('drift').catch((error: unknown) => error);
+    expect(problemOf(refused)).toBe('consent_revoked');
+    expect(bankReads(api).filter(call => call.path.endsWith('/balances'))).toHaveLength(1);
   });
 });

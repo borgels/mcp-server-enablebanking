@@ -60,7 +60,11 @@ export class UnattendedBudget {
     return entry;
   }
 
-  /** Takes `count` fetches for the consent, all or none. */
+  /**
+   * Takes `count` fetches for the consent, all or none. A count of zero takes
+   * nothing but is still refused while the consent is paused after the bank's
+   * rate limit.
+   */
   take(consent: string, count = 1): BudgetDecision {
     if (!this.enabled) return { ok: true, remaining: Number.MAX_SAFE_INTEGER };
     const entry = this.entry(consent);

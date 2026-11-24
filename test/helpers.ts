@@ -15,6 +15,9 @@ export function dkIban(bban: string): string {
   return `DK${String(98 - remainder).padStart(2, '0')}${bban}`;
 }
 
+// Everything in the tests is invented: the companies, their numbers, the people and the accounts. The account
+// numbers are plainly synthetic and get a valid checksum worked out here, so that no real IBAN stands in the
+// repository. Keep it so: no real company, person, account or address in a test, a fixture or an example.
 export const IBAN = {
   aaaDrift: dkIban('54700001234567'),
   aaaSkat: dkIban('54700007654321'),
@@ -25,7 +28,7 @@ export const IBAN = {
 export const REGISTRY = {
   companies: {
     aaa: {
-      name: 'Alfa Drift ApS',
+      name: 'Opdigtet Alfa ApS',
       cvr: '12345678',
       accounts: [
         { iban: IBAN.aaaDrift, id: 'drift', name: 'Driftskonto', bank: 'Danske Bank', ledgerAccount: 5820 },
@@ -33,7 +36,7 @@ export const REGISTRY = {
       ],
     },
     bbb: {
-      name: 'Beta Handel ApS',
+      name: 'Opdigtet Beta ApS',
       cvr: '87654321',
       accounts: [{ iban: IBAN.bbbDrift, id: 'drift', name: 'Driftskonto', bank: 'Danske Bank' }],
     },
@@ -73,7 +76,8 @@ export function fakeApi(overrides: Partial<Record<string, (call: FakeCall) => un
     let payload: unknown;
     let status = 200;
     if (custom) {
-      payload = custom[1]!(call);
+      // A handler may take its time, as a bank does.
+      payload = await custom[1]!(call);
       if (payload instanceof Response) return payload;
     } else if (route === 'GET /aspsps') {
       payload = { aspsps: [{ name: 'Danske Bank', country: 'DK', psu_types: ['business', 'personal'], maximum_consent_validity: 180 * 86400 }] };

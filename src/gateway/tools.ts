@@ -15,7 +15,7 @@ import {
   type LineFilter,
   type TransactionView,
 } from '../enablebanking/format.js';
-import { problemHint, problemOf, problemRetryAfterSeconds, type ProblemCode } from '../enablebanking/problems.js';
+import { problemFromSessionStatus, problemHint, problemOf, problemRetryAfterSeconds, type ProblemCode } from '../enablebanking/problems.js';
 import { maskIban, normalizeIban } from '../enablebanking/registry.js';
 import {
   DEFAULT_RANGE_DAYS,
@@ -476,13 +476,6 @@ export interface ActiveConsent {
 
 export type ConsentCheck = ({ ok: true } & ActiveConsent) | { ok: false; reason: string; code: ProblemCode };
 
-/** The problem a session status that is not AUTHORIZED stands for. */
-function statusProblem(status: string | undefined): ProblemCode {
-  if (status === 'EXPIRED') return 'consent_expired';
-  if (status === 'REVOKED' || status === 'CLOSED' || status === 'CANCELLED') return 'consent_revoked';
-  return 'consent_not_active';
-}
-
 export function consentState(session: SessionStatus | undefined, now: number): ConsentCheck {
   const status = typeof session?.status === 'string' ? session.status : undefined;
   if (status !== 'AUTHORIZED') {
@@ -490,7 +483,7 @@ export function consentState(session: SessionStatus | undefined, now: number): C
     return {
       ok: false,
       reason: `The bank consent is not active${status && SESSION_STATUSES.has(status) ? ` (${status})` : ''}. It must be renewed.`,
-      code: statusProblem(status),
+      code: problemFromSessionStatus(status),
     };
   }
   const validUntil = instant(session?.access?.valid_until);

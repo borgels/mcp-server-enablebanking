@@ -80,9 +80,11 @@ The gateway follows this exactly:
   another control character, non-ASCII, more than 512 characters, an IP address that is not one) refuses the call
   with `presence_incomplete` before any request. Each value is checked as given, before anything is trimmed. A
   malformed statement is never turned into a background read.
-- The values are sent to the bank and removed from the call's result and error texts (whole, in raw, URL-encoded
-  and JSON-escaped form; the address and the location always, the other values from 8 characters), so a bank that
-  repeats them cannot hand them on.
+- The values are sent to the bank and removed from the call's finished result and error texts, so a bank that
+  repeats them does not hand them on. The address and the location: always, where the value stands whole, in any
+  percent-, JSON- or HTML-encoding up to three layers and in another spelling that says the same. The other
+  values: best effort, from 8 characters. A value the bank has changed or cut up over several fields is not
+  removed, and the removal is no promise of anonymity. The README has the exact wording.
 - `context.unattended: true` marks the call as made with nobody present: no header is sent, and the call counts
   against the budget for unattended reads.
 - Neither: no header is sent and no budget is kept, as in 0.6.x.
@@ -274,10 +276,10 @@ The exact mapping is `problemFromHttp` in `src/enablebanking/problems.ts`; `test
 | Limit | Source | What is done |
 |---|---|---|
 | Reads with nobody present | FAQ: "many ASPSPs have the limit of 4 times a day" for background reads | Gateway: a call marked `unattended` counts against a budget of 4 reads at the bank per consent in any 24 hours (`unattendedFetchesPerDay`, 0 turns it off). When it is used up the call is refused with `unattended_limit` and the time of the next possible read, before any request. A listing from the consent data costs nothing. Standalone: the same budget, off unless `ENABLEBANKING_UNATTENDED_FETCHES_PER_DAY` is set. |
-| The bank's own rate limit | 429 `ASPSP_RATE_LIMIT_EXCEEDED`; FAQ: continue after 6 hours | `rate_limited` with `retryAfterSeconds: 21600`; unattended reads of that consent pause for six hours, also when the limit shows up for one account inside a search; a search does not ask for the remaining accounts |
+| The bank's own rate limit | 429 `ASPSP_RATE_LIMIT_EXCEEDED`; FAQ: continue after 6 hours | `rate_limited` with `retryAfterSeconds: 21600`; unattended reads of that consent pause for six hours, also when the limit shows up for one account inside a search, and also for the next page of a listing; a search does not ask for the remaining accounts |
 | Transaction history | Reference and FAQ: full history for about an hour after sign-in, then often 90 days | `period_not_available` with that explanation; `strategy: "longest"` asks for as much as the bank gives |
 | Consent length | `maximum_consent_validity` per bank, at most 180 days for most | Shown per bank; days left in `list_accounts` and the consent status |
-| Caching | none required | Standalone: 300 seconds by default (`ENABLEBANKING_CACHE_SECONDS`), per account of one consent, reached only after the registry and the stored consent have been checked on that call, emptied when a consent is completed, refreshed, revoked or reported gone. Gateway: none; see below. |
+| Caching | none required | Standalone: 300 seconds by default (`ENABLEBANKING_CACHE_SECONDS`), per account of one consent, reached only after the registry and the stored consent have been checked on that call. Once any answer from Enable Banking says a consent is over or an account has left it (a failed read, the consent status, a refresh), what was read under it is dropped and it is not read until it is seen in order again. Gateway: none; see below. |
 
 ### No answer cache in the gateway
 
@@ -287,7 +289,12 @@ every tool was not a small change. The gateway now keeps no bank data between ca
 decided by that call alone. With `credentials.accounts`, listing accounts needs no read at the bank; a person who
 asks is not limited; and the budget keeps unattended reads within the bank's limit, so little is lost.
 
-A cache added later must hold all of this, with a test for each:
+The standalone server keeps its cache: it has no person to send details of, so every read it makes is a background
+read on the bank's four a day, and answering the same question twice from memory is what makes it usable. Its rule
+and every way it learns that a consent is over are in the README ("What the cache may answer") and in
+`test/standalone-authority.test.ts`.
+
+A cache added to the gateway later must hold all of this, with a test for each:
 
 1. An answer is returned only if every account it holds is in the session's accounts as read on this call, and in
    the `accountIds` given with this call.

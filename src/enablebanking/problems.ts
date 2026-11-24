@@ -122,6 +122,13 @@ export function problemHint(code: ProblemCode | undefined): string | undefined {
   return code === undefined ? undefined : HINTS[code];
 }
 
+/** The problem a session status that is not AUTHORIZED stands for. */
+export function problemFromSessionStatus(status: string | undefined): ProblemCode {
+  if (status === 'EXPIRED') return 'consent_expired';
+  if (status === 'REVOKED' || status === 'CLOSED' || status === 'CANCELLED') return 'consent_revoked';
+  return 'consent_not_active';
+}
+
 /** Seconds to wait before trying again, where Enable Banking's documentation recommends a wait. */
 export function problemRetryAfterSeconds(code: ProblemCode | undefined): number | undefined {
   // FAQ, rate limits: 'we recommend to continue data fetching after 6 hours'.

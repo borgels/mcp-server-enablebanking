@@ -48,6 +48,8 @@ interface Bank {
   failing: Map<string, { status: number; error: string }>;
   /** Added to every line and every account, as a bank that repeats what it was sent. */
   echo?: Record<string, unknown>;
+  /** The bank always has one more page of lines. */
+  continues?: boolean;
 }
 
 function api(bank: Bank) {
@@ -68,7 +70,9 @@ function api(bank: Bank) {
     if (kind === 'balances') {
       return json({ balances: [{ balance_type: 'ITAV', name: 'Available', balance_amount: { currency: 'EUR', amount: '5.00' }, ...(bank.echo ?? {}) }] });
     }
-    if (url.pathname.endsWith('/transactions')) return json({ transactions: [line(`${who}-1`, `${who} Supplies`, bank.echo)] });
+    if (url.pathname.endsWith('/transactions')) {
+      return json({ transactions: [line(`${who}-1`, `${who} Supplies`, bank.echo)], ...(bank.continues ? { continuation_key: 'made-up-next-page' } : {}) });
+    }
     return json(line(`${who}-1`, `${who} Supplies`, bank.echo));
   });
   return { calls, fetchImpl, bankReads: () => calls.filter(call => call.url.pathname.startsWith('/accounts/')) };
@@ -418,5 +422,284 @@ describe('a malformed statement of who is present', () => {
       for (let i = 0; i < 2; i += 1) expect((await gw.callTool('get_balances', { account: ACCOUNT_A }, context)).isError).toBeUndefined();
     }
     for (const call of calls) expect([...call.headers.keys()].filter(name => name.startsWith('psu-'))).toEqual([]);
+  });
+});
+
+describe('the details of the person present, written another way', () => {
+  // Checked independently of the redactor: the text with every layer of encoding undone, as a reader could undo it.
+  const hex = (char: string, upper: boolean) => {
+    const code = char.charCodeAt(0).toString(16).padStart(2, '0');
+    return upper ? code.toUpperCase() : code;
+  };
+  const percentAll = (value: string, upper: boolean) => [...value].map(char => `%${hex(char, upper)}`).join('');
+  const lowerHex = (value: string) => encodeURIComponent(value).replace(/%[0-9A-F]{2}/g, escape => escape.toLowerCase());
+  const SPELLINGS: Array<[string, (value: string) => string]> = [
+    ['percent-encoded with upper-case hex', value => encodeURIComponent(value)],
+    ['percent-encoded with lower-case hex', lowerHex],
+    ['percent-encoded with mixed-case hex', value => encodeURIComponent(value).replace(/%([0-9A-F])([A-F])/g, (_, a: string, b: string) => `%${a}${b.toLowerCase()}`)],
+    ['every character percent-encoded, upper case', value => percentAll(value, true)],
+    ['every character percent-encoded, lower case', value => percentAll(value, false)],
+    ['the characters a URL leaves alone percent-encoded too', value => encodeURIComponent(value).replace(/[.a-z-]/g, char => `%${hex(char, false)}`)],
+    ['encoded twice', value => encodeURIComponent(encodeURIComponent(value))],
+    ['encoded twice with lower-case hex', value => lowerHex(lowerHex(value))],
+    ['encoded three times', value => encodeURIComponent(encodeURIComponent(encodeURIComponent(value)))],
+    ['as a form writes it, with + for a space', value => encodeURIComponent(value).replace(/%20/g, '+')],
+    ['as a form writes it, encoded again', value => encodeURIComponent(encodeURIComponent(value).replace(/%20/g, '+'))],
+    ['with JSON unicode escapes', value => [...value].map(char => `\\u00${hex(char, false)}`).join('')],
+    ['with JSON unicode escapes for the punctuation only', value => value.replace(/[^A-Za-z0-9]/g, char => `\\u00${hex(char, true)}`)],
+    ['with JavaScript hex escapes', value => value.replace(/[^A-Za-z0-9]/g, char => `\\x${hex(char, false)}`)],
+    ['with escaped slashes', value => value.replace(/\//g, '\\/')],
+    ['inside JSON inside JSON', value => JSON.stringify(JSON.stringify(value).slice(1, -1)).slice(1, -1)],
+    ['with decimal HTML entities', value => value.replace(/[^A-Za-z0-9]/g, char => `&#${char.charCodeAt(0)};`)],
+    ['with hexadecimal HTML entities', value => value.replace(/[^A-Za-z0-9]/g, char => `&#x${hex(char, true)};`)],
+    ['with named HTML entities', value => value.replace(/&/g, '&amp;').replace(/</g, '&lt;')],
+    ['percent-encoded inside an HTML entity encoding', value => encodeURIComponent(value).replace(/%/g, '&#37;')],
+    ['with two spaces for one', value => value.replace(/ /g, '  ')],
+    ['with a tab or a line break for a space', value => value.replace(/ /, '\t').replace(/ /, '\n')],
+    ['with a non-breaking space for a space', value => value.replace(/ /g, '\u00a0')],
+  ];
+  const PEOPLE: Array<[string, Record<string, string>]> = [
+    [
+      'an IPv4 address',
+      { ipAddress: '192.0.2.10', geoLocation: '55.676100,12.568300', userAgent: 'ExampleBrowser 1.0 (made-up device; rv:1)', referer: 'https://app.example/bank?view=a b&tab=<1>' },
+    ],
+    ['an IPv6 address', { ipAddress: '2001:db8::a1', geoLocation: '-33.8568,151.2153', userAgent: 'Made-up "Agent" \ 2.0', acceptLanguage: 'sv-SE,sv;q=0.9' }],
+  ];
+
+  for (const [who, person] of PEOPLE) {
+    it.each(SPELLINGS)(`never come back for ${who}: %s`, async (_, spell) => {
+      const written = Object.values(person).map(spell);
+      const echo = {
+        note: `Request from ${written.join(' | ')} end`,
+        remittance_information: written.map(value => `Seen ${value} here`),
+        creditor: { name: `Party ${written[0]}` },
+      };
+      const { fetchImpl } = api({ sessionAccounts: [ACCOUNT_A], failing: new Map(), echo });
+      const context = { credentials: { sessionId: SESSION, accountIds: [ACCOUNT_A] }, psu: person };
+      const gw = gateway(fetchImpl);
+
+      const details = await gw.callTool('get_transaction_details', { account: ACCOUNT_A, transaction: 'id-Alpha-1' }, context);
+      expect(details.isError).toBeUndefined();
+      const view = data<{ transaction: { note: string; remittance: string[]; text: string; counterparty: string } }>(details).transaction;
+      // The whole of each echo is gone, and nothing but it: the bank's own words around it are still there.
+      expect(view.note).toBe(`Request from ${written.map(() => '‹redacted›').join(' | ')} end`);
+      expect(view.remittance).toEqual(written.map(() => 'Seen ‹redacted› here'));
+      expect(view.text).toBe(written.map(() => 'Seen ‹redacted› here').join(' '));
+      expect(view.counterparty).toBe('Party ‹redacted›');
+
+      for (const [tool, input] of [
+        ['list_transactions', { account: ACCOUNT_A }],
+        ['search_transactions', { query: 'invoice' }],
+        ['summarize_transactions', { account: ACCOUNT_A }],
+        ['get_transaction_details', { account: ACCOUNT_A, transaction: 'id-Alpha-1' }],
+      ] as Array<[string, Record<string, unknown>]>) {
+        const out = JSON.stringify(await gw.callTool(tool, input as never, context));
+        for (const [index, value] of Object.values(person).entries()) {
+          expect(out, `${tool}: ${value}`).not.toContain(value);
+          expect(out, `${tool}: ${value} as written`).not.toContain(written[index]!);
+          expect(out, `${tool}: ${value} as written, inside JSON`).not.toContain(JSON.stringify(written[index]).slice(1, -1));
+        }
+      }
+    });
+  }
+
+  it('are removed after the server’s own joining and spacing of the bank’s texts', async () => {
+    const person = { ipAddress: '192.0.2.10', userAgent: 'Example  Browser 1.0' };
+    // The bank repeats the browser name as it was sent, with its two spaces; the listing shows the remittance lines
+    // joined and with single spaces. And a bank that splits it over two lines: the server joins them again.
+    const echo = { remittance_information: ['Seen Example  Browser 1.0', 'Example', 'Browser 1.0'] };
+    const { fetchImpl } = api({ sessionAccounts: [ACCOUNT_A], failing: new Map(), echo });
+    const context = { credentials: { sessionId: SESSION, accountIds: [ACCOUNT_A] }, psu: person };
+    const gw = gateway(fetchImpl);
+    for (const [tool, input] of [
+      ['list_transactions', { account: ACCOUNT_A }],
+      ['search_transactions', { query: 'browser' }],
+      ['get_transaction_details', { account: ACCOUNT_A, transaction: 'id-Alpha-1' }],
+    ] as Array<[string, Record<string, unknown>]>) {
+      const result = await gw.callTool(tool, input as never, context);
+      expect(result.isError, tool).toBeUndefined();
+      const out = JSON.stringify(result);
+      expect(out, tool).not.toMatch(/Example\s+Browser 1\.0/);
+      expect(out, tool).toContain('Seen ‹redacted›');
+    }
+    const view = data<{ transaction: { text: string; remittance: string[] } }>(
+      await gw.callTool('get_transaction_details', { account: ACCOUNT_A, transaction: 'id-Alpha-1' }, context),
+    ).transaction;
+    expect(view.text).toBe('Seen ‹redacted› ‹redacted›');
+    // What is not promised: a value the bank itself has cut in two stays where the two parts are shown apart.
+    expect(view.remittance).toEqual(['Seen ‹redacted›', 'Example', 'Browser 1.0']);
+  });
+
+  it('are found however they are written, by the redactor itself', () => {
+    const redactor = new GatewayRedactor();
+    redactor.addExact('55.676100,12.568300');
+    redactor.addExact('2001:db8::a1');
+    redactor.add('Made-up Agent / 2.0');
+    const check = (text: string, expected: string) => expect(redactor.redactValues(text), text).toBe(expected);
+    check('at 55.676100%2c12.568300.', 'at ‹redacted›.');
+    check('at 55.676100%2C12.568300.', 'at ‹redacted›.');
+    check('at 55.676100%252c12.568300.', 'at ‹redacted›.');
+    check('at 55.676100%25252C12.568300.', 'at ‹redacted›.');
+    check('from 2001%3adb8%3a%3aa1, 2001%3Adb8%3A%3Aa1 and 2001&#58;db8&#x3a;:a1', 'from ‹redacted›, ‹redacted› and ‹redacted›');
+    check('ua=Made-up+Agent+%2f+2.0&x=1', 'ua=‹redacted›&x=1');
+    check('ua Made-up\tAgent \n/  2.0!', 'ua ‹redacted›!');
+    check('"Made-up Agent \\/ 2.0"', '"‹redacted›"');
+    // Two echoes side by side are two removals; one inside the other is one.
+    check('55.676100%2c12.568300 55.676100,12.568300', '‹redacted› ‹redacted›');
+    // What does not read as the value stays: another number, a + that is a plus, a stray percent sign.
+    check('55.676100%2d12.568300, 1+1=2, 100% sure, A&B, C:\\dir', '55.676100%2d12.568300, 1+1=2, 100% sure, A&B, C:\\dir');
+    // Layers are undone to a fixed depth (MAX_DECODE_DEPTH), not without end.
+    check(`55.676100%${'25'.repeat(3)}2C12.568300`, '‹redacted›');
+    check(`55.676100%${'25'.repeat(8)}2C12.568300`, `55.676100%${'25'.repeat(8)}2C12.568300`);
+  });
+});
+
+describe('an address or a location of the person present, in another spelling that says the same', () => {
+  const through = async (person: Record<string, string>, note: string) => {
+    const { fetchImpl } = api({ sessionAccounts: [ACCOUNT_A], failing: new Map(), echo: { note } });
+    const context = { credentials: { sessionId: SESSION, accountIds: [ACCOUNT_A] }, psu: person };
+    const result = await gateway(fetchImpl).callTool('get_transaction_details', { account: ACCOUNT_A, transaction: 'id-Alpha-1' }, context);
+    expect(result.isError).toBeUndefined();
+    return data<{ transaction: { note: string } }>(result).transaction.note;
+  };
+
+  it.each([
+    ['in upper case', '2001:DB8::A1'],
+    ['written out in full', '2001:0db8:0000:0000:0000:0000:0000:00a1'],
+    ['written out without leading zeros', '2001:db8:0:0:0:0:0:a1'],
+    ['shortened in another place', '2001:db8:0:0::a1'],
+    ['with its end as an IPv4 address', ['2001:db8::0.0.0', 161].join('.')],
+    ['in brackets with a port', '[2001:Db8::a1]:443'],
+    ['at the end of a sentence', '2001:DB8:0::A1.'],
+    ['percent-encoded in upper case', '2001%3ADB8%3A%3AA1'],
+    ['percent-encoded with lower-case hex, written out', '2001%3a0db8%3a0%3a0%3a0%3a0%3a0%3aa1'],
+  ])('removes an IPv6 address %s', async (_, written) => {
+    const note = await through({ ipAddress: '2001:db8::a1' }, `Seen from ${written} today`);
+    expect(note).not.toMatch(/a1|A1/);
+    expect(['Seen from ‹redacted› today', 'Seen from [‹redacted›]:443 today', 'Seen from ‹redacted›. today']).toContain(note);
+  });
+
+  it('removes an IPv4 address written as an IPv6 address, and leaves other addresses alone', async () => {
+    const mapped = ['::ffff:', 'c000:20a'].join('');
+    const note = await through({ ipAddress: '192.0.2.10' }, `Seen from ${mapped}, ::FFFF:192.0.2.10 and 0:0:0:0:0:ffff:C000:020A, not 2001:db8::b2 or 12:30:45`);
+    // (The address as it was sent is removed first, wherever it stands; what is left of that spelling says nothing.)
+    expect(note).toBe('Seen from ‹redacted›, ::FFFF:‹redacted› and ‹redacted›, not 2001:db8::b2 or 12:30:45');
+  });
+
+  it.each([
+    ['with fewer zeros', '55.6761,12.5683'],
+    ['with more zeros', '55.67610000,12.56830000'],
+    ['with a space after the comma', '55.676100, 12.568300'],
+    ['with a semicolon', '55.676100;12.568300'],
+    ['with a percent-encoded comma and space', '55.6761%2c%2012.5683'],
+  ])('removes a location %s', async (_, written) => {
+    const note = await through({ geoLocation: '55.676100,12.568300' }, `Seen at ${written} today, paid 55.67, 12.56 and 10.00,20.00`);
+    expect(note).toBe('Seen at ‹redacted› today, paid 55.67, 12.56 and 10.00,20.00');
+  });
+});
+
+describe('the redactor on text it has no business with', () => {
+  // A fixed sequence, so a failure can be repeated.
+  function sequence(seed: number) {
+    let state = seed;
+    return () => {
+      state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+      return state / 2 ** 32;
+    };
+  }
+  const ALPHABET = ['%', '%2', '%2c', '%25', '\\', '\\u00', '\\u002c', '\\x', '&', '&#', '&#44;', '&amp;', ';', '+', ' ', '  ', '\t', ':', '::', '.', ',', 'a', 'F', '0', '1', '9', 'db8', 'x', 'é', '‹', '"'];
+  const noise = (next: () => number, length: number) => Array.from({ length }, () => ALPHABET[Math.floor(next() * ALPHABET.length)]!).join('');
+
+  const redactor = new GatewayRedactor();
+  redactor.addAddress('2001:db8::a1');
+  redactor.addLocation('55.676100,12.568300');
+  redactor.add('Made-up Agent / 2.0');
+
+  it('leaves every text that holds none of its values exactly as it is', () => {
+    const next = sequence(20261124);
+    for (let round = 0; round < 3000; round += 1) {
+      const text = noise(next, 1 + Math.floor(next() * 60));
+      expect(redactor.redactValues(text), JSON.stringify(text)).toBe(text);
+    }
+  });
+
+  it('removes a value from the middle of any such text and keeps the text around it', () => {
+    const next = sequence(7);
+    const written = ['2001%3aDB8%3A%3aa1', '55.6761%2C%2012.5683', 'Made-up+Agent+%2f+2.0', '2001:db8:0:0:0:0:0:a1', 'Made-up\\u0020Agent / 2.0'];
+    for (let round = 0; round < 1500; round += 1) {
+      // Letters around the value, so that what stands next to it cannot be read as part of an escape or an address.
+      const before = `${noise(next, Math.floor(next() * 30))} x `;
+      const after = ` x ${noise(next, Math.floor(next() * 30))}`;
+      const value = written[round % written.length]!;
+      expect(redactor.redactValues(`${before}${value}${after}`), JSON.stringify([before, value, after])).toBe(`${before}‹redacted›${after}`);
+    }
+  });
+
+  it('answers at once for a long text of nothing but escapes', () => {
+    const started = Date.now();
+    for (const text of ['%25'.repeat(20_000), '&#37;'.repeat(10_000), ':'.repeat(50_000), '1.1,'.repeat(20_000), ' \t'.repeat(30_000), '\\u005c'.repeat(10_000)]) {
+      redactor.redactValues(text);
+    }
+    expect(Date.now() - started).toBeLessThan(5_000);
+  });
+});
+
+describe('a continued listing during the pause after a rate limit', () => {
+  const period = { account: ACCOUNT_A, from: '2026-11-01', to: '2026-11-10' };
+
+  async function tokenThenLimit(extra: Partial<EnableBankingGatewayOptions> = {}) {
+    let clock = NOW;
+    const bank: Bank = { sessionAccounts: [ACCOUNT_A, ACCOUNT_B], failing: new Map(), continues: true };
+    const { fetchImpl, bankReads } = api(bank);
+    const gw = gateway(fetchImpl, { now: () => clock, ...extra });
+    const unattended = { ...both, unattended: true };
+    const first = await gw.callTool('list_transactions', period, unattended);
+    const token = data<{ nextPageToken: string; hasMore: boolean }>(first).nextPageToken;
+    expect(token).toEqual(expect.any(String));
+    // The bank says stop, for another account of the same consent.
+    bank.failing.set(ACCOUNT_B, { status: 429, error: 'ASPSP_RATE_LIMIT_EXCEEDED' });
+    expect((await gw.callTool('get_balances', { account: ACCOUNT_B }, unattended)).errorCode).toBe('rate_limited');
+    bank.failing.clear();
+    return { gw, bankReads, token, unattended, advance: (ms: number) => (clock += ms) };
+  }
+
+  it('is refused like any other read with nobody present, until the pause is over', async () => {
+    const { gw, bankReads, token, unattended, advance } = await tokenThenLimit();
+    const before = bankReads().length;
+
+    const continued = await gw.callTool('list_transactions', { ...period, pageToken: token }, unattended);
+    expect(continued).toMatchObject({ isError: true, errorCode: 'unattended_limit' });
+    expect(continued.content[0]!.text).toContain('2026-11-24 16:00 UTC');
+    expect(JSON.stringify(continued)).not.toContain('Alpha');
+    // The same as an ordinary read gets, and neither reached the bank.
+    expect((await gw.callTool('get_balances', { account: ACCOUNT_A }, unattended)).errorCode).toBe('unattended_limit');
+    expect(bankReads()).toHaveLength(before);
+
+    // (The token itself lasts fifteen minutes; after the pause a listing is started anew and continued as before.)
+    advance(6 * HOUR);
+    const anew = await gw.callTool('list_transactions', period, unattended);
+    expect(anew.isError).toBeUndefined();
+    const next = data<{ nextPageToken: string }>(anew).nextPageToken;
+    expect((await gw.callTool('list_transactions', { ...period, pageToken: next }, unattended)).isError).toBeUndefined();
+    expect(bankReads().length).toBeGreaterThan(before);
+  });
+
+  it('is not held back for a person who asks', async () => {
+    const { gw, bankReads, token } = await tokenThenLimit();
+    const before = bankReads().length;
+    const asked = await gw.callTool('list_transactions', { ...period, pageToken: token }, { ...both, psu: { ipAddress: '192.0.2.10' } });
+    expect(asked.isError).toBeUndefined();
+    expect(bankReads().length).toBeGreaterThan(before);
+  });
+
+  it('still costs nothing of the budget when there is no pause', async () => {
+    const bank: Bank = { sessionAccounts: [ACCOUNT_A, ACCOUNT_B], failing: new Map(), continues: true };
+    const { fetchImpl } = api(bank);
+    const gw = gateway(fetchImpl, { unattendedFetchesPerDay: 1 });
+    const unattended = { ...both, unattended: true };
+    const token = data<{ nextPageToken: string }>(await gw.callTool('list_transactions', period, unattended)).nextPageToken;
+    // The day's one read is used; the listing can still be continued, and a new read cannot be started.
+    expect((await gw.callTool('list_transactions', { ...period, pageToken: token }, unattended)).isError).toBeUndefined();
+    expect((await gw.callTool('get_balances', { account: ACCOUNT_A }, unattended)).errorCode).toBe('unattended_limit');
   });
 });

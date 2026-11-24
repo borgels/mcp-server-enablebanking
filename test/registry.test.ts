@@ -4,6 +4,7 @@ import { IBAN, REGISTRY } from './helpers.js';
 
 describe('account registry', () => {
   it('validates IBAN checksums', () => {
+    // The example IBAN of the IBAN standard's own documentation: not an account.
     expect(isValidIban('GB82 WEST 1234 5698 7654 32')).toBe(true);
     expect(isValidIban(IBAN.aaaDrift)).toBe(true);
     expect(isValidIban(IBAN.aaaDrift.replace(/\d$/, d => String((Number(d) + 1) % 10)))).toBe(false);
@@ -25,7 +26,7 @@ describe('account registry', () => {
     expect(registry.resolve('aaa', 'drift').iban).toBe(IBAN.aaaDrift);
     const spaced = IBAN.aaaSkat.replace(/(.{4})/g, '$1 ').toLowerCase();
     expect(registry.resolve('aaa', spaced).id).toBe('skat');
-    expect(() => registry.resolve('aaa', IBAN.bbbDrift)).toThrow(/does not belong to Alfa Drift ApS/);
+    expect(() => registry.resolve('aaa', IBAN.bbbDrift)).toThrow(/does not belong to Opdigtet Alfa ApS/);
     expect(() => registry.resolve('aaa', IBAN.bbbDrift)).not.toThrow(/Beta/);
     expect(() => registry.resolve('aaa', IBAN.stray)).toThrow(/unknown account/);
     expect(registry.accountOf('bbb', IBAN.aaaDrift)).toBeUndefined();
