@@ -782,7 +782,8 @@ function buildEnableBankingGateway(options: EnableBankingGatewayOptions) {
     });
     // What the status says counts for every call under way: an ended consent, the accounts it still lists, and when
     // it runs out (checked again when the answer of this call is returned).
-    withdrawals.status(credentials.sessionId, session, now(), sessionAccounts(session));
+    const until = withdrawals.status(credentials.sessionId, session, now(), sessionAccounts(session));
+    if (watch) watch.until = until;
     const consent = consentState(session, now());
     if (!consent.ok) return errorResult(consent.reason, undefined, consent.code);
     // Accounts of the call the session no longer lists are not read by it: what this status says of them is not

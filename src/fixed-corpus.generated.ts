@@ -494,6 +494,7 @@ export const FIXED_CORPUS: readonly string[] = [
   "The company's bank accounts covered by its consent: id, name, masked IBAN, currency and product, and when the consent ",
   "The consent changed here while its status was being checked; ask again.",
   "The consent covers no account that can be read.",
+  "The consent ran out while its status was being checked.",
   "The full URL from the browser, including ?code=…&state=…",
   "The full account number, the account holder, product and credit limit of an account. No transactions.",
   "The key was refused: it is too short, or it shares text with this server’s own texts.",

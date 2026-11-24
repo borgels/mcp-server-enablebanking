@@ -645,9 +645,26 @@ call began against its consent or against an account its answer may come from
 search over all accounts), the call is refused with `consent_not_active` ("Refused:
 the bank consent was ended, or an account left it, while this call was being
 answered; ...") and no data. What a search learns itself about an account
-it then skipped does not count against it. Only session ids, account ids and a
-counter are kept, for at most 10 000 sessions; when an older entry has to be
-dropped, every call under way is refused rather than trusted.
+it then skipped does not count against it.
+
+What is kept per session does not grow with use: whether it was ended here,
+the counter of the last word against the consent and against each account,
+the accounts a status listed (an account a later status leaves out has left)
+and the earliest validity date. A status that says what is already known
+changes nothing, so a session that is checked thousands of times is not
+refused for it. Records of at most 10 000 sessions are kept, the least
+recently changed dropped first. Dropping a record that held only what was in
+order refuses nothing; dropping one that held a word against a consent, an
+account or an earlier validity date refuses every call under way at that
+moment, and no call that begins after it.
+
+What the gateway cannot know, the host must say: a host that stores new
+credentials for a company (a new session) without calling `endSession` on the
+old one, or that passes fewer `accountIds` than before, does not by that alone
+stop calls already under way with the earlier credentials. They finish under
+what they were given, as long as Enable Banking still holds the old session
+and its accounts. Call `endSession` on a session that should no longer be
+read; a smaller `accountIds` limits the calls made with it, and only those.
 
 Enable Banking API reference: <https://enablebanking.com/docs/api/reference/>.
 

@@ -253,6 +253,23 @@ describe('a gateway answer, checked after the call’s last await', () => {
     expect((await call).isError).toBeUndefined();
   });
 
+  it('answers 100 reads of an unchanged session, and still refuses one under way when a revocation is learned', async () => {
+    const fake = bank();
+    const gw = gateway(fake.fetchImpl);
+    for (let i = 0; i < 100; i += 1) {
+      const result = await gw.callTool('get_balances', { account: ACCOUNT_A }, context);
+      expect(result.isError, `read ${i + 1}: ${result.content[0]!.text}`).toBeUndefined();
+      await gw.sessionStatus({ sessionId: SESSION });
+    }
+    const held = fake.hold(ACCOUNT_A);
+    const call = gw.callTool('get_balances', { account: ACCOUNT_A }, context);
+    await held;
+    fake.setSession('REVOKED');
+    await gw.sessionStatus({ sessionId: SESSION });
+    fake.letGo();
+    refused(await call);
+  });
+
   it('reads nothing back under a session ended here, even while Enable Banking still says it is authorised', async () => {
     const fake = bank();
     const gw = gateway(fake.fetchImpl);

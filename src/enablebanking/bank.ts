@@ -548,14 +548,28 @@ export class Bank {
     // and again when the answer is released.
     return this.held(() => {
       const shown = [...consents];
+      const releasedAt = this.now();
       for (const { at, session, version } of checked) {
-        if (this.version(session.sessionId) === version) continue;
-        shown[at] = {
-          ...shown[at],
-          status: null,
-          problem: this.lostConsents.get(session.sessionId) ?? 'consent_not_active',
-          reason: 'The consent changed here while its status was being checked; ask again.',
-        };
+        if (this.version(session.sessionId) !== version) {
+          shown[at] = {
+            ...shown[at],
+            status: null,
+            problem: this.lostConsents.get(session.sessionId) ?? 'consent_not_active',
+            reason: 'The consent changed here while its status was being checked; ask again.',
+          };
+          continue;
+        }
+        // A consent in order when asked that has run out by now (the stored date, the date Enable Banking gave, or
+        // an earlier one it gave before) is shown as expired, against the clock at this moment.
+        const dates = [Date.parse(session.validUntil), Date.parse(String(shown[at]!.validUntil)), this.deadlines.get(session.sessionId) ?? Number.NaN];
+        if (dates.some(date => date <= releasedAt)) {
+          shown[at] = {
+            ...shown[at],
+            status: null,
+            problem: 'consent_expired',
+            reason: 'The consent ran out while its status was being checked.',
+          };
+        }
       }
       return { company: company.name, checkedAt: new Date(now).toISOString(), consents: shown };
     });

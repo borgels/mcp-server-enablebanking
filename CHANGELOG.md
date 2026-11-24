@@ -72,7 +72,8 @@ Standalone server:
   status tool shows a consent that changed while its answer was on its way as changed. `enablebanking_list_accounts`
   has a new account status for it: `consent_ended`. Every answer with bank data is checked once more after the
   tool's last await (the audit line included), with nothing awaited before it is returned, in the one response
-  path every tool goes through; an answer not made for that check is withheld.
+  path every tool goes through; an answer not made for that check is withheld. The consent's validity date (stored,
+  or an earlier one Enable Banking gave) is checked then too, the consent status tool included.
 - `enablebanking_refresh_consent` refuses a consent that is no longer authorised instead of binding to it.
 - A search stops at the first account the bank's rate limit refuses.
 - The account registry no longer assumes DKK for an account without a currency.
@@ -111,7 +112,8 @@ Gateway (`mcp-server-enablebanking/gateway`), every change to the surface:
   depends on it, checked after the call's last await (refused with `consent_not_active`). After
   `endSession` the instance reads nothing more under that session. Every request about a session feeds this,
   `sessionStatus` and `completeSession` included, and the validity date Enable Banking gave is checked against the
-  clock when the answer is returned.
+  clock when the answer is returned. The record of a session does not grow with use, and a host that replaces a
+  session without `endSession`, or passes fewer `accountIds`, does not stop calls already under way (README).
 - `GatewayToolResult`: `errorCode` on every error result and `retryAfterSeconds` where a wait is recommended. The
   fixed error texts of 0.6.x are unchanged.
 - `list_accounts`: adds `source` (`consent`, `bank` or `mixed`), `consent` (status, `validUntil`, `expiresInDays`,

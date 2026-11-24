@@ -170,7 +170,7 @@ describe('an answer with bank data, checked after the last await', () => {
     expect(found.transactions.length).toBeGreaterThan(0);
   });
 
-  it.each(DATA_TOOLS.filter(([tool]) => tool !== 'enablebanking_get_consent_status'))(
+  it.each(DATA_TOOLS)(
     '%s returns nothing when the consent runs out while its final audit line is written (stored date, clock at return)',
     async (tool, args) => {
       let clock = Date.parse('2026-11-24T10:00:00Z');
@@ -185,6 +185,9 @@ describe('an answer with bank data, checked after the last await', () => {
       expect(body).not.toMatch(/1234\.50|Leverand|Husleje|-250\.00/i);
       if (tool === 'enablebanking_search_transactions') {
         expect(JSON.parse(body).accounts.every((entry: { read: boolean; problem?: string }) => !entry.read && entry.problem === 'consent_expired')).toBe(true);
+      } else if (tool === 'enablebanking_get_consent_status') {
+        // Asked at 10.00.00 with a date of 10.00.01, returned at 10.00.02: not shown as authorised.
+        expect(JSON.parse(body).consents[0]).toMatchObject({ status: null, problem: 'consent_expired' });
       } else {
         expect(body).toMatch(/errorCode: consent_expired/);
       }
@@ -223,6 +226,18 @@ describe('an answer with bank data, checked after the last await', () => {
     clock += 2_000;
     audit.open();
     expect(text(await call)).toMatch(/errorCode: consent_expired/);
+  });
+
+  it('shows a consent as expired when the date Enable Banking gives runs out before the status is returned', async () => {
+    let clock = Date.parse('2026-11-24T10:00:00Z');
+    const { api, audit, client } = await setup(BOTH, { now: () => clock });
+    api.setSessionValidUntil('2026-11-24T10:00:01Z');
+    const held = audit.holdNext();
+    const call = client.callTool({ name: 'enablebanking_get_consent_status', arguments: {} });
+    await held;
+    clock += 2_000;
+    audit.open();
+    expect(JSON.parse(text(await call)).consents[0]).toMatchObject({ status: null, problem: 'consent_expired' });
   });
 
   it('refuses an answer the bank did not make (fail closed): only the tools without bank data skip the check', () => {
