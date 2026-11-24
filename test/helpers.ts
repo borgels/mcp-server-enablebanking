@@ -15,6 +15,9 @@ export function dkIban(bban: string): string {
   return `DK${String(98 - remainder).padStart(2, '0')}${bban}`;
 }
 
+// Everything in the tests is invented: the companies, their numbers, the people and the accounts. The account
+// numbers are plainly synthetic and get a valid checksum worked out here, so that no real IBAN stands in the
+// repository. Keep it so: no real company, person, account or address in a test, a fixture or an example.
 export const IBAN = {
   aaaDrift: dkIban('54700001234567'),
   aaaSkat: dkIban('54700007654321'),
@@ -25,7 +28,7 @@ export const IBAN = {
 export const REGISTRY = {
   companies: {
     aaa: {
-      name: 'Alfa Drift ApS',
+      name: 'Opdigtet Alfa ApS',
       cvr: '12345678',
       accounts: [
         { iban: IBAN.aaaDrift, id: 'drift', name: 'Driftskonto', bank: 'Danske Bank', ledgerAccount: 5820 },
@@ -33,7 +36,7 @@ export const REGISTRY = {
       ],
     },
     bbb: {
-      name: 'Beta Handel ApS',
+      name: 'Opdigtet Beta ApS',
       cvr: '87654321',
       accounts: [{ iban: IBAN.bbbDrift, id: 'drift', name: 'Driftskonto', bank: 'Danske Bank' }],
     },
@@ -54,6 +57,8 @@ export function fakeApi(overrides: Partial<Record<string, (call: FakeCall) => un
   const calls: FakeCall[] = [];
   const deleted: string[] = [];
   let sessionCounter = 0;
+  let sessionValidUntil = '2099-01-01T00:00:00Z';
+  let sessionStatus = 'AUTHORIZED';
   let sessionAccounts = [
     { uid: 'uid-aaa-drift', account_id: { iban: IBAN.aaaDrift }, name: 'Drift', currency: 'DKK' },
     { uid: 'uid-bbb-drift', account_id: { iban: IBAN.bbbDrift }, name: 'Beta drift', currency: 'DKK' },
@@ -73,7 +78,8 @@ export function fakeApi(overrides: Partial<Record<string, (call: FakeCall) => un
     let payload: unknown;
     let status = 200;
     if (custom) {
-      payload = custom[1]!(call);
+      // A handler may take its time, as a bank does.
+      payload = await custom[1]!(call);
       if (payload instanceof Response) return payload;
     } else if (route === 'GET /aspsps') {
       payload = { aspsps: [{ name: 'Danske Bank', country: 'DK', psu_types: ['business', 'personal'], maximum_consent_validity: 180 * 86400 }] };
@@ -86,7 +92,7 @@ export function fakeApi(overrides: Partial<Record<string, (call: FakeCall) => un
       deleted.push(url.pathname.split('/')[2]!);
       payload = {};
     } else if (route.startsWith('GET /sessions/')) {
-      payload = { status: 'AUTHORIZED', accounts: sessionAccounts.map(a => a.uid), access: { valid_until: '2099-01-01T00:00:00Z' } };
+      payload = { status: sessionStatus, accounts: sessionAccounts.map(a => a.uid), access: { valid_until: sessionValidUntil } };
     } else if (/^GET \/accounts\/[^/]+\/details$/.test(route)) {
       const uid = url.pathname.split('/')[2];
       payload = sessionAccounts.find(a => a.uid === uid);
@@ -115,6 +121,14 @@ export function fakeApi(overrides: Partial<Record<string, (call: FakeCall) => un
     setSessionAccounts(accounts: typeof sessionAccounts) {
       sessionAccounts = accounts;
     },
+    /** The validity date GET /sessions/{id} answers with. */
+    setSessionValidUntil(until: string) {
+      sessionValidUntil = until;
+    },
+    /** The status GET /sessions/{id} answers with. */
+    setSessionStatus(status: string) {
+      sessionStatus = status;
+    },
   };
 }
 
@@ -139,7 +153,7 @@ export function makeBank(options: {
   registry?: unknown;
   dataDir?: string;
   now?: () => number;
-  cacheSeconds?: number;
+  unattendedFetchesPerDay?: number;
 } = {}) {
   const api = options.api ?? fakeApi();
   const company = options.company ?? 'aaa';
@@ -150,13 +164,13 @@ export function makeBank(options: {
     registry: new AccountRegistry(options.registry ?? REGISTRY),
     store: new SessionStore(company, dataDir, MASTER_KEY),
     redirectUrl: 'https://consent.example.com/bank-consent',
-    cacheSeconds: options.cacheSeconds ?? 300,
+    unattendedFetchesPerDay: options.unattendedFetchesPerDay,
     now: options.now,
   });
   return { bank, api, dataDir };
 }
 
-/** Run the MitID round: start, then build the redirect the bank would send back. */
+/** Run the sign-in round at the bank: start, then build the redirect the bank would send back. */
 export async function linkConsent(bank: Bank, api: ReturnType<typeof fakeApi>, user = 'anna@example.com') {
   const started = await bank.startConsent({ user, bank: 'Danske Bank', country: 'DK', psuType: 'business', validDays: 365 });
   const auth = [...api.calls].reverse().find(call => call.method === 'POST' && call.path === '/auth')!;

@@ -1,3 +1,4 @@
+import { problemFromHttp, problemHint, type ProblemCode } from './enablebanking/problems.js';
 import { vendorRequestId } from './gateway/failure.js';
 
 /**
@@ -82,28 +83,37 @@ export class EnableBankingHttpError extends Error {
   readonly status: number;
   readonly path: string;
   readonly code?: string;
+  /** Our own fixed code for what went wrong (src/enablebanking/problems.ts). */
+  readonly problem: ProblemCode;
   /** Enable Banking's own id for the request, when a response header gives one as a UUID or hex id. */
   readonly requestId?: string;
 
   constructor(init: { status: number; method: string; path: string; payload?: unknown; requestId?: string }) {
     const code = documentedErrorCode(init.payload);
     const path = redactPath(init.path);
-    const hint = statusHint(init.status);
+    const problem = problemFromHttp(init.status, code);
+    // A documented code says more than the status: its own sentence when it has one.
+    const hint = (code ? problemHint(problem) : undefined) ?? statusHint(init.status);
     super(`Enable Banking ${init.method} ${path} failed with HTTP ${init.status}${code ? ` (${code})` : ''}.${hint ? ` ${hint}` : ''}`);
     this.name = 'EnableBankingHttpError';
     this.status = init.status;
     this.path = path;
+    this.problem = problem;
     if (code !== undefined) this.code = code;
     const requestId = vendorRequestId(init.requestId);
     if (requestId !== undefined) this.requestId = requestId;
   }
 
-  /** The bank or Enable Banking no longer honours the consent behind this call. */
+  /**
+   * The bank or Enable Banking no longer honours the consent behind this call. Decided by the documented code: a 401
+   * or 403 alone is not taken as an ended consent, since the application itself can be what was refused.
+   */
   get consentLost(): boolean {
     return (
-      this.status === 401 ||
-      this.status === 403 ||
-      /^(EXPIRED_SESSION|CLOSED_SESSION|REVOKED_SESSION|SESSION_DOES_NOT_EXIST|ACCOUNT_DOES_NOT_EXIST)$/.test(this.code ?? '')
+      this.problem === 'consent_expired' ||
+      this.problem === 'consent_revoked' ||
+      this.problem === 'consent_not_active' ||
+      this.problem === 'account_not_in_consent'
     );
   }
 }

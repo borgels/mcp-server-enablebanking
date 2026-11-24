@@ -1,5 +1,167 @@
 # Changelog
 
+## 0.7.0 (2026-11-24)
+
+The whole account information part of Enable Banking's API, for both the standalone server and the embedded
+gateway. What the API offers and what is done with each part is in `docs/capability-map.md` (read from the API
+description `1.0.0-1c03cf81` on 2026-11-24). Still read-only: there is no payment initiation, and
+`docs/payment-initiation-design.md` is a design note only. `docs/sandbox-checklist.md` lists what remains to be
+checked against a real application.
+
+Both surfaces:
+
+- New tools: one transaction's details, totals per counterparty for a period, and a search across accounts. The
+  last two are derived from the bank lines of the same call and say so (`derived: true`).
+- Bank lines carry everything the bank gives: transaction date, counterparty account in any scheme, counterparty
+  bank, address and organisation id, each remittance line, reference number and its scheme, the bank transaction
+  code in full, merchant category code, exchange rate with the instructed amount, the balance after the line, the
+  note, and `detailsId` for the details tool. Personal identifiers and contact details of counterparties are not
+  passed on, and a card number is masked. Nothing is filled in that the bank did not give.
+- Balances: every documented balance type with its meaning, `code` beside the `type` text, last change and last
+  committed transaction. Account details: holder, description, usage, account type, holder role, credit limit,
+  every identifier, servicer and address.
+- No currency is assumed. A balance or an account whose currency the bank does not state has `currency: null`
+  (0.6.x said `DKK`), and a missing amount is empty, not `0`.
+- Amounts keep the bank's precision (`0.125` stays `0.125`, `100` stays `100`); 0.6.x rewrote every amount to two
+  decimals. Totals are exact and kept per currency.
+- `pending` now means the bank's `PDNG`, `HOLD` and `SCHD`. Cancelled, rejected and unspecified lines appear only
+  with status `all` (0.6.x counted everything that was not booked as pending).
+- A value of a kind the API description does not allow (a number or an object where it says text) is dropped
+  rather than shown.
+- `strategy: "longest"` on the transaction listing asks for the longest history the bank gives. An end date cannot
+  be given with it.
+- Every answer from the bank says when the bank was read (`fetchedAt`), and a transaction answer says truthfully
+  whether there is more (`hasMore` on the gateway; `complete`, `truncated` and `nextOffset` standalone).
+- Fixed error codes, decided by Enable Banking's documented error code and not by the HTTP status: an ended consent
+  (`consent_expired`, `consent_revoked`, `consent_not_active`), a refused application (`application_refused`,
+  `application_restricted`), an account outside the consent (`account_not_in_consent`) or not the company's
+  (`account_not_connected`), the bank's rate limit (`rate_limited`, with the six hours Enable Banking recommends as
+  `retryAfterSeconds`), a bank that does not answer (`bank_unavailable`), and more; the list is in the README. A
+  401 or 403 that names no documented code is `access_refused`. In 0.6.x the standalone server took any 401 or 403
+  as an ended consent.
+- The tool descriptions and the server instructions say that names, texts and references on bank lines are written
+  by other people and are data, never instructions.
+
+Standalone server:
+
+- New tools `enablebanking_get_transaction_details`, `enablebanking_summarize_transactions`,
+  `enablebanking_search_transactions` and `enablebanking_get_consent_status`.
+- `enablebanking_list_transactions`: `strategy`, `offset`, and amounts to filter by as exact decimal strings. The
+  answer has `fetchedAt`, `offset`, `complete` and `nextOffset`; a read stops at 50 pages and says so.
+- `enablebanking_get_balances` and `enablebanking_get_account_details` have `fetchedAt`; the bank's description of
+  the account is under `details` (0.6.x: `bank`).
+- `enablebanking_list_banks`: `country` and `psuType` are optional (0.6.x: Denmark and business customers), and
+  each bank has its group, sign-in methods and the headers it requires.
+- `enablebanking_start_consent`: `country` is required (0.6.x: Denmark), and `authMethod` and `extendedHistory` are
+  new.
+- A failed call ends with `errorCode: <code>` and, where a wait is recommended, `retryAfterSeconds: <n>`.
+- `ENABLEBANKING_UNATTENDED_FETCHES_PER_DAY` (default 0: off): a budget of reads at the bank per consent in any 24
+  hours. The standalone server has no details of a person to send, so all its reads are background reads.
+- The answer cache is gone: no answer from the bank is kept between calls, not even briefly in memory, and every
+  call that shows bank data asks the bank. `ENABLEBANKING_CACHE_SECONDS` is no longer read. The bank's limit on
+  background reads is met by `ENABLEBANKING_UNATTENDED_FETCHES_PER_DAY`. Before, the consent status tool could
+  report a revoked consent while a kept balance was still served.
+- Reads stand under a stated rule (README, "Reads after a consent ended"): once any answer from Enable Banking says
+  a consent is over or an account has left it (a failed read, the consent status, a refresh), reads of it are
+  refused, until it is seen in order again or a new consent is completed. Also for calls side by side: a read that
+  was waiting for the bank when the consent was withdrawn, revoked, replaced or refreshed without its account
+  returns nothing, and a status answer or a refresh that was under way when a withdrawal was learned does not lift
+  it or bind anything. A word against a consent or an account is acted on whenever the answer that says it
+  arrives, also when the consent changed while it was on its way. A search checks every account again after its
+  last read and drops what an account gave when its consent or the account was withdrawn meanwhile; the consent
+  status tool shows a consent that changed while its answer was on its way as changed. `enablebanking_list_accounts`
+  has a new account status for it: `consent_ended`. Every answer with bank data is checked once more after the
+  tool's last await (the audit line included), with nothing awaited before it is returned, in the one response
+  path every tool goes through; an answer not made for that check is withheld. The consent's validity date (stored,
+  or an earlier one Enable Banking gave) is checked then too, the consent status tool included.
+- `enablebanking_refresh_consent` refuses a consent that is no longer authorised instead of binding to it.
+- A search stops at the first account the bank's rate limit refuses.
+- The account registry no longer assumes DKK for an account without a currency.
+- The package ships `docs/`.
+
+Gateway (`mcp-server-enablebanking/gateway`), every change to the surface:
+
+- Tools: `get_account_details`, `get_transaction_details`, `summarize_transactions` and `search_transactions` are
+  new, in that order after the existing ones. `list_transactions` takes `strategy`. Catalog entries have
+  `derived` (boolean). The descriptions of the three existing tools are reworded; their names, inputs and
+  summaries are unchanged.
+- `GatewayCallContext`: `psu` (the details of the person who asked, sent as `Psu-*` headers) and `unattended`.
+- `EnableBankingGatewayCredentials`: `accounts` (optional), what the host stored about each account;
+  `list_accounts` then answers without a read at the bank.
+- `EnableBankingGatewayOptions`: `unattendedFetchesPerDay` (default 4; 0 turns the budget off). The budget applies
+  only to calls marked `unattended: true`. The gateway keeps no answer between calls: there is no cache option.
+- A malformed `psu` or `unattended` (also `null`, and a value with a line break or another control character) is
+  refused with `presence_incomplete`, never read as "nobody is present".
+- The values of `psu` are removed from the finished result of the call, so a bank that repeats them does not hand
+  them on: `ipAddress` and `geoLocation` always, where they stand whole, however they are encoded or escaped
+  (percent-encoding as UTF-8, JSON and JavaScript escapes, every HTML character reference of the HTML5 table, up to
+  three layers in any mix), written (NFKC, digits of any script, any Unicode whitespace, separator or zero-width
+  character between the numbers) or spelled (a location also with any trailing zeros, a decimal comma, a minus sign
+  or dash, matched as whole numbers so that amounts, dates and account numbers are left alone, also as they were
+  sent); the other fields best effort, from 8 characters. A location needs decimals in both numbers; a position in
+  whole degrees (`55,12`) is refused and never looked for, so the amount `55,12 kr.` stays. HTML references are
+  decoded by the `entities` package (7.0.1, pinned, no dependencies of its own), the first runtime dependency
+  besides the MCP SDK and zod. The README says exactly what is promised ("Who is present"). The redaction of every
+  value the gateway holds (session id, key, authorization code) now reads a text decoded before comparing, so a
+  percent-encoding in lower case, a double encoding or an HTML entity no longer hides a value.
+- The pause after a bank's rate limit also holds for the next page of a listing (`pageToken`).
+- `search_transactions` is refused as a whole when the bank says, for any of its accounts, that the consent is over:
+  nothing read under it before is returned. An account that has left the consent is refused alone.
+- Calls side by side in one instance: a session ended with `endSession`, a consent Enable Banking says is over and
+  an account it says has left the consent, learned by any call, stop the answer of every call under way that
+  depends on it, checked after the call's last await (refused with `consent_not_active`). After
+  `endSession` the instance reads nothing more under that session. Every request about a session feeds this,
+  `sessionStatus` and `completeSession` included, and the validity date Enable Banking gave is checked against the
+  clock when the answer is returned. Each call holds a watch on its session, registered before it awaits
+  anything; every fact about the session is put on every live watch and never cleared, whatever order the answers
+  arrive in, and the final check reads only the call's own watch and the clock. Only the sessions ended here are
+  kept beyond a call (`endedSessionsKept`, default 10 000). A host that replaces a session without `endSession`, or
+  passes fewer `accountIds`, does not stop calls already under way (README).
+- `GatewayToolResult`: `errorCode` on every error result and `retryAfterSeconds` where a wait is recommended. The
+  fixed error texts of 0.6.x are unchanged.
+- `list_accounts`: adds `source` (`consent`, `bank` or `mixed`), `consent` (status, `validUntil`, `expiresInDays`,
+  bank, customer type, `authorizedAt`), `fetchedAt` when the bank was read, and `identification` for an account
+  without an IBAN. `consentValidUntil` stays.
+- `get_balances`: adds `fetchedAt`; each balance adds `code` and `lastCommittedTransaction`, and the `type` text of
+  some balance types is reworded.
+- `list_transactions`: adds `hasMore`, `fetchedAt` and `strategy`; `to` is null with `strategy: "longest"`.
+- `resolveEnableBankingReadTarget`: a failure has `code`; a target can have `accounts` (the search) and `strategy`.
+- `listBanks`: no default country or customer type; `EnableBankingBank` adds `maximumConsentSeconds`, `sandbox`,
+  `group`, `logoUrl`, `authMethods` and `requiredPsuHeaders`.
+- `startAuthorization`: `country` is required; `authMethod`, `accounts`, `balances`, `transactions` and
+  `extendedHistory` are new; the result adds `authorizationId`.
+- `completeSession`: adds `outcome` (`connected` or `no_accounts`) and `access`; each account adds `product`,
+  `identification`, `cashAccountType` and `usage`.
+- `sessionStatus`: adds `bank`, `psuType`, `createdAt`, `authorizedAt`, `closedAt` and `access`.
+- `endSession`: returns `{ alreadyEnded }` (0.6.x: nothing) and no longer throws for a session that is already
+  expired, closed, revoked or unknown.
+- `application()` is new: the application as Enable Banking holds it.
+- `EnableBankingGatewayError` has `problem`, the fixed code.
+- New exports: `enableBankingProblemCodes`, `enableBankingPsuHeaders` and the types `EnableBankingProblemCode`,
+  `EnableBankingPsu`, `EnableBankingKnownAccount`, `EnableBankingAuthMethod`, `EnableBankingAccountSelection`,
+  `EndSessionResult` and `EnableBankingApplicationStatus`.
+- `enableBankingServiceCatalog` adds the endpoints `accountTransaction` and `getApplication`.
+
+Moving a host from 0.6.1:
+
+1. Four tools are new. A host that keeps its own table per tool (texts, roles, log sentences) must add them before
+   it starts, or leave them out of what it offers. All four are `riskLevel: "read"`; three of them have
+   `transactionDetails: true`, and `get_account_details` shows the full account number and the holder's name.
+2. Pass `country` to `startAuthorization`, and to `listBanks` if only one country should be listed.
+3. Say who is present on every call: `psu` with what was observed from the person's own device, or
+   `unattended: true` for a schedule. With neither, nothing changes from 0.6.1: no header is sent and no budget is
+   kept.
+4. Branch on `errorCode` instead of on the HTTP status or the text. `application_refused` and `access_refused` are
+   not an ended consent.
+5. Store what `completeSession` returns about each account and pass it as `credentials.accounts`, so
+   `list_accounts` needs no read at the bank. Handle `outcome: "no_accounts"` as its own result.
+6. `endSession` can be called for a session in any state; check `alreadyEnded` only if it matters.
+7. Do not assume a currency: `currency` can be null. Do not parse amounts as two-decimal numbers. Do not match on
+   the `type` text of a balance; use `code`.
+
+Not in this version: the standalone account registry still describes companies in a Danish shape (an 8-digit
+registration number, IBAN only), so accounts without an IBAN are served on the gateway path only.
+
 ## 0.6.1 (2026-11-22)
 
 - Gateway: the consent helpers give each account's identification hash (`ConsentAccount.identificationHash`,

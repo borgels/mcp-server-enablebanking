@@ -64,15 +64,16 @@ describe('numeric configuration', () => {
     expect(() => loadConfig({ ENABLEBANKING_COMPANY: 'aaa', ENABLEBANKING_TIMEOUT_MS: 'abc' })).toThrow(
       /ENABLEBANKING_TIMEOUT_MS/,
     );
-    expect(() => loadConfig({ ENABLEBANKING_COMPANY: 'aaa', ENABLEBANKING_CACHE_SECONDS: '5m' })).toThrow(
-      /ENABLEBANKING_CACHE_SECONDS/,
+    expect(() => loadConfig({ ENABLEBANKING_COMPANY: 'aaa', ENABLEBANKING_UNATTENDED_FETCHES_PER_DAY: '4x' })).toThrow(
+      /ENABLEBANKING_UNATTENDED_FETCHES_PER_DAY/,
     );
   });
 
   it('keeps defaults for unset values and clamps out-of-range integers', () => {
-    expect(loadConfig({ ENABLEBANKING_COMPANY: 'aaa' })).toMatchObject({ timeoutMs: 30_000, cacheSeconds: 300 });
+    expect(loadConfig({ ENABLEBANKING_COMPANY: 'aaa' })).toMatchObject({ timeoutMs: 30_000, unattendedFetchesPerDay: 0 });
     expect(loadConfig({ ENABLEBANKING_COMPANY: 'aaa', ENABLEBANKING_TIMEOUT_MS: '10' }).timeoutMs).toBe(1_000);
-    expect(loadConfig({ ENABLEBANKING_COMPANY: 'aaa', ENABLEBANKING_CACHE_SECONDS: '0' }).cacheSeconds).toBe(0);
+    // The answer cache is gone: a setting left over from earlier versions is not read.
+    expect(loadConfig({ ENABLEBANKING_COMPANY: 'aaa', ENABLEBANKING_CACHE_SECONDS: '300' })).not.toHaveProperty('cacheSeconds');
   });
 });
 
@@ -97,5 +98,60 @@ describe('error codes from non-JSON content types', () => {
     const error = (await client(fetchImpl).getApplication().catch((e: unknown) => e)) as EnableBankingHttpError;
     expect(error.status).toBe(502);
     expect(error.code).toBeUndefined();
+  });
+});
+
+describe('account information requests', () => {
+  const ok = (body: unknown) => new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } });
+
+  it('builds the transactions query the API documents, and sends a person’s headers only when given', async () => {
+    const fetchImpl = vi.fn<typeof fetch>(async () => ok({ transactions: [], continuation_key: 'next' }));
+    const api = client(fetchImpl);
+    const page = await api.getTransactionsPage('uid-1', { dateFrom: '2026-01-01', dateTo: '2026-01-31', status: 'PDNG', continuationKey: 'k 1' });
+    expect(page).toEqual({ transactions: [], continuationKey: 'next' });
+    const first = new URL(String(fetchImpl.mock.calls[0]![0]));
+    expect(first.pathname).toBe('/accounts/uid-1/transactions');
+    expect(Object.fromEntries(first.searchParams)).toEqual({ date_from: '2026-01-01', date_to: '2026-01-31', transaction_status: 'PDNG', continuation_key: 'k 1' });
+    expect(Object.keys(fetchImpl.mock.calls[0]![1]!.headers as object).some(name => name.startsWith('Psu-'))).toBe(false);
+
+    await api.getTransactionsPage('uid-1', { dateFrom: '2020-01-01', dateTo: '2026-01-31', strategy: 'longest' }, { 'Psu-Ip-Address': '192.0.2.10', Authorization: 'replaced?' });
+    const second = new URL(String(fetchImpl.mock.calls[1]![0]));
+    // With the longest strategy the API ignores an end date, so none is sent.
+    expect(Object.fromEntries(second.searchParams)).toEqual({ date_from: '2020-01-01', strategy: 'longest' });
+    const headers = fetchImpl.mock.calls[1]![1]!.headers as Record<string, string>;
+    expect(headers['Psu-Ip-Address']).toBe('192.0.2.10');
+    // A header of the person can never replace one of ours.
+    expect(headers.Authorization).toMatch(/^Bearer ey/);
+  });
+
+  it('follows continuation keys to the end, through empty pages, and says when it stopped early', async () => {
+    let page = 0;
+    const three = vi.fn<typeof fetch>(async () => {
+      page += 1;
+      return ok({ transactions: page === 2 ? [] : [{ entry_reference: `r${page}` }], continuation_key: page < 3 ? `k${page}` : null });
+    });
+    expect(await client(three).listTransactions('uid-1', { dateFrom: '2026-01-01', dateTo: '2026-01-31' })).toMatchObject({ truncated: false, pages: 3, transactions: [{ entry_reference: 'r1' }, { entry_reference: 'r3' }] });
+    const keys = three.mock.calls.map(call => new URL(String(call[0])).searchParams.get('continuation_key'));
+    expect(keys).toEqual([null, 'k1', 'k2']);
+
+    const endless = vi.fn<typeof fetch>(async () => ok({ transactions: [], continuation_key: 'again' }));
+    expect(await client(endless).listTransactions('uid-1', {})).toMatchObject({ truncated: true, pages: 50 });
+    expect(endless).toHaveBeenCalledTimes(50);
+  });
+
+  it('asks for banks that offer account information, in one country or all', async () => {
+    const fetchImpl = vi.fn<typeof fetch>(async () => ok({ aspsps: [] }));
+    await client(fetchImpl).listAspsps();
+    await client(fetchImpl).listAspsps('SE', 'personal');
+    expect(fetchImpl.mock.calls.map(call => new URL(String(call[0])).search)).toEqual(['?service=AIS', '?service=AIS&country=SE&psu_type=personal']);
+  });
+
+  it('reads one transaction as a single path segment', async () => {
+    const fetchImpl = vi.fn<typeof fetch>(async () => ok({ transaction_id: 'x' }));
+    await client(fetchImpl).getTransaction('uid-1', 'id:1=a');
+    expect(new URL(String(fetchImpl.mock.calls[0]![0])).pathname).toBe(`/accounts/uid-1/transactions/${encodeURIComponent('id:1=a')}`);
+    await expect(client(fetchImpl).getTransaction('uid-1', '../balances')).rejects.toThrow();
+    await expect(client(fetchImpl).getTransaction('uid-1', 'a/b')).rejects.toThrow();
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 });

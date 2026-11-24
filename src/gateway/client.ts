@@ -1,5 +1,15 @@
 import { createSign, type KeyObject } from 'node:crypto';
-import type { AccountResource, Aspsp, BalanceResource, SessionResource, SessionStatus, TransactionResource } from '../enablebanking/client.js';
+import type {
+  AccountIdentification,
+  AccountResource,
+  ApplicationResource,
+  Aspsp,
+  BalanceResource,
+  FetchStrategy,
+  SessionResource,
+  SessionStatus,
+  TransactionResource,
+} from '../enablebanking/api.js';
 import { EnableBankingHttpError, nestedFailuresAsStatus } from '../errors.js';
 import { discardBody, isRedirect, readErrorBody, readTextUpTo } from '../upstream-http.js';
 import { EnableBankingRedirectError, requestIdFrom } from './failure.js';
@@ -9,7 +19,9 @@ import { EnableBankingRedirectError, requestIdFrom } from './failure.js';
  * the consent calls only: there is no payment method, and every request is one
  * of the fixed targets in UPSTREAM below, on the one origin fixed at creation.
  * Identifiers placed in a path must match ID_PATTERN (letters, digits and
- * dashes), so no value can add a segment, a dot segment or a query.
+ * dashes), so no value can add a segment, a dot segment or a query. A
+ * transaction id, which a bank makes up, must match TRANSACTION_ID_PATTERN and
+ * is percent-encoded as one segment.
  */
 
 export const DEFAULT_API_BASE_URL = 'https://api.enablebanking.com';
@@ -19,12 +31,21 @@ export const DEFAULT_MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
 /** Session ids and account uids (UUIDs at Enable Banking). */
 export const ID_PATTERN = /^[A-Za-z0-9-]{8,128}$/;
 
+/**
+ * A bank's id of a transaction, for the details request: unreserved and a few sub-delimiter characters only, so it is
+ * one path segment whatever it holds. No slash, backslash, question mark, hash, percent sign or space, and not a dot
+ * segment.
+ */
+export const TRANSACTION_ID_PATTERN = /^(?!\.{1,2}$)[A-Za-z0-9._~:=+@,;!$*'()&-]{1,256}$/;
+
 /** Every request the gateway can make, by name. */
 export const UPSTREAM = Object.freeze({
   getSession: { method: 'GET', path: '/sessions/{session_id}' },
   accountDetails: { method: 'GET', path: '/accounts/{account_id}/details' },
   accountBalances: { method: 'GET', path: '/accounts/{account_id}/balances' },
   accountTransactions: { method: 'GET', path: '/accounts/{account_id}/transactions' },
+  accountTransaction: { method: 'GET', path: '/accounts/{account_id}/transactions/{transaction_id}' },
+  getApplication: { method: 'GET', path: '/application' },
   listAspsps: { method: 'GET', path: '/aspsps' },
   startAuthorization: { method: 'POST', path: '/auth' },
   createSession: { method: 'POST', path: '/sessions' },
@@ -59,6 +80,9 @@ function idSegment(value: string, what: string): string {
   return value;
 }
 
+/** `Psu-*` request headers of a person present (src/enablebanking/psu.ts). Left out: a background fetch. */
+export type PresenceHeaders = Readonly<Record<string, string>>;
+
 export class GatewayClient {
   constructor(private readonly options: GatewayClientOptions) {}
 
@@ -76,15 +100,21 @@ export class GatewayClient {
    */
   private async request<T>(
     name: UpstreamName,
-    params: { session_id?: string; account_id?: string } = {},
+    params: { session_id?: string; account_id?: string; transaction_id?: string } = {},
     query?: URLSearchParams,
     body?: unknown,
     onRaw?: (raw: unknown) => void,
+    presence?: PresenceHeaders,
   ): Promise<T> {
     const target = UPSTREAM[name];
     let path: string = target.path;
     if (path.includes('{session_id}')) path = path.replace('{session_id}', idSegment(params.session_id ?? '', 'session id'));
     if (path.includes('{account_id}')) path = path.replace('{account_id}', idSegment(params.account_id ?? '', 'account id'));
+    if (path.includes('{transaction_id}')) {
+      const id = params.transaction_id ?? '';
+      if (typeof id !== 'string' || !TRANSACTION_ID_PATTERN.test(id)) throw new InvalidIdentifierError('transaction id');
+      path = path.replace('{transaction_id}', () => encodeURIComponent(id));
+    }
     const qs = query && [...query.keys()].length > 0 ? `?${query.toString()}` : '';
     const url = new URL(`${path}${qs}`, this.options.origin);
     // Belt and braces: the request goes to the fixed origin and the fixed path.
@@ -97,6 +127,8 @@ export class GatewayClient {
       response = await this.options.fetchImpl(url.toString(), {
         method: target.method,
         headers: {
+          // The person's headers first, so none of them can replace one of ours.
+          ...(presence ?? {}),
           Authorization: `Bearer ${this.jwt()}`,
           Accept: 'application/json',
           ...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
@@ -161,50 +193,80 @@ export class GatewayClient {
     }
   }
 
+  /** The session as Enable Banking holds it. Not a read at the bank. */
   getSession(sessionId: string): Promise<SessionStatus> {
     return this.request('getSession', { session_id: sessionId });
   }
 
-  getAccountDetails(uid: string): Promise<AccountResource> {
-    return this.request('accountDetails', { account_id: uid });
+  getAccountDetails(uid: string, presence?: PresenceHeaders): Promise<AccountResource> {
+    return this.request('accountDetails', { account_id: uid }, undefined, undefined, undefined, presence);
   }
 
-  async getBalances(uid: string): Promise<BalanceResource[]> {
-    const body = await this.request<{ balances?: BalanceResource[] } | undefined>('accountBalances', { account_id: uid });
+  async getBalances(uid: string, presence?: PresenceHeaders): Promise<BalanceResource[]> {
+    const body = await this.request<{ balances?: BalanceResource[] } | undefined>(
+      'accountBalances',
+      { account_id: uid },
+      undefined,
+      undefined,
+      undefined,
+      presence,
+    );
     return Array.isArray(body?.balances) ? body.balances : [];
   }
 
+  /** One page. Every parameter but the continuation key must be the same on each page of a listing. */
   async getTransactionsPage(
     uid: string,
-    query: { dateFrom: string; dateTo: string; status?: 'BOOK' | 'PDNG'; continuationKey?: string },
+    query: { dateFrom?: string; dateTo?: string; status?: 'BOOK' | 'PDNG'; strategy?: FetchStrategy; continuationKey?: string },
+    presence?: PresenceHeaders,
   ): Promise<{ transactions: TransactionResource[]; continuationKey?: string }> {
-    const params = new URLSearchParams({ date_from: query.dateFrom, date_to: query.dateTo });
+    const params = new URLSearchParams();
+    if (query.dateFrom) params.set('date_from', query.dateFrom);
+    // With the longest strategy the API reads up to today and ignores an end date; none is sent.
+    if (query.dateTo && query.strategy !== 'longest') params.set('date_to', query.dateTo);
     if (query.status) params.set('transaction_status', query.status);
+    if (query.strategy === 'longest') params.set('strategy', 'longest');
     if (query.continuationKey) params.set('continuation_key', query.continuationKey);
     const body = await this.request<{ transactions?: TransactionResource[]; continuation_key?: string | null } | undefined>(
       'accountTransactions',
       { account_id: uid },
       params,
+      undefined,
+      undefined,
+      presence,
     );
     const continuationKey = typeof body?.continuation_key === 'string' && body.continuation_key ? body.continuation_key : undefined;
     return { transactions: Array.isArray(body?.transactions) ? body.transactions : [], ...(continuationKey ? { continuationKey } : {}) };
   }
 
-  async listAspsps(country: string, psuType: 'business' | 'personal'): Promise<Aspsp[]> {
-    const body = await this.request<{ aspsps?: Aspsp[] } | undefined>(
-      'listAspsps',
-      {},
-      new URLSearchParams({ country, psu_type: psuType, service: 'AIS' }),
-    );
+  /** The bank's further details of one transaction, by the transaction id of a listing. */
+  getTransaction(uid: string, transactionId: string, presence?: PresenceHeaders): Promise<TransactionResource | undefined> {
+    return this.request('accountTransaction', { account_id: uid, transaction_id: transactionId }, undefined, undefined, undefined, presence);
+  }
+
+  /** Banks offering account information. Without a country: every country the application covers. */
+  async listAspsps(country?: string, psuType?: 'business' | 'personal'): Promise<Aspsp[]> {
+    const params = new URLSearchParams();
+    if (country) params.set('country', country);
+    if (psuType) params.set('psu_type', psuType);
+    params.set('service', 'AIS');
+    const body = await this.request<{ aspsps?: Aspsp[] } | undefined>('listAspsps', {}, params);
     return Array.isArray(body?.aspsps) ? body.aspsps : [];
   }
 
   startAuthorization(body: {
-    access: { valid_until: string };
+    access: {
+      valid_until: string;
+      accounts?: AccountIdentification[];
+      balances?: boolean;
+      transactions?: boolean;
+      transactions_extended_history?: boolean;
+    };
     aspsp: { name: string; country: string };
     state: string;
     redirect_url: string;
     psu_type: 'business' | 'personal';
+    auth_method?: string;
     language?: string;
   }): Promise<{ url?: string; authorization_id?: string } | undefined> {
     return this.request('startAuthorization', {}, undefined, body);
@@ -216,6 +278,11 @@ export class GatewayClient {
 
   async deleteSession(sessionId: string): Promise<void> {
     await this.request('deleteSession', { session_id: sessionId });
+  }
+
+  /** The application as Enable Banking sees it. */
+  getApplication(): Promise<ApplicationResource | undefined> {
+    return this.request('getApplication');
   }
 }
 

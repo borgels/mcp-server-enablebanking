@@ -7,7 +7,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { createEnableBankingGateway, type GatewayCallContext } from '../src/gateway.js';
 import { FRAGMENT_LENGTH } from '../src/gateway/redact.js';
-import { KEY } from './helpers.js';
+import { KEY, dkIban } from './helpers.js';
 
 const PEM = KEY.privateKey.export({ type: 'pkcs8', format: 'pem' }).toString();
 const CONTENT = PEM.replace(/-----(BEGIN|END) [A-Z ]*-----/g, '').replace(/\s+/g, '');
@@ -114,6 +114,16 @@ describe('no piece of the key leaves an instance', () => {
         results.push(await gateway.callTool('list_accounts', {}, ctx));
         results.push(await gateway.callTool('get_balances', { account: ACCOUNT }, ctx));
         results.push(await gateway.callTool('list_transactions', { account: ACCOUNT, from: '2026-11-01', to: '2026-11-17' }, ctx));
+        results.push(await gateway.callTool('get_account_details', { account: ACCOUNT }, ctx));
+        results.push(await gateway.callTool('get_transaction_details', { account: ACCOUNT, transaction: 'tx-0001' }, ctx));
+        results.push(await gateway.callTool('summarize_transactions', { account: ACCOUNT, from: '2026-11-01', to: '2026-11-17' }, ctx));
+        results.push(await gateway.callTool('search_transactions', { query: PIECE.slice(0, 20), from: '2026-11-01', to: '2026-11-17' }, ctx));
+        results.push(await gateway.callTool('list_transactions', { account: ACCOUNT, strategy: 'longest' }, ctx));
+        // The host's own notes about the account, and its account of who is present, carry the key too.
+        const noted = { ...ctx, credentials: { ...ctx.credentials!, accounts: [{ id: ACCOUNT, name: PIECE, maskedIban: PEM, currency: PIECE, product: CONTENT }] } };
+        results.push(await gateway.callTool('list_accounts', {}, noted));
+        results.push(await gateway.callTool('get_balances', { account: ACCOUNT }, { ...ctx, psu: { userAgent: PIECE, ipAddress: '192.0.2.10' } }));
+        results.push(await gateway.callTool('get_balances', { account: ACCOUNT }, { ...ctx, unattended: true }));
       }
     }
     // The host's own input, through the tool name, the field names and the credentials.
@@ -140,8 +150,8 @@ describe('no piece of the key leaves an instance', () => {
       const gateway = gatewayWith(url => (url.pathname === '/aspsps' ? json({ aspsps: [{ name: 'Opdigtet Bank', country: 'DK' }] }) : channel(url)));
       const attempts: Array<() => Promise<unknown>> = [
         () => gateway.listBanks({ country: 'DK' }),
-        () => gateway.startAuthorization({ bank: 'Opdigtet Bank', redirectUrl: 'https://host.test/retur', state: 'state-0123456789abcdef' }),
-        () => gateway.startAuthorization({ bank: PEM, redirectUrl: `https://host.test/${PIECE}`, state: PIECE.replace(/[^A-Za-z0-9]/g, 'x') }),
+        () => gateway.startAuthorization({ country: 'DK', bank: 'Opdigtet Bank', redirectUrl: 'https://host.test/retur', state: 'state-0123456789abcdef' }),
+        () => gateway.startAuthorization({ country: 'DK', bank: PEM, redirectUrl: `https://host.test/${PIECE}`, state: PIECE.replace(/[^A-Za-z0-9]/g, 'x') }),
         () => gateway.completeSession({ code: 'code-0123456789' }),
         () => gateway.sessionStatus({ sessionId: SESSION }),
         () => gateway.endSession({ sessionId: SESSION }),
@@ -194,7 +204,18 @@ describe('numbers', () => {
     const serialised = JSON.stringify(result);
     expect(JSON.parse(serialised)).toEqual(result);
     expect(serialised).not.toContain(NUMERIC);
-    expect(result.structuredContent).toMatchObject({ balances: [{ name: '‹redacted›', amount: '‹redacted›' }] });
+    // A value from the bank that is not a text is not passed on at all.
+    expect(result.structuredContent).toMatchObject({ balances: [{ name: null, amount: '' }] });
+
+    // Echoed as a text, it is redacted.
+    const echoing = gatewayWith(url =>
+      url.pathname.startsWith('/sessions/')
+        ? json({ status: 'AUTHORIZED', accounts: [ACCOUNT], access: { valid_until: '2027-05-01T00:00:00Z' } })
+        : json({ balances: [{ balance_type: 'CLBD', name: `Konto ${NUMERIC}`, balance_amount: { currency: 'DKK', amount: '12.00' } }] }),
+    );
+    const echoed = await echoing.callTool('get_balances', { account: ACCOUNT }, { credentials: { sessionId: NUMERIC, accountIds: [ACCOUNT] } });
+    expect(JSON.stringify(echoed)).not.toContain(NUMERIC);
+    expect(echoed.structuredContent).toMatchObject({ balances: [{ name: 'Konto ‹redacted›', amount: '12.00' }] });
   });
 });
 
@@ -242,9 +263,8 @@ describe('round 5 of the threat model', () => {
     );
     const result = await gateway.callTool('get_balances', { account: ACCOUNT }, ctx);
     expect(result.isError, JSON.stringify(result.content)).toBeUndefined();
-    expect(result.structuredContent).toMatchObject({
-      balances: [{ amount: { status: 500, error: 'Enable Banking reported a failure with HTTP 500.' } }],
-    });
+    // The failure is reduced to its status by the client, and an amount that is not a decimal text is then not shown.
+    expect(result.structuredContent).toMatchObject({ balances: [{ amount: '' }] });
     expect(JSON.stringify(result)).not.toContain('Vendor');
   });
 
@@ -454,7 +474,7 @@ describe('round 9: consent helpers', () => {
       await caughtIn(() => gateway.sessionStatus({ sessionId: LONE })),
       await caughtIn(() => gateway.endSession({ sessionId: LONE })),
       await caughtIn(() =>
-        gateway.startAuthorization({ bank: 'Fiktiv Bank', redirectUrl: 'https://example.test/return', state: `state-${LONE}-0123456789` }),
+        gateway.startAuthorization({ country: 'DK', bank: 'Fiktiv Bank', redirectUrl: 'https://example.test/return', state: `state-${LONE}-0123456789` }),
       ),
       await caughtIn(() => gateway.listBanks({ country: 'DK' })),
       await caughtIn(() => gateway.completeSession({ code: 'code-0123456789' })),
@@ -622,6 +642,9 @@ describe('round 12', () => {
 });
 
 describe('identification hashes', () => {
+  // Invented: an account number of zeros with a checksum worked out here, and a name nobody has.
+  const MADE_UP_IBAN = dkIban('0'.repeat(14));
+  const MADE_UP_OWNER = 'Made-up Owner (invented)';
   const HASH = 'WwUJU8ZJw2Xy0rFdrDFBF2tV3+sRuI3qPk4ZdHs/fTI=.zQx6z2rN4qkc9u1D4TfjtWAeFqa+X7LrV7K0J6P5jVZtnF8KfE';
   const session = (hash: string) => ({
     session_id: SESSION,
@@ -629,7 +652,7 @@ describe('identification hashes', () => {
     aspsp: { name: 'Opdigtet Bank', country: 'DK' },
     access: { valid_until: '2099-01-01T00:00:00Z' },
     accounts: [ACCOUNT],
-    accounts_data: [{ uid: ACCOUNT, identification_hash: hash, iban: 'DK5000400440116243', owner: 'Lund VVS ApS', extra: { nested: HASH } }],
+    accounts_data: [{ uid: ACCOUNT, identification_hash: hash, iban: MADE_UP_IBAN, owner: MADE_UP_OWNER, extra: { nested: HASH } }],
   });
 
   it('carries no piece of the key in a hash, and nothing else of accounts_data', async () => {
@@ -651,7 +674,9 @@ describe('identification hashes', () => {
       }
     }
     expect(leaks(answers)).toEqual([]);
-    expect(JSON.stringify(answers)).not.toMatch(/Lund VVS|DK5000400440116243|nested/);
+    expect(JSON.stringify(answers)).not.toMatch(/nested/);
+    expect(JSON.stringify(answers)).not.toContain(MADE_UP_IBAN);
+    expect(JSON.stringify(answers)).not.toContain('Made-up Owner');
   });
 
   it('gives the hash to the consent helpers and keeps it out of the list_accounts answer', async () => {
